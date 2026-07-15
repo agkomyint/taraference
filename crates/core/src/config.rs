@@ -1,4 +1,4 @@
-//! Model config from GGUF metadata (Qwen2 / Llama-style).
+//! Architecture + hyperparams from GGUF metadata (Qwen2 / Llama-style).
 
 use anyhow::{anyhow, Result};
 use taraference_gguf::GgufFile;

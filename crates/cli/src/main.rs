@@ -8,9 +8,11 @@ use taraference_gguf::GgufFile;
 #[command(name = "taraference", about = "CUDA multi-turn GGUF (Qwen2.5-3B)")]
 struct Cli {
     model: PathBuf,
-    #[arg(short = 'n', long, default_value_t = 64)]
+    /// Max tokens per assistant reply (default sized for full answers on 4GB).
+    #[arg(short = 'n', long, default_value_t = 512)]
     max_new: usize,
-    #[arg(long, default_value_t = 2048)]
+    /// KV context length (default for RTX 3050 Ti 4GB + 3B Q4).
+    #[arg(long, default_value_t = 5000)]
     ctx: usize,
     #[arg(long)]
     prompt: Option<String>,
@@ -23,11 +25,6 @@ fn main() -> Result<()> {
         GgufFile::open(&cli.model).with_context(|| format!("open {}", cli.model.display()))?;
     let tok = Tokenizer::from_gguf(&gguf)?;
     let mut model = CudaModel::load(&gguf)?;
-    eprintln!(
-        "ready GPU | L={} d={} vocab={} | ceiling≈{:.0} tok/s",
-        model.cfg.n_layer, model.cfg.n_embd, model.cfg.n_vocab, model.bw_ceiling_tps
-    );
-
     let max_seq = cli.ctx.min(model.cfg.n_ctx);
     let mut session = Session::new(&mut model, &tok, max_seq, cli.max_new)?;
 

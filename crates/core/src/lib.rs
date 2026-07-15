@@ -1,11 +1,12 @@
-mod cuda_kernels;
-mod cuda_model;
-mod model;
-mod quant;
-mod session;
-mod tokenizer;
+//! taraference core: GGUF load, CUDA forward, chat session, tokenizer.
 
-pub use cuda_model::{CudaKv, CudaModel};
-pub use model::ModelConfig;
+pub mod config;
+pub mod cuda;
+pub mod quant;
+pub mod session;
+pub mod tokenizer;
+
+pub use config::ModelConfig;
+pub use cuda::{CudaKv, CudaModel};
 pub use session::Session;
 pub use tokenizer::Tokenizer;
