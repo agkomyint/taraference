@@ -86,6 +86,33 @@ extern "C" __global__ void rope_neox_f32(
     }
 }
 
+// Device-side pos0 (for CUDA graph replay — scalar pos0 would be baked at capture).
+extern "C" __global__ void rope_neox_f32_d(
+    float* __restrict__ x,
+    int n_heads,
+    int head_dim,
+    const int* __restrict__ pos0_ptr,
+    int n_tok,
+    float theta
+) {
+    int pos0 = pos0_ptr[0];
+    int h = (int)blockIdx.x;
+    int t = (int)blockIdx.y;
+    if (h >= n_heads || t >= n_tok) return;
+    int half = head_dim / 2;
+    int pos = pos0 + t;
+    float* base = x + (size_t)t * (size_t)(n_heads * head_dim) + h * head_dim;
+    for (int i = (int)threadIdx.x; i < half; i += (int)blockDim.x) {
+        float freq = powf(theta, -2.f * (float)i / (float)head_dim);
+        float ang = (float)pos * freq;
+        float c = cosf(ang), s = sinf(ang);
+        float x0 = base[i];
+        float x1 = base[i + half];
+        base[i] = x0 * c - x1 * s;
+        base[i + half] = x0 * s + x1 * c;
+    }
+}
+
 // Store K/V as IEEE f16 bits (unsigned short) — halves attention HBM traffic.
 extern "C" __global__ void copy_kv_f16(
     const float* __restrict__ src,
@@ -94,6 +121,24 @@ extern "C" __global__ void copy_kv_f16(
     int n_tok,
     int stride
 ) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = n_tok * stride;
+    if (i < total) {
+        int t = i / stride;
+        int d = i % stride;
+        cache[(size_t)(pos0 + t) * (size_t)stride + d] =
+            float_to_half_bits(src[(size_t)t * (size_t)stride + d]);
+    }
+}
+
+extern "C" __global__ void copy_kv_f16_d(
+    const float* __restrict__ src,
+    unsigned short* __restrict__ cache,
+    const int* __restrict__ pos0_ptr,
+    int n_tok,
+    int stride
+) {
+    int pos0 = pos0_ptr[0];
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int total = n_tok * stride;
     if (i < total) {

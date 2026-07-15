@@ -17,6 +17,10 @@ pub struct EngineConfig {
     pub max_new: usize,
     pub decode: DecodeBackend,
     pub default_system: String,
+    /// Attempt CUDA graph capture for single-token decode after warm-up.
+    pub cuda_graph: bool,
+    /// Prompt Lookup Decoding (n-gram speculative) in sessions.
+    pub pld: bool,
 }
 
 impl Default for EngineConfig {
@@ -27,6 +31,8 @@ impl Default for EngineConfig {
             max_new: 512,
             decode: DecodeBackend::default(),
             default_system: "You are a helpful assistant.".into(),
+            cuda_graph: true,
+            pld: false,
         }
     }
 }
@@ -44,6 +50,7 @@ pub struct InferenceEngine {
     pub max_new: usize,
     pub default_system: String,
     pub weight_gib: f64,
+    pub pld: bool,
 }
 
 impl InferenceEngine {
@@ -53,7 +60,8 @@ impl InferenceEngine {
         let gguf = GgufFile::open(&path).with_context(|| format!("open {}", path.display()))?;
         let weight_gib = gguf.total_tensor_bytes() as f64 / (1024.0 * 1024.0 * 1024.0);
         let tok = Tokenizer::from_gguf(&gguf)?;
-        let model = CudaModel::load_with(&gguf, cfg.decode)?;
+        let mut model = CudaModel::load_with(&gguf, cfg.decode)?;
+        model.set_cuda_graph(cfg.cuda_graph);
         let max_seq = cfg.max_seq.min(model.cfg.n_ctx);
         let kv = model.alloc_kv(max_seq)?;
         let model_id = path
@@ -61,6 +69,12 @@ impl InferenceEngine {
             .and_then(|s| s.to_str())
             .unwrap_or("taraference")
             .to_string();
+        eprintln!(
+            "flags | cuda_graph={} | pld={} | decode={}",
+            cfg.cuda_graph,
+            cfg.pld,
+            cfg.decode.name()
+        );
 
         Ok(Self {
             model,
@@ -72,6 +86,7 @@ impl InferenceEngine {
             max_new: cfg.max_new,
             default_system: cfg.default_system,
             weight_gib,
+            pld: cfg.pld,
         })
     }
 
@@ -86,6 +101,25 @@ impl InferenceEngine {
             max_seq,
             max_new,
             decode,
+            ..EngineConfig::default()
+        })
+    }
+
+    pub fn load_with_flags(
+        model: impl AsRef<Path>,
+        decode: DecodeBackend,
+        max_seq: usize,
+        max_new: usize,
+        cuda_graph: bool,
+        pld: bool,
+    ) -> Result<Self> {
+        Self::load(EngineConfig {
+            model_path: model.as_ref().to_path_buf(),
+            max_seq,
+            max_new,
+            decode,
+            cuda_graph,
+            pld,
             ..EngineConfig::default()
         })
     }
@@ -158,6 +192,7 @@ impl InferenceEngine {
             system: self.default_system.clone(),
             print_stream: false,
             print_stats: false,
+            pld: self.pld,
         };
         self.kv.clear();
         let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);

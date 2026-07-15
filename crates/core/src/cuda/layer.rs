@@ -27,6 +27,8 @@ pub(crate) struct ChunkDims {
     pub eps: f32,
     pub theta: f32,
     pub scale: f32,
+    /// Read pos0 from `CudaModel::d_pos0` (CUDA-graph safe single-token path).
+    pub use_device_pos: bool,
 }
 
 impl CudaModel {
@@ -207,49 +209,95 @@ impl CudaModel {
         }
 
         unsafe {
-            self.stream
-                .launch_builder(&self.k.rope)
-                .arg(&mut self.q)
-                .arg(&d.n_head)
-                .arg(&d.hd)
-                .arg(&d.pos0_i)
-                .arg(&d.n_tok)
-                .arg(&d.theta)
-                .launch(LaunchConfig {
-                    grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-            self.stream
-                .launch_builder(&self.k.rope)
-                .arg(&mut self.k_buf)
-                .arg(&d.n_kv)
-                .arg(&d.hd)
-                .arg(&d.pos0_i)
-                .arg(&d.n_tok)
-                .arg(&d.theta)
-                .launch(LaunchConfig {
-                    grid_dim: (d.n_kv_heads as u32, d.n_tok_u as u32, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-            let kv_elems = (d.n_tok_u * d.stride_u) as u32;
-            self.stream
-                .launch_builder(&self.k.copy_kv)
-                .arg(&self.k_buf)
-                .arg(&mut cache.k[li])
-                .arg(&d.pos0_i)
-                .arg(&d.n_tok)
-                .arg(&d.stride)
-                .launch(LaunchConfig::for_num_elems(kv_elems))?;
-            self.stream
-                .launch_builder(&self.k.copy_kv)
-                .arg(&self.v_buf)
-                .arg(&mut cache.v[li])
-                .arg(&d.pos0_i)
-                .arg(&d.n_tok)
-                .arg(&d.stride)
-                .launch(LaunchConfig::for_num_elems(kv_elems))?;
+            if d.use_device_pos {
+                self.stream
+                    .launch_builder(&self.k.rope_d)
+                    .arg(&mut self.q)
+                    .arg(&d.n_head)
+                    .arg(&d.hd)
+                    .arg(&self.d_pos0)
+                    .arg(&d.n_tok)
+                    .arg(&d.theta)
+                    .launch(LaunchConfig {
+                        grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                self.stream
+                    .launch_builder(&self.k.rope_d)
+                    .arg(&mut self.k_buf)
+                    .arg(&d.n_kv)
+                    .arg(&d.hd)
+                    .arg(&self.d_pos0)
+                    .arg(&d.n_tok)
+                    .arg(&d.theta)
+                    .launch(LaunchConfig {
+                        grid_dim: (d.n_kv_heads as u32, d.n_tok_u as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                let kv_elems = (d.n_tok_u * d.stride_u) as u32;
+                self.stream
+                    .launch_builder(&self.k.copy_kv_d)
+                    .arg(&self.k_buf)
+                    .arg(&mut cache.k[li])
+                    .arg(&self.d_pos0)
+                    .arg(&d.n_tok)
+                    .arg(&d.stride)
+                    .launch(LaunchConfig::for_num_elems(kv_elems))?;
+                self.stream
+                    .launch_builder(&self.k.copy_kv_d)
+                    .arg(&self.v_buf)
+                    .arg(&mut cache.v[li])
+                    .arg(&self.d_pos0)
+                    .arg(&d.n_tok)
+                    .arg(&d.stride)
+                    .launch(LaunchConfig::for_num_elems(kv_elems))?;
+            } else {
+                self.stream
+                    .launch_builder(&self.k.rope)
+                    .arg(&mut self.q)
+                    .arg(&d.n_head)
+                    .arg(&d.hd)
+                    .arg(&d.pos0_i)
+                    .arg(&d.n_tok)
+                    .arg(&d.theta)
+                    .launch(LaunchConfig {
+                        grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                self.stream
+                    .launch_builder(&self.k.rope)
+                    .arg(&mut self.k_buf)
+                    .arg(&d.n_kv)
+                    .arg(&d.hd)
+                    .arg(&d.pos0_i)
+                    .arg(&d.n_tok)
+                    .arg(&d.theta)
+                    .launch(LaunchConfig {
+                        grid_dim: (d.n_kv_heads as u32, d.n_tok_u as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                let kv_elems = (d.n_tok_u * d.stride_u) as u32;
+                self.stream
+                    .launch_builder(&self.k.copy_kv)
+                    .arg(&self.k_buf)
+                    .arg(&mut cache.k[li])
+                    .arg(&d.pos0_i)
+                    .arg(&d.n_tok)
+                    .arg(&d.stride)
+                    .launch(LaunchConfig::for_num_elems(kv_elems))?;
+                self.stream
+                    .launch_builder(&self.k.copy_kv)
+                    .arg(&self.v_buf)
+                    .arg(&mut cache.v[li])
+                    .arg(&d.pos0_i)
+                    .arg(&d.n_tok)
+                    .arg(&d.stride)
+                    .launch(LaunchConfig::for_num_elems(kv_elems))?;
+            }
         }
 
         self.launch_attn(li, d, cache)?;
@@ -466,28 +514,137 @@ impl CudaModel {
             }
             AttnLaunch::Causal {
                 kernel,
+                kernel_d,
                 smem,
                 block_threads,
             } => {
-                let f = self.k.attn(kernel)?;
                 let smem_bytes = smem.bytes(d.head_dim, seq_len);
+                if d.use_device_pos {
+                    let kd = kernel_d.ok_or_else(|| {
+                        anyhow::anyhow!("decode backend has no device-pos kernel for graphs")
+                    })?;
+                    let f = self.k.attn(kd)?;
+                    unsafe {
+                        self.stream
+                            .launch_builder(f)
+                            .arg(&self.q)
+                            .arg(&cache.k[li])
+                            .arg(&cache.v[li])
+                            .arg(&mut self.xb)
+                            .arg(&d.n_head)
+                            .arg(&d.n_kv)
+                            .arg(&d.hd)
+                            .arg(&self.d_pos0)
+                            .arg(&d.n_tok)
+                            .arg(&d.scale)
+                            .launch(LaunchConfig {
+                                grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
+                                block_dim: (block_threads, 1, 1),
+                                shared_mem_bytes: smem_bytes,
+                            })?;
+                    }
+                } else {
+                    let f = self.k.attn(kernel)?;
+                    unsafe {
+                        self.stream
+                            .launch_builder(f)
+                            .arg(&self.q)
+                            .arg(&cache.k[li])
+                            .arg(&cache.v[li])
+                            .arg(&mut self.xb)
+                            .arg(&d.n_head)
+                            .arg(&d.n_kv)
+                            .arg(&d.hd)
+                            .arg(&d.pos0_i)
+                            .arg(&d.n_tok)
+                            .arg(&d.scale)
+                            .launch(LaunchConfig {
+                                grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
+                                block_dim: (block_threads, 1, 1),
+                                shared_mem_bytes: smem_bytes,
+                            })?;
+                    }
+                }
+                Ok(())
+            }
+            AttnLaunch::Flash {
+                partial,
+                partial_d,
+                reduce,
+                smem,
+                block_threads,
+                prefill_as,
+                n_split,
+            } => {
+                // Prefill multi-token: use fastv2 causal.
+                if d.n_tok != 1 {
+                    let fb = find_by_name(prefill_as).ok_or_else(|| {
+                        anyhow::anyhow!("flash prefill_as={prefill_as:?} missing from REGISTRY")
+                    })?;
+                    return self.launch_attn_spec(fb, li, d, cache);
+                }
+                let smem_bytes = smem.bytes(d.head_dim, seq_len);
+                let n_split_i = n_split as i32;
+                let one = 1i32;
+                if d.use_device_pos {
+                    let f = self.k.attn(partial_d)?;
+                    unsafe {
+                        self.stream
+                            .launch_builder(f)
+                            .arg(&self.q)
+                            .arg(&cache.k[li])
+                            .arg(&cache.v[li])
+                            .arg(&mut self.flash_partial)
+                            .arg(&d.n_head)
+                            .arg(&d.n_kv)
+                            .arg(&d.hd)
+                            .arg(&self.d_pos0)
+                            .arg(&one)
+                            .arg(&n_split_i)
+                            .arg(&d.scale)
+                            .launch(LaunchConfig {
+                                grid_dim: (d.n_head_u as u32, n_split, 1),
+                                block_dim: (block_threads, 1, 1),
+                                shared_mem_bytes: smem_bytes,
+                            })?;
+                    }
+                } else {
+                    let f = self.k.attn(partial)?;
+                    unsafe {
+                        self.stream
+                            .launch_builder(f)
+                            .arg(&self.q)
+                            .arg(&cache.k[li])
+                            .arg(&cache.v[li])
+                            .arg(&mut self.flash_partial)
+                            .arg(&d.n_head)
+                            .arg(&d.n_kv)
+                            .arg(&d.hd)
+                            .arg(&d.pos0_i)
+                            .arg(&one)
+                            .arg(&n_split_i)
+                            .arg(&d.scale)
+                            .launch(LaunchConfig {
+                                grid_dim: (d.n_head_u as u32, n_split, 1),
+                                block_dim: (block_threads, 1, 1),
+                                shared_mem_bytes: smem_bytes,
+                            })?;
+                    }
+                }
+                let fr = self.k.attn(reduce)?;
                 unsafe {
                     self.stream
-                        .launch_builder(f)
-                        .arg(&self.q)
-                        .arg(&cache.k[li])
-                        .arg(&cache.v[li])
+                        .launch_builder(fr)
+                        .arg(&self.flash_partial)
                         .arg(&mut self.xb)
                         .arg(&d.n_head)
-                        .arg(&d.n_kv)
                         .arg(&d.hd)
-                        .arg(&d.pos0_i)
-                        .arg(&d.n_tok)
-                        .arg(&d.scale)
+                        .arg(&n_split_i)
+                        .arg(&one)
                         .launch(LaunchConfig {
-                            grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
-                            block_dim: (block_threads, 1, 1),
-                            shared_mem_bytes: smem_bytes,
+                            grid_dim: (d.n_head_u as u32, 1, 1),
+                            block_dim: (d.head_dim as u32, 1, 1),
+                            shared_mem_bytes: 0,
                         })?;
                 }
                 Ok(())

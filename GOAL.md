@@ -24,8 +24,28 @@ If a change raises total server QPS but **lowers** single-stream decode `tok/s` 
 
 Use:
 
-- `profile-logs/latest_<model>.txt`
+- `profile-logs/latest_Qwen2.5-3B-Instruct-Q4_K_M.txt` (and matching `index.csv` rows)
 - `SUMMARY_KV` fields: `overall_decode_tps`, `decode_tps_first`, `decode_tps_last`, `decode_drop_pct`
+
+---
+
+## Model policy (mandatory)
+
+| Rule | Detail |
+|------|--------|
+| **Only 3B for profile / improve / A/B** | **Qwen2.5-3B-Instruct-Q4_K_M** is the **sole** model for performance work |
+| **Do not use 0.5B** | Not for profiling, not for “quick” speed A/B, not for declaring wins, not for agent iteration |
+| **Download** | Prefer `tarafer --download 3b` for the scoreboard model |
+| **Path** | `models/Qwen2.5-3B-Instruct-Q4_K_M.gguf` (local) or `~/models/…` / `/tmp/tara-models/…` (SSH) |
+
+**0.5B** may still exist in the download catalog for end users who want a tiny demo, but **this project’s optimize loop never uses it.**
+
+Canonical measure:
+
+```text
+tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode fastv2
+# or --decode flash / --cuda-graph as the experiment requires
+```
 
 ---
 
@@ -49,8 +69,9 @@ These matter for production multi-tenant serving. They are **not** the current g
 ## Target workload
 
 - **One** interactive session (CLI chat or one API client at a time).
-- Models: Qwen2.5 GGUF (e.g. 0.5B / 3B Q4_K_M), CUDA path in `crates/core`.
-- Hardware focus: consumer NVIDIA (e.g. RTX 3050 Ti 4GB); improvements should still help larger single GPUs when the same single stream runs there.
+- **Scoreboard model only:** **Qwen2.5-3B-Instruct-Q4_K_M** (see Model policy above). Larger models (7B/14B) are optional later; **not** 0.5B.
+- CUDA path in `crates/core`.
+- Hardware focus: consumer NVIDIA (e.g. RTX 3050 Ti 4GB) for smoke; **authoritative** numbers on SSH GPU (e.g. T4) with the **same 3B** weights.
 - Multi-turn chat with growing KV is normal — optimize so **late-context decode** stays as close as possible to early-context decode.
 
 Serialized server use (`--serve` with one request at a time) is fine as a delivery mode. **Do not** design the engine around many concurrent `/v1/chat/completions` callers.
@@ -88,10 +109,12 @@ When in doubt: **single-stream decode tok/s wins.**
 ## How we measure
 
 ```text
-cargo run --release -- models/<model>.gguf --profile --decode fastv2
+# ONLY 3B — never 0.5B for this goal
+cargo run --release -p taraference -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode fastv2
 ```
 
-Compare same model only (`latest_<model>.txt` / `index.csv`). Do not mix 0.5B and 3B when judging a win.
+Compare only `latest_Qwen2.5-3B-Instruct-Q4_K_M.txt` / matching `index.csv` rows.  
+**Never** use 0.5B (or other sizes) as a stand-in when judging a win.
 
 Report at least:
 

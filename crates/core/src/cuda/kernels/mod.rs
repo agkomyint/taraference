@@ -14,6 +14,7 @@ pub const SOURCE: &str = concat!(
     // ── attn backends (order free; symbols must match REGISTRY) ──
     include_str!("attn/fast_v1.cu"),
     include_str!("attn/fast_v2.cu"),
+    include_str!("attn/flash.cu"),
     include_str!("attn/basic.cu"),
     include_str!("attn/online.cu"),
 );

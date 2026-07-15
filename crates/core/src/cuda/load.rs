@@ -55,7 +55,16 @@ impl CudaModel {
         );
 
         let ctx = CudaContext::new(0).context("CudaContext")?;
-        let stream = ctx.default_stream();
+        // cudarc event-tracking inserts cuStreamWaitEvent around every buffer use.
+        // Those waits create cross-stream deps that make CUDA graph capture fail with
+        // CUDA_ERROR_STREAM_CAPTURE_ISOLATION. We use one stream only → tracking is
+        // unnecessary and must be off *before* any allocations.
+        // SAFETY: single inference stream; no concurrent multi-stream buffer sharing.
+        unsafe {
+            ctx.disable_event_tracking();
+        }
+        // Non-null stream required for CUDA graph capture (legacy default/null cannot capture).
+        let stream = ctx.new_stream().context("CudaStream (non-blocking)")?;
         // Match the live GPU (e.g. sm_86 laptop 3050 Ti, sm_75 Tesla T4).
         // Hardcoding sm_86 breaks PTX load on other arches.
         let (cc_major, cc_minor) = ctx
@@ -109,11 +118,16 @@ impl CudaModel {
             embed_q5_one: module.load_function("embed_q5_0_one")?,
             embed_q6_one: module.load_function("embed_q6_k_one")?,
             embed_q8_one: module.load_function("embed_q8_0_one")?,
+            embed_q4_one_d: module.load_function("embed_q4_k_one_d")?,
+            embed_q5_one_d: module.load_function("embed_q5_0_one_d")?,
+            embed_q6_one_d: module.load_function("embed_q6_k_one_d")?,
+            embed_q8_one_d: module.load_function("embed_q8_0_one_d")?,
             rms_norm: module.load_function("rms_norm_f32")?,
             silu_mul: module.load_function("silu_mul_f32")?,
             add: module.load_function("add_f32")?,
             add_bias: module.load_function("add_bias_f32")?,
             rope: module.load_function("rope_neox_f32")?,
+            rope_d: module.load_function("rope_neox_f32_d")?,
             attn: {
                 // Load only symbols listed in decode::REGISTRY (easy add/remove).
                 let mut map = std::collections::HashMap::new();
@@ -125,6 +139,7 @@ impl CudaModel {
                 map
             },
             copy_kv: module.load_function("copy_kv_f16")?,
+            copy_kv_d: module.load_function("copy_kv_f16_d")?,
             argmax: module.load_function("argmax_f32")?,
             copy_last: module.load_function("copy_last_row")?,
         };
@@ -169,10 +184,16 @@ impl CudaModel {
                 down: upload_mat(&format!("{p}.ffn_down.weight"))?,
             });
         }
-        eprintln!("ready | decode opts: fused Q5/Q4 dual GEMV + Q5 QKV when applicable");
+        // Ensure no pending default-stream work before inference/graphs.
+        ctx.synchronize().context("ctx sync after load")?;
+        eprintln!(
+            "ready | decode={} | fused dual GEMV | flash backend available | CUDA-graph ready",
+            decode.name()
+        );
 
         let n_embd = cfg.n_embd;
         let n_kv = cfg.n_head_kv * cfg.head_dim();
+        let head_dim = cfg.head_dim();
         let b = MAX_BATCH;
         // Split-K partials: enough for largest single-token GEMV (usually vocab).
         let gemv_partial_stride = cfg
@@ -181,6 +202,10 @@ impl CudaModel {
             .max(n_embd)
             .max(n_kv);
         const GEMV_SPLIT_MAX: usize = 8;
+        use super::decode::FLASH_MAX_SPLIT;
+        let flash_partial_stride = 2 + head_dim;
+        let flash_partial_n =
+            cfg.n_head * FLASH_MAX_SPLIT as usize * flash_partial_stride;
         Ok(Self {
             x: stream.alloc_zeros(b * n_embd)?,
             xb: stream.alloc_zeros(b * n_embd)?,
@@ -197,6 +222,14 @@ impl CudaModel {
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,
             gemv_partial: stream.alloc_zeros(GEMV_SPLIT_MAX * gemv_partial_stride)?,
             gemv_partial_stride,
+            d_pos0: stream.alloc_zeros(1)?,
+            d_token: stream.alloc_zeros(1)?,
+            flash_partial: stream.alloc_zeros(flash_partial_n)?,
+            flash_partial_stride,
+            decode_graph: None,
+            graph_tried: false,
+            cuda_graph: true,
+            graph_active: false,
             cfg,
             decode,
             gpu_name,

@@ -4,8 +4,16 @@ use super::decode::DecodeBackend;
 use super::kv::CudaKv;
 use super::types::{GpuLayer, GpuMat, Kernels};
 use crate::config::ModelConfig;
-use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaGraph, CudaModule, CudaSlice, CudaStream};
 use std::sync::Arc;
+
+/// `CudaGraph` is not `Send` in cudarc; we only use it under the engine mutex.
+pub(crate) struct SendCudaGraph(pub CudaGraph);
+
+// SAFETY: inference is single-threaded behind `Mutex<InferenceEngine>`; graph
+// is never shared across threads concurrently.
+unsafe impl Send for SendCudaGraph {}
+unsafe impl Sync for SendCudaGraph {}
 
 pub struct CudaModel {
     pub cfg: ModelConfig,
@@ -45,9 +53,37 @@ pub struct CudaModel {
     pub(crate) gemv_partial: CudaSlice<f32>,
     /// Capacity of one partial row (= max n_cols among gemv mats / vocab).
     pub(crate) gemv_partial_stride: usize,
+    /// Device pos0 for single-token decode / CUDA graphs.
+    pub(crate) d_pos0: CudaSlice<i32>,
+    /// Device token id for single-token embed / CUDA graphs.
+    pub(crate) d_token: CudaSlice<i32>,
+    /// Flash-decoding partial workspace: n_head * n_split * (2 + head_dim).
+    pub(crate) flash_partial: CudaSlice<f32>,
+    pub(crate) flash_partial_stride: usize, // 2 + head_dim
+    /// Captured single-token decode graph (replay after updating d_pos0/d_token).
+    pub(crate) decode_graph: Option<SendCudaGraph>,
+    /// Graph capture attempted (success or permanent fail).
+    pub(crate) graph_tried: bool,
+    /// When true, attempt capture after first single-token decode.
+    pub cuda_graph: bool,
+    /// True once a graph is live and replaying.
+    pub graph_active: bool,
 }
 
 impl CudaModel {
+    pub fn set_cuda_graph(&mut self, enabled: bool) {
+        self.cuda_graph = enabled;
+        if !enabled {
+            self.decode_graph = None;
+            self.graph_tried = false;
+            self.graph_active = false;
+        }
+    }
+
+    pub fn graph_active(&self) -> bool {
+        self.graph_active
+    }
+
     pub fn alloc_kv(&self, max_seq: usize) -> anyhow::Result<CudaKv> {
         let stride = self.cfg.n_head_kv * self.cfg.head_dim();
         let slot = max_seq * stride;
@@ -66,5 +102,11 @@ impl CudaModel {
             len: 0,
             max_seq,
         })
+    }
+
+    /// Drop CUDA graph (e.g. after backend switch — not used mid-session).
+    pub fn invalidate_decode_graph(&mut self) {
+        self.decode_graph = None;
+        self.graph_tried = false;
     }
 }

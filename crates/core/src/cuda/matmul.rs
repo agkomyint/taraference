@@ -506,4 +506,31 @@ impl CudaModel {
         }
         Ok(())
     }
+
+    /// Embed from `d_token` (device-side id; CUDA-graph safe).
+    pub(crate) fn embed_one_device(&mut self) -> Result<()> {
+        let n_rows = self.token_embd.n_rows as i32;
+        let col_bytes = self.token_embd.col_bytes as i32;
+        let f = match self.token_embd.wtype {
+            WType::Q4K => &self.k.embed_q4_one_d,
+            WType::Q5_0 => &self.k.embed_q5_one_d,
+            WType::Q6K => &self.k.embed_q6_one_d,
+            WType::Q8_0 => &self.k.embed_q8_one_d,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(f)
+                .arg(&self.token_embd.data)
+                .arg(&mut self.x)
+                .arg(&self.d_token)
+                .arg(&n_rows)
+                .arg(&col_bytes)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
 }

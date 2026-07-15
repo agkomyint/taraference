@@ -114,7 +114,16 @@ extern "C" __global__ void gemv_q4_k(
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    // Stage x with float4 loads when rows are multiple of 4 (always true for QK blocks).
+    {
+        int n4 = n_rows >> 2;
+        for (int i = tid; i < n4; i += GEMV_THREADS) {
+            float4 v = reinterpret_cast<const float4*>(x)[i];
+            int o = i << 2;
+            xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
+        }
+        for (int i = (n4 << 2) + tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    }
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
@@ -140,7 +149,15 @@ extern "C" __global__ void gemv_q6_k(
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    {
+        int n4 = n_rows >> 2;
+        for (int i = tid; i < n4; i += GEMV_THREADS) {
+            float4 v = reinterpret_cast<const float4*>(x)[i];
+            int o = i << 2;
+            xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
+        }
+        for (int i = (n4 << 2) + tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    }
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
@@ -166,7 +183,15 @@ extern "C" __global__ void gemv_q8_0(
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    {
+        int n4 = n_rows >> 2;
+        for (int i = tid; i < n4; i += GEMV_THREADS) {
+            float4 v = reinterpret_cast<const float4*>(x)[i];
+            int o = i << 2;
+            xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
+        }
+        for (int i = (n4 << 2) + tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    }
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
@@ -202,7 +227,15 @@ extern "C" __global__ void gemv_q5_0(
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    {
+        int n4 = n_rows >> 2;
+        for (int i = tid; i < n4; i += GEMV_THREADS) {
+            float4 v = reinterpret_cast<const float4*>(x)[i];
+            int o = i << 2;
+            xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
+        }
+        for (int i = (n4 << 2) + tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    }
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;

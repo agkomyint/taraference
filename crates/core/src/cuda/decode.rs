@@ -11,7 +11,8 @@
 //! 2. Remove its `include_str!` from `kernels/mod.rs`
 //! 3. Delete `kernels/attn/<file>.cu`
 //!
-//! Host launch is **data-driven** from [`AttnLaunch`] — no new match arms in `layer.rs`.
+//! Host launch is **data-driven** from [`AttnLaunch`] — no new match arms in `layer.rs`
+//! for normal causal backends; flash has a dedicated arm for partial+reduce.
 
 use anyhow::{bail, Result};
 use std::fmt;
@@ -43,6 +44,11 @@ impl SmemRule {
     }
 }
 
+/// Max sequence splits for flash-decoding (must match flash.cu FLASH_MAX_SPLIT).
+pub const FLASH_MAX_SPLIT: u32 = 8;
+/// Fixed splits for decode (CUDA-graph stable launch shape).
+pub const FLASH_DECODE_SPLIT: u32 = 4;
+
 /// Host launch shape for an attention kernel.
 #[derive(Clone, Copy, Debug)]
 pub enum AttnLaunch {
@@ -50,8 +56,20 @@ pub enum AttnLaunch {
     /// CUDA signature: `attn_*(q,k,v,out, n_head,n_kv,hd, pos0, n_q, scale)`.
     Causal {
         kernel: &'static str,
+        /// Device-pos0 variant for CUDA graphs (`*_d`).
+        kernel_d: Option<&'static str>,
         smem: SmemRule,
         block_threads: u32,
+    },
+    /// Flash-decoding: partial over splits + reduce. Prefill uses `prefill_as`.
+    Flash {
+        partial: &'static str,
+        partial_d: &'static str,
+        reduce: &'static str,
+        smem: SmemRule,
+        block_threads: u32,
+        prefill_as: &'static str,
+        n_split: u32,
     },
     /// Single-token online decode: grid `(n_head)`, block `head_dim`, arg `seq_len`.
     /// Prefill (`n_tok > 1`) uses another registry name.
@@ -85,26 +103,43 @@ pub struct DecodeSpec {
 /// All decode backends. Order = help list order. Default = the `is_default` row.
 pub static REGISTRY: &[DecodeSpec] = &[
     DecodeSpec {
+        name: "fastv2",
+        aliases: &["v2", "tiled"],
+        description: "v2: f16 KV + tiled online attn + CUDA-graph path — recommended",
+        launch: AttnLaunch::Causal {
+            kernel: "attn_fast_v2",
+            kernel_d: Some("attn_fast_v2_d"),
+            smem: SmemRule::HeadPlusTile { tile: 64 },
+            block_threads: 128,
+        },
+        is_default: true,
+    },
+    DecodeSpec {
+        name: "flash",
+        aliases: &["flashdec", "fd"],
+        description: "flash-decoding: split KV + reduce (helps long-ctx drop)",
+        launch: AttnLaunch::Flash {
+            partial: "attn_flash_partial",
+            partial_d: "attn_flash_partial_d",
+            reduce: "attn_flash_reduce",
+            smem: SmemRule::HeadPlusTile { tile: 64 },
+            block_threads: 128,
+            prefill_as: "fastv2",
+            n_split: FLASH_DECODE_SPLIT,
+        },
+        is_default: false,
+    },
+    DecodeSpec {
         name: "fast",
         aliases: &["fastv1", "v1", "parallel"],
         description: "v1: f16 KV + parallel softmax scores[ctx] smem — A/B baseline",
         launch: AttnLaunch::Causal {
             kernel: "attn_fast_v1",
+            kernel_d: None,
             smem: SmemRule::HeadPlusSeq,
             block_threads: 128,
         },
         is_default: false,
-    },
-    DecodeSpec {
-        name: "fastv2",
-        aliases: &["v2", "tiled"],
-        description: "v2: f16 KV + tiled online attn (fixed smem) — recommended",
-        launch: AttnLaunch::Causal {
-            kernel: "attn_fast_v2",
-            smem: SmemRule::HeadPlusTile { tile: 64 },
-            block_threads: 128,
-        },
-        is_default: true,
     },
     DecodeSpec {
         name: "basic",
@@ -112,6 +147,7 @@ pub static REGISTRY: &[DecodeSpec] = &[
         description: "f16 KV + serial softmax scores[ctx] — slow baseline",
         launch: AttnLaunch::Causal {
             kernel: "attn_basic_f32",
+            kernel_d: None,
             smem: SmemRule::SeqOnly,
             block_threads: 128,
         },
@@ -119,7 +155,7 @@ pub static REGISTRY: &[DecodeSpec] = &[
     },
     DecodeSpec {
         name: "online",
-        aliases: &["flash"],
+        aliases: &[],
         description: "f16 KV + online decode (1 tok); prefill uses fastv2",
         launch: AttnLaunch::OnlineDecode {
             kernel: "attn_online_f32",
@@ -172,10 +208,30 @@ impl DecodeBackend {
         let mut out = Vec::new();
         for s in REGISTRY {
             match s.launch {
-                AttnLaunch::Causal { kernel, .. } => push_unique(&mut out, kernel),
+                AttnLaunch::Causal {
+                    kernel, kernel_d, ..
+                } => {
+                    push_unique(&mut out, kernel);
+                    if let Some(kd) = kernel_d {
+                        push_unique(&mut out, kd);
+                    }
+                }
+                AttnLaunch::Flash {
+                    partial,
+                    partial_d,
+                    reduce,
+                    ..
+                } => {
+                    push_unique(&mut out, partial);
+                    push_unique(&mut out, partial_d);
+                    push_unique(&mut out, reduce);
+                }
                 AttnLaunch::OnlineDecode { kernel, .. } => push_unique(&mut out, kernel),
             }
         }
+        // Prefill fallbacks + graph variants always useful.
+        push_unique(&mut out, "attn_fast_v2");
+        push_unique(&mut out, "attn_fast_v2_d");
         out
     }
 
@@ -214,7 +270,6 @@ impl Default for DecodeBackend {
                 return DecodeBackend { idx: i as u8 };
             }
         }
-        // Fallback: first entry
         DecodeBackend { idx: 0 }
     }
 }
@@ -246,6 +301,7 @@ mod tests {
     fn default_is_marked() {
         let d = DecodeBackend::default();
         assert!(d.spec().is_default);
+        assert_eq!(d.name(), "fastv2");
     }
 
     #[test]
@@ -265,6 +321,7 @@ mod tests {
     fn symbols_cover_registry() {
         let syms = DecodeBackend::required_kernel_symbols();
         assert!(syms.contains(&"attn_fast_v2"));
+        assert!(syms.contains(&"attn_flash_partial"));
         assert!(syms.contains(&"attn_online_f32"));
     }
 }
