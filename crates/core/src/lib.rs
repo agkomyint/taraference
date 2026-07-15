@@ -8,5 +8,5 @@ pub mod tokenizer;
 
 pub use config::ModelConfig;
 pub use cuda::{CudaKv, CudaModel};
-pub use session::Session;
+pub use session::{Session, TurnStats};
 pub use tokenizer::Tokenizer;

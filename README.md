@@ -15,6 +15,20 @@ No flags needed. Defaults:
 
 Optional one-shot: `--prompt "Hello"`. Chat: type messages, `/quit`, `/reset`.
 
+### Profile / benchmark (multi-turn + CPU/GPU)
+
+```powershell
+cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile
+```
+
+Runs a **5-turn** chat script (greeting → follow-ups → summarize) so KV/context grows like a real user. Samples CPU/GPU every ~100 ms, then prints per-turn + aggregate report.
+
+Single-turn microbench only:
+
+```powershell
+cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --prompt "Hello"
+```
+
 ## Layout
 
 | Path | Role |

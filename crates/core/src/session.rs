@@ -6,6 +6,20 @@ use anyhow::Result;
 use std::io::{self, Write};
 use std::time::Instant;
 
+/// Timing / token counts from one `turn`.
+#[derive(Debug, Clone)]
+pub struct TurnStats {
+    pub reply: String,
+    pub prompt_tokens: usize,
+    pub gen_tokens: usize,
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
+    pub decode_tps: f64,
+    pub prefill_tps: f64,
+    pub ctx_len: usize,
+    pub wall_ms: f64,
+}
+
 pub struct Session<'a> {
     model: &'a mut CudaModel,
     tok: &'a Tokenizer,
@@ -47,13 +61,15 @@ impl<'a> Session<'a> {
         s
     }
 
-    pub fn turn(&mut self, user: &str) -> Result<String> {
+    pub fn turn(&mut self, user: &str) -> Result<TurnStats> {
+        let wall = Instant::now();
         let first = !self.primed;
         let prompt = self.build_user_prompt(user, first);
         let ids = self.tok.encode(&prompt, false);
         if ids.is_empty() {
             anyhow::bail!("tokenizer produced 0 tokens for prompt");
         }
+        let prompt_tokens = ids.len();
         self.primed = true;
 
         let t0 = Instant::now();
@@ -88,18 +104,35 @@ impl<'a> Session<'a> {
         }
 
         let n = reply_ids.len();
-        let gen_s = t1.elapsed().as_secs_f64();
-        let tps = if n > 0 {
+        let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let gen_s = decode_ms / 1000.0;
+        let decode_tps = if n > 0 {
             n as f64 / gen_s.max(1e-6)
+        } else {
+            0.0
+        };
+        let prefill_tps = if prompt_tokens > 0 {
+            prompt_tokens as f64 / (prefill_ms / 1000.0).max(1e-6)
         } else {
             0.0
         };
         println!();
         eprintln!(
-            "[{n} tok | prefill {prefill_ms:.0} ms | decode {tps:.1} tok/s | ctx {}]",
+            "[{n} tok | prefill {prefill_ms:.0} ms | decode {decode_tps:.1} tok/s | ctx {}]",
             self.cache.len
         );
-        Ok(reply)
+
+        Ok(TurnStats {
+            reply,
+            prompt_tokens,
+            gen_tokens: n,
+            prefill_ms,
+            decode_ms,
+            decode_tps,
+            prefill_tps,
+            ctx_len: self.cache.len,
+            wall_ms: wall.elapsed().as_secs_f64() * 1000.0,
+        })
     }
 
     pub fn run_repl(&mut self) -> Result<()> {
