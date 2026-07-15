@@ -6,6 +6,8 @@
 
 #define GEMV_WARPS 32
 #define GEMV_THREADS (GEMV_WARPS * 32)
+#define Q5_GEMV_WARPS 8
+#define Q5_GEMV_THREADS (Q5_GEMV_WARPS * 32)
 // Must match matmul.rs GEMV_SPLIT_MAX
 #define GEMV_SPLIT_MAX 8
 
@@ -126,6 +128,67 @@ __device__ __forceinline__ float dot_q4_k_col_q8_range(
     return warp_sum(acc);
 }
 
+__device__ __forceinline__ float2 dot_q4_k_pair_q8_range(
+    const unsigned char* __restrict__ col_a,
+    const unsigned char* __restrict__ col_b,
+    const signed char* __restrict__ q8,
+    const float* __restrict__ d8,
+    int bi0, int bi1, int lane
+) {
+    float acc[2] = {0.f, 0.f};
+    const int iqs = 2 * (lane & 15);
+    const int q8_offset = 2 * ((iqs >> 1) >> 2);
+    const int q4_offset = 16 * q8_offset + 4 * ((iqs >> 1) & 3);
+    const int q8_word = (iqs >> 1) & 3;
+    for (int bi = bi0 + (lane >> 4); bi < bi1; bi += 2) {
+        const int local_block = bi - bi0;
+        const signed char* qb0 = q8 + (local_block * 8 + q8_offset) * 32;
+        const int* u0 = reinterpret_cast<const int*>(qb0) + q8_word;
+        const int* u1 = reinterpret_cast<const int*>(qb0 + 32) + q8_word;
+        const int ua0 = u0[0], ua1 = u0[4];
+        const int ub0 = u1[0], ub1 = u1[4];
+        const int sum0 = __dp4a(0x01010101, ua0, __dp4a(0x01010101, ua1, 0));
+        const int sum1 = __dp4a(0x01010101, ub0, __dp4a(0x01010101, ub1, 0));
+        const float d80 = d8[local_block * 8 + q8_offset];
+        const float d81 = d8[local_block * 8 + q8_offset + 1];
+        const unsigned char* bases[2] = {
+            col_a + bi * 144,
+            col_b + bi * 144,
+        };
+        #pragma unroll
+        for (int matrix = 0; matrix < 2; matrix++) {
+            const unsigned char* base = bases[matrix];
+            const float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+            const float minv = half_to_float((unsigned short)(base[2] | (base[3] << 8)));
+            const unsigned short* sc16 = reinterpret_cast<const unsigned short*>(base + 4);
+            const int* q4 = reinterpret_cast<const int*>(base + 16 + q4_offset);
+            const int v0 = q4[0];
+            const int v1 = q4[4];
+            unsigned short aux0, aux1;
+            const int j = q8_offset >> 1;
+            if (j < 2) {
+                aux0 = sc16[j] & 0x3f3f;
+                aux1 = sc16[j + 2] & 0x3f3f;
+            } else {
+                aux0 = ((sc16[j + 2] >> 0) & 0x0f0f) | ((sc16[j - 2] & 0xc0c0) >> 2);
+                aux1 = ((sc16[j + 2] >> 4) & 0x0f0f) | ((sc16[j] & 0xc0c0) >> 2);
+            }
+            const int dot0 = __dp4a(v0 & 0x0f0f0f0f, ua0,
+                             __dp4a(v1 & 0x0f0f0f0f, ua1, 0));
+            const int dot1 = __dp4a((v0 >> 4) & 0x0f0f0f0f, ub0,
+                             __dp4a((v1 >> 4) & 0x0f0f0f0f, ub1, 0));
+            acc[matrix] += d * (d80 * (float)(dot0 * (int)(unsigned char)(aux0 & 0xff))
+                              + d81 * (float)(dot1 * (int)(unsigned char)(aux0 >> 8)));
+            acc[matrix] -= minv * (d80 * (float)(sum0 * (int)(unsigned char)(aux1 & 0xff))
+                                 + d81 * (float)(sum1 * (int)(unsigned char)(aux1 >> 8)));
+        }
+    }
+    float2 result;
+    result.x = warp_sum(acc[0]);
+    result.y = warp_sum(acc[1]);
+    return result;
+}
+
 __device__ __forceinline__ float dot_q4_k_col_xs_range(
     const unsigned char* __restrict__ col,
     const float* __restrict__ xs,
@@ -235,6 +298,43 @@ __device__ __forceinline__ float dot_q6_k_repack_q8_range(
     return warp_sum(acc);
 }
 
+__device__ __forceinline__ float dot_q6_k_compact_q8_range(
+    const unsigned char* __restrict__ col,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    int bi0, int bi1, int lane
+) {
+    float acc = 0.f;
+    for (int bi = bi0; bi < bi1; bi++) {
+        const unsigned char* base = col + bi * 212;
+        const signed char* sc = reinterpret_cast<const signed char*>(base + 192);
+        const float d = half_to_float((unsigned short)(base[208] | (base[209] << 8)));
+        const int local = (bi - bi0) * 256;
+        #pragma unroll
+        for (int g = lane; g < 64; g += 32) {
+            const int i = g * 4;
+            const int half = i >> 7;
+            const int segment = (i & 127) >> 5;
+            const int offset = i & 31;
+            const unsigned int ql = *reinterpret_cast<const unsigned int*>(
+                base + half * 64 + (segment & 1) * 32 + offset
+            );
+            const unsigned int qh = *reinterpret_cast<const unsigned int*>(
+                base + 128 + half * 32 + offset
+            );
+            const unsigned int lo = segment < 2
+                ? (ql & 0x0f0f0f0fu) : ((ql >> 4) & 0x0f0f0f0fu);
+            const unsigned int hi = (qh >> (segment * 2)) & 0x03030303u;
+            const unsigned int raw = lo | (hi << 4);
+            const int wpack = __vsubss4((int)raw, 0x20202020);
+            const int apack = *reinterpret_cast<const int*>(xq + local + i);
+            const int dot = __dp4a(wpack, apack, 0);
+            acc += d * (float)sc[i >> 4] * xd[(local + i) >> 5] * (float)dot;
+        }
+    }
+    return warp_sum(acc);
+}
+
 __device__ __forceinline__ float dot_q6_k_repack_q8_global_range(
     const unsigned char* __restrict__ col,
     const signed char* __restrict__ xq,
@@ -315,16 +415,17 @@ extern "C" __global__ void gemv_q6_k(
     const int warp = tid >> 5;
     {
         int n4 = n_rows >> 2;
-        for (int i = tid; i < n4; i += GEMV_THREADS) {
+        for (int i = tid; i < n4; i += (int)blockDim.x) {
             float4 v = reinterpret_cast<const float4*>(x)[i];
             int o = i << 2;
             xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
         }
-        for (int i = (n4 << 2) + tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+        for (int i = (n4 << 2) + tid; i < n_rows; i += (int)blockDim.x) xs[i] = x[i];
     }
     __syncthreads();
 
-    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    int j = (int)blockIdx.x * warps_per_block + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = dot_q6_k_col_xs(col, xs, n_rows, lane);
@@ -352,7 +453,8 @@ extern "C" __global__ void gemv_q6_k_repack(
     quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
     __syncthreads();
 
-    const int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = dot_q6_k_repack_q8_range(col, xq, xd, 0, n_rows / 256, lane);
@@ -400,6 +502,29 @@ extern "C" __global__ void gemv_q6_k_repack_global(
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = dot_q6_k_repack_q8_range(col, xq, xd, 0, n_rows / 256, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+extern "C" __global__ void gemv_q6_k_compact_global(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q6_k_compact_q8_range(col, xq, xd, 0, n_rows / 256, lane);
     if (lane == 0) {
         acc = gemv_apply_res(use_res, acc, out, j, residual);
         if (use_bias) acc += bias[j];
@@ -465,16 +590,16 @@ extern "C" __global__ void gemv_q5_0(
     const int warp = tid >> 5;
     {
         int n4 = n_rows >> 2;
-        for (int i = tid; i < n4; i += GEMV_THREADS) {
+        for (int i = tid; i < n4; i += Q5_GEMV_THREADS) {
             float4 v = reinterpret_cast<const float4*>(x)[i];
             int o = i << 2;
             xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
         }
-        for (int i = (n4 << 2) + tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+        for (int i = (n4 << 2) + tid; i < n_rows; i += Q5_GEMV_THREADS) xs[i] = x[i];
     }
     __syncthreads();
 
-    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    int j = (int)blockIdx.x * Q5_GEMV_WARPS + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = 0.f;
@@ -544,6 +669,36 @@ extern "C" __global__ void gemv_q4_k_splitk(
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = dot_q4_k_col_q8_range(col, xq, xd, bi0, bi1, lane);
     if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = acc;
+}
+
+extern "C" __global__ void gemv_q4_k_global_splitk(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ partial,
+    int n_rows, int n_cols, int col_bytes, int n_split
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int s = (int)blockIdx.y;
+    const int j = (int)blockIdx.x;
+    if (s >= n_split || j >= n_cols) return;
+    const int n_blocks = n_rows / 256;
+    const int split_bi0 = (n_blocks * s) / n_split;
+    const int split_bi1 = (n_blocks * (s + 1)) / n_split;
+    const int mid = (split_bi0 + split_bi1 + 1) / 2;
+    const int bi0 = warp == 0 ? split_bi0 : mid;
+    const int bi1 = warp == 0 ? mid : split_bi1;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q4_k_col_q8_range(
+        col, xq + bi0 * 256, xd + bi0 * 8, bi0, bi1, lane
+    );
+    __shared__ float second;
+    if (warp == 1 && lane == 0) second = acc;
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        partial[(size_t)s * (size_t)n_cols + j] = acc + second;
+    }
 }
 
 extern "C" __global__ void gemv_q6_k_splitk(
@@ -637,6 +792,64 @@ extern "C" __global__ void gemv_q6_k_repack_global_splitk(
     if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = acc;
 }
 
+extern "C" __global__ void gemv_q6_k_compact_global_splitk(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ partial,
+    int n_rows, int n_cols, int col_bytes, int n_split
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int s = (int)blockIdx.y;
+    if (s >= n_split) return;
+    const int nsb = n_rows / 256;
+    const int bi0 = (nsb * s) / n_split;
+    const int bi1 = (nsb * (s + 1)) / n_split;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    const float acc = dot_q6_k_compact_q8_range(
+        col, xq + bi0 * 256, xd + bi0 * 8, bi0, bi1, lane
+    );
+    if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = acc;
+}
+
+// One output column per block.  Four warps split the tall K dimension and
+// reduce in shared memory, avoiding the separate partial-buffer reduction
+// launch used by conventional split-K.
+extern "C" __global__ void gemv_q6_k_compact_global_4way(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    __shared__ float warp_acc[4];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols) return;
+    const int nsb = n_rows / 256;
+    const int bi0 = (nsb * warp) / 4;
+    const int bi1 = (nsb * (warp + 1)) / 4;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    const float acc = dot_q6_k_compact_q8_range(
+        col, xq + bi0 * 256, xd + bi0 * 8, bi0, bi1, lane
+    );
+    if (lane == 0) warp_acc[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = warp_acc[0] + warp_acc[1] + warp_acc[2] + warp_acc[3];
+        total = gemv_apply_res(use_res, total, out, j, residual);
+        if (use_bias) total += bias[j];
+        out[j] = total;
+    }
+}
+
 extern "C" __global__ void gemv_q8_0_splitk(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
@@ -696,10 +909,10 @@ extern "C" __global__ void gemv_q5_0_splitk(
     const int bi1 = (nb * (s + 1)) / n_split;
     const int row0 = bi0 * 32;
     const int n_local = (bi1 - bi0) * 32;
-    for (int i = tid; i < n_local; i += GEMV_THREADS) xs[i] = x[row0 + i];
+    for (int i = tid; i < n_local; i += Q5_GEMV_THREADS) xs[i] = x[row0 + i];
     __syncthreads();
 
-    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    int j = (int)blockIdx.x * Q5_GEMV_WARPS + warp;
     if (j >= n_cols) return;
     if (bi0 >= bi1) {
         if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = 0.f;
@@ -801,10 +1014,10 @@ extern "C" __global__ void gemv_q5_0_qk(
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    for (int i = tid; i < n_rows; i += Q5_GEMV_THREADS) xs[i] = x[i];
     __syncthreads();
 
-    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    int j = (int)blockIdx.x * Q5_GEMV_WARPS + warp;
     int n_tot = n_q + n_k;
     if (j >= n_tot) return;
 
@@ -849,8 +1062,7 @@ extern "C" __global__ void gemv_q4_k_pair(
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-
-    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    const int j = (int)blockIdx.x;
     int n_tot = n_a + n_b;
     if (j >= n_tot) return;
 
@@ -871,10 +1083,59 @@ extern "C" __global__ void gemv_q4_k_pair(
         oj = jb;
     }
 
-    float acc = dot_q4_k_col_q8_range(wcol, xq, xd, 0, n_rows / 256, lane);
-    if (lane == 0) {
+    const int n_blocks = n_rows / 256;
+    const int split = (n_blocks + 1) / 2;
+    const int bi0 = warp == 0 ? 0 : split;
+    const int bi1 = warp == 0 ? split : n_blocks;
+    float acc = dot_q4_k_col_q8_range(
+        wcol, xq + bi0 * 256, xd + bi0 * 8, bi0, bi1, lane
+    );
+    __shared__ float second;
+    if (warp == 1 && lane == 0) second = acc;
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        acc += second;
         if (use_bias) acc += bias[oj];
         out[oj] = acc;
+    }
+}
+
+// Equal-width Q4_K pair (FFN gate+up): one output row per block so the same
+// two warps reuse the activation cache lines for both matrices.
+extern "C" __global__ void gemv_q4_k_dual(
+    const unsigned char* __restrict__ wa,
+    const unsigned char* __restrict__ wb,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out_a,
+    float* __restrict__ out_b,
+    int n_rows, int n_cols, int col_bytes
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols) return;
+    const int n_blocks = n_rows / 256;
+    const int split = (n_blocks + 1) / 2;
+    const int bi0 = warp == 0 ? 0 : split;
+    const int bi1 = warp == 0 ? split : n_blocks;
+    const signed char* xq_local = xq + bi0 * 256;
+    const float* xd_local = xd + bi0 * 8;
+    const float2 pair = dot_q4_k_pair_q8_range(
+        wa + (size_t)j * (size_t)col_bytes,
+        wb + (size_t)j * (size_t)col_bytes,
+        xq_local, xd_local, bi0, bi1, lane
+    );
+    __shared__ float a_second;
+    __shared__ float b_second;
+    if (warp == 1 && lane == 0) {
+        a_second = pair.x;
+        b_second = pair.y;
+    }
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        out_a[j] = pair.x + a_second;
+        out_b[j] = pair.y + b_second;
     }
 }
 
@@ -944,10 +1205,10 @@ extern "C" __global__ void gemv_q5_0_qkv(
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    for (int i = tid; i < n_rows; i += Q5_GEMV_THREADS) xs[i] = x[i];
     __syncthreads();
 
-    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    int j = (int)blockIdx.x * Q5_GEMV_WARPS + warp;
     int n_tot = n_q + n_k + n_v;
     if (j >= n_tot) return;
 

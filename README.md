@@ -9,7 +9,9 @@ CUDA multi-turn GGUF inference, optimized for single-stream decode on NVIDIA GPU
 **Performance scoreboard:** all profiling and speed claims use
 `Qwen2.5-3B-Instruct-Q4_K_M.gguf`. See [GOAL.md](GOAL.md).
 
-**v0.4 decode path:** Q4_K×Q8 shared-memory activation quantization with packed DP4A dots, fused Q4/Q5 projections, eight-way flash decode, CUDA graphs, and dynamic NVRTC `sm_XX` targeting.
+**v0.5 decode path:** packed Q4_K/Q6_K × Q8 DP4A kernels, fused equal-width
+gate+up projections, cooperative in-block Q6 split-K reduction, eight-way flash
+decode, CUDA graphs, and dynamic NVRTC `sm_XX` targeting.
 
 **Day-to-day loop** (edit locally, sync/build/profile directly on SSH T4): [WORKFLOW.md](WORKFLOW.md).
 

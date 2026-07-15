@@ -9,6 +9,9 @@ use std::sync::Arc;
 /// Must match `GEMV_WARPS` in gemv.cu.
 const GEMV_WARPS: u32 = 32;
 const GEMV_THREADS: u32 = GEMV_WARPS * 32;
+/// Q5 kernels use more registers per thread; 1024-thread blocks exceed T4 resources.
+const Q5_GEMV_WARPS: u32 = 8;
+const Q5_GEMV_THREADS: u32 = Q5_GEMV_WARPS * 32;
 /// Must match `GEMV_SPLIT_MAX` in gemv.cu / load.rs.
 pub(crate) const GEMV_SPLIT_MAX: u32 = 8;
 /// Only split-K when staging `x` would use large shared memory (FFN-tall mats).
@@ -21,6 +24,14 @@ pub(crate) fn lc_gemv(n_cols: u32, n_rows: u32) -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((n_cols + GEMV_WARPS - 1) / GEMV_WARPS, 1, 1),
         block_dim: (GEMV_THREADS, 1, 1),
+        shared_mem_bytes: n_rows * 4,
+    }
+}
+
+fn lc_q5_gemv(n_cols: u32, n_rows: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((n_cols + Q5_GEMV_WARPS - 1) / Q5_GEMV_WARPS, 1, 1),
+        block_dim: (Q5_GEMV_THREADS, 1, 1),
         shared_mem_bytes: n_rows * 4,
     }
 }
@@ -62,6 +73,18 @@ fn lc_gemv_splitk(n_cols: u32, n_split: u32, rows_per_split: u32) -> LaunchConfi
     LaunchConfig {
         grid_dim: ((n_cols + GEMV_WARPS - 1) / GEMV_WARPS, n_split, 1),
         block_dim: (GEMV_THREADS, 1, 1),
+        shared_mem_bytes: rows_per_split * 4,
+    }
+}
+
+fn lc_q5_gemv_splitk(n_cols: u32, n_split: u32, rows_per_split: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (
+            (n_cols + Q5_GEMV_WARPS - 1) / Q5_GEMV_WARPS,
+            n_split,
+            1,
+        ),
+        block_dim: (Q5_GEMV_THREADS, 1, 1),
         shared_mem_bytes: rows_per_split * 4,
     }
 }
@@ -136,6 +159,11 @@ pub(crate) fn try_gemv_global_q8(
     let n_split = gemv_n_split(w.n_rows);
     let (f, data, col_bytes) = match w.wtype {
         WType::Q4K => (&k.gemv_q4_global, &w.data, w.col_bytes),
+        WType::Q6K if w.compact_data.is_some() => (
+            &k.gemv_q6_compact_global,
+            w.compact_data.as_ref().unwrap(),
+            w.compact_col_bytes,
+        ),
         WType::Q6K if w.decode_data.is_some() => (
             &k.gemv_q6_repack_global,
             w.decode_data.as_ref().unwrap(),
@@ -159,14 +187,55 @@ pub(crate) fn try_gemv_global_q8(
     };
     quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
     if n_split > 1 {
-        if w.wtype != WType::Q6K || w.decode_data.is_none() || w.n_cols > partial_stride {
+        if w.n_cols > partial_stride {
             return Ok(false);
         }
+        if w.wtype == WType::Q6K && w.compact_data.is_some() && n_split == 4 {
+            unsafe {
+                stream
+                    .launch_builder(&k.gemv_q6_compact_global_4way)
+                    .arg(data)
+                    .arg(&*q8_x)
+                    .arg(&*q8_d)
+                    .arg(y)
+                    .arg(&n_rows)
+                    .arg(&n_cols)
+                    .arg(&col_bytes)
+                    .arg(&use_bias)
+                    .arg(bias_ptr)
+                    .arg(&use_res)
+                    .arg(residual_ptr)
+                    .launch(LaunchConfig {
+                        grid_dim: (w.n_cols as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            return Ok(true);
+        }
+        let (split_f, split_grid, split_block) = match w.wtype {
+            WType::Q4K => (
+                &k.gemv_q4_global_splitk,
+                (w.n_cols as u32, n_split, 1),
+                (64, 1, 1),
+            ),
+            WType::Q6K if w.compact_data.is_some() => (
+                &k.gemv_q6_compact_global_splitk,
+                ((w.n_cols as u32 + 3) / 4, n_split, 1),
+                (128, 1, 1),
+            ),
+            WType::Q6K if w.decode_data.is_some() => (
+                &k.gemv_q6_repack_global_splitk,
+                ((w.n_cols as u32 + GEMV_WARPS - 1) / GEMV_WARPS, n_split, 1),
+                (GEMV_THREADS, 1, 1),
+            ),
+            _ => return Ok(false),
+        };
         let n_split_i = n_split as i32;
         unsafe {
             stream
-                .launch_builder(&k.gemv_q6_repack_global_splitk)
-                .arg(w.decode_data.as_ref().unwrap())
+                .launch_builder(split_f)
+                .arg(data)
                 .arg(q8_x)
                 .arg(q8_d)
                 .arg(&mut *partial)
@@ -175,8 +244,8 @@ pub(crate) fn try_gemv_global_q8(
                 .arg(&col_bytes)
                 .arg(&n_split_i)
                 .launch(LaunchConfig {
-                    grid_dim: ((w.n_cols as u32 + GEMV_WARPS - 1) / GEMV_WARPS, n_split, 1),
-                    block_dim: (GEMV_THREADS, 1, 1),
+                    grid_dim: split_grid,
+                    block_dim: split_block,
                     shared_mem_bytes: 0,
                 })?;
             stream
@@ -267,7 +336,12 @@ fn gemv_baseline(
                 lb.arg(r);
             }
         }
-        lb.launch(lc_gemv(w.n_cols as u32, w.n_rows as u32))?;
+        let lc = if matches!(w.wtype, WType::Q5_0 | WType::Q6K) {
+            lc_q5_gemv(w.n_cols as u32, w.n_rows as u32)
+        } else {
+            lc_gemv(w.n_cols as u32, w.n_rows as u32)
+        };
+        lb.launch(lc)?;
     }
     Ok(())
 }
@@ -330,7 +404,11 @@ fn gemv_splitk(
             .arg(&n_cols)
             .arg(&col_bytes)
             .arg(&n_split_i)
-            .launch(lc_gemv_splitk(w.n_cols as u32, n_split, rows_per_split))?;
+            .launch(if w.wtype == WType::Q5_0 {
+                lc_q5_gemv_splitk(w.n_cols as u32, n_split, rows_per_split)
+            } else {
+                lc_gemv_splitk(w.n_cols as u32, n_split, rows_per_split)
+            })?;
 
         let mut lb = stream.launch_builder(&k.gemv_splitk_reduce);
         lb.arg(&*partial)
@@ -376,6 +454,33 @@ pub(crate) fn try_gemv_pair(
         return Ok(true);
     }
     try_gemv_q4_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb, q8_x, q8_d)
+}
+
+/// Equal-width Q4_K pair with both matrices evaluated by the same block.
+pub(crate) fn try_gemv_q4_dual(
+    stream: &Arc<CudaStream>, k: &Kernels, wa: &GpuMat, wb: &GpuMat,
+    x: &CudaSlice<f32>, out_a: &mut CudaSlice<f32>, out_b: &mut CudaSlice<f32>,
+    q8_x: &mut CudaSlice<i8>, q8_d: &mut CudaSlice<f32>,
+) -> Result<bool> {
+    if wa.wtype != WType::Q4K || wb.wtype != WType::Q4K
+        || wa.n_rows != wb.n_rows || wa.n_cols != wb.n_cols
+        || wa.col_bytes != wb.col_bytes {
+        return Ok(false);
+    }
+    let n_rows = wa.n_rows as i32;
+    let n_cols = wa.n_cols as i32;
+    let col_bytes = wa.col_bytes as i32;
+    quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+    unsafe {
+        stream.launch_builder(&k.gemv_q4_dual)
+            .arg(&wa.data).arg(&wb.data).arg(q8_x).arg(q8_d)
+            .arg(out_a).arg(out_b).arg(&n_rows).arg(&n_cols).arg(&col_bytes)
+            .launch(LaunchConfig {
+                grid_dim: (wa.n_cols as u32, 1, 1),
+                block_dim: (64, 1, 1), shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(true)
 }
 
 fn try_gemv_q4_pair(
@@ -428,7 +533,11 @@ fn try_gemv_q4_pair(
             .arg(&use_bias)
             .arg(ba_p)
             .arg(bb_p)
-            .launch(lc_gemv_quantized(n_tot))?;
+            .launch(LaunchConfig {
+                grid_dim: (n_tot, 1, 1),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
     }
     Ok(true)
 }
@@ -482,7 +591,7 @@ fn try_gemv_q5_pair(
             .arg(&use_bias)
             .arg(ba_p)
             .arg(bb_p)
-            .launch(lc_gemv(n_tot, wa.n_rows as u32))?;
+            .launch(lc_q5_gemv(n_tot, wa.n_rows as u32))?;
     }
     Ok(true)
 }
@@ -593,7 +702,7 @@ pub(crate) fn try_gemv_qkv(
             .arg(bq_p)
             .arg(bk_p)
             .arg(bv_p)
-            .launch(lc_gemv(n_tot, wq.n_rows as u32))?;
+            .launch(lc_q5_gemv(n_tot, wq.n_rows as u32))?;
     }
     Ok(true)
 }

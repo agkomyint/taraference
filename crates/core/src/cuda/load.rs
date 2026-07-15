@@ -35,33 +35,17 @@ fn f32_host(gguf: &GgufFile, name: &str) -> Result<Vec<f32>> {
     Ok(v)
 }
 
-const Q6_REPACK_BLOCK_BYTES: usize = 276;
+const Q6_COMPACT_BLOCK_BYTES: usize = 212;
 
-fn q6_value(base: &[u8], i: usize) -> i8 {
-    let half = i >> 7;
-    let within = i & 127;
-    let segment = within >> 5;
-    let lane = within & 31;
-    let lo_byte = base[half * 64 + (segment & 1) * 32 + lane];
-    let lo = if segment < 2 { lo_byte & 0x0f } else { lo_byte >> 4 };
-    let hi = (base[128 + half * 32 + lane] >> (segment * 2)) & 3;
-    ((lo | (hi << 4)) as i8) - 32
-}
-
-/// Expand Q6_K's split 4+2-bit representation once at load time.  Decode then
-/// streams aligned signed bytes + the original per-16 scales and block scale.
-fn repack_q6_decode(raw: &[u8], n_rows: usize, n_cols: usize, col_bytes: usize) -> Vec<u8> {
+fn align_q6_decode(raw: &[u8], n_rows: usize, n_cols: usize, col_bytes: usize) -> Vec<u8> {
     let n_blocks = n_rows / 256;
-    let decode_col_bytes = n_blocks * Q6_REPACK_BLOCK_BYTES;
-    let mut out = vec![0u8; n_cols * decode_col_bytes];
+    let compact_col_bytes = n_blocks * Q6_COMPACT_BLOCK_BYTES;
+    let mut out = vec![0u8; n_cols * compact_col_bytes];
     for col in 0..n_cols {
         for bi in 0..n_blocks {
-            let src = &raw[col * col_bytes + bi * 210..][..210];
-            let dst0 = col * decode_col_bytes + bi * Q6_REPACK_BLOCK_BYTES;
-            for i in 0..256 {
-                out[dst0 + i] = q6_value(src, i) as u8;
-            }
-            out[dst0 + 256..dst0 + 274].copy_from_slice(&src[192..210]);
+            let src = col * col_bytes + bi * 210;
+            let dst = col * compact_col_bytes + bi * Q6_COMPACT_BLOCK_BYTES;
+            out[dst..dst + 210].copy_from_slice(&raw[src..src + 210]);
         }
     }
     out
@@ -133,18 +117,25 @@ impl CudaModel {
             gemv_q6: module.load_function("gemv_q6_k")?,
             gemv_q6_repack: module.load_function("gemv_q6_k_repack")?,
             gemv_q6_repack_global: module.load_function("gemv_q6_k_repack_global")?,
+            gemv_q6_compact_global: module.load_function("gemv_q6_k_compact_global")?,
+            gemv_q6_compact_global_4way: module
+                .load_function("gemv_q6_k_compact_global_4way")?,
             gemv_q8: module.load_function("gemv_q8_0")?,
             gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
+            gemv_q4_global_splitk: module.load_function("gemv_q4_k_global_splitk")?,
             gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,
             gemv_q6_splitk: module.load_function("gemv_q6_k_splitk")?,
             gemv_q6_repack_splitk: module.load_function("gemv_q6_k_repack_splitk")?,
             gemv_q6_repack_global_splitk: module
                 .load_function("gemv_q6_k_repack_global_splitk")?,
+            gemv_q6_compact_global_splitk: module
+                .load_function("gemv_q6_k_compact_global_splitk")?,
             gemv_q8_splitk: module.load_function("gemv_q8_0_splitk")?,
             gemv_splitk_reduce: module.load_function("gemv_splitk_reduce")?,
             gemv_q5_qk: module.load_function("gemv_q5_0_qk")?,
             gemv_q5_qkv: module.load_function("gemv_q5_0_qkv")?,
             gemv_q4_pair: module.load_function("gemv_q4_k_pair")?,
+            gemv_q4_dual: module.load_function("gemv_q4_k_dual")?,
             gemv_q4_qkv: module.load_function("gemv_q4_k_qkv")?,
             gemm_q4: module.load_function("gemm_q4_k")?,
             gemm_q5: module.load_function("gemm_q5_0")?,
@@ -194,20 +185,23 @@ impl CudaModel {
             let n_cols = *t.dims.get(1).unwrap_or(&1) as usize;
             let raw = gguf.tensor_data(t);
             let wtype = wtype_of(t.ggml_type)?;
-            let (decode_data, decode_col_bytes) = if wtype == WType::Q6K {
-                let packed = repack_q6_decode(raw, n_rows, n_cols, t.ggml_type.nbytes(n_rows as u64) as usize);
-                let stride = (n_rows / 256) * Q6_REPACK_BLOCK_BYTES;
-                (Some(stream.clone_htod(&packed)?), stride)
+            let decode_data = None;
+            let decode_col_bytes = t.ggml_type.nbytes(n_rows as u64) as usize;
+            let (compact_data, compact_col_bytes) = if wtype == WType::Q6K {
+                let compact = align_q6_decode(raw, n_rows, n_cols, t.ggml_type.nbytes(n_rows as u64) as usize);
+                (Some(stream.clone_htod(&compact)?), (n_rows / 256) * Q6_COMPACT_BLOCK_BYTES)
             } else {
-                (None, t.ggml_type.nbytes(n_rows as u64) as usize)
+                (None, 0)
             };
             Ok(GpuMat {
                 data: stream.clone_htod(raw)?,
                 decode_data,
+                compact_data,
                 n_rows,
                 n_cols,
                 col_bytes: t.ggml_type.nbytes(n_rows as u64) as usize,
                 decode_col_bytes,
+                compact_col_bytes,
                 wtype,
             })
         };

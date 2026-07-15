@@ -3,7 +3,8 @@
 use super::decode::{find_by_name, AttnLaunch};
 use super::kv::CudaKv;
 use super::matmul::{
-    gemm, gemv, try_gemv_global_q8, try_gemv_pair, try_gemv_qkv, GemvResidual,
+    gemm, gemv, try_gemv_global_q8, try_gemv_pair, try_gemv_q4_dual, try_gemv_qkv,
+    GemvResidual,
 };
 use super::model::CudaModel;
 use anyhow::Result;
@@ -442,7 +443,17 @@ impl CudaModel {
         }
         if d.n_tok == 1 {
             // gate+up often same quant (Q5_0 or Q4_K) → stage xb once.
-            if !try_gemv_pair(
+            if !try_gemv_q4_dual(
+                &self.stream,
+                &self.k,
+                &self.layers[li].gate,
+                &self.layers[li].up,
+                &self.xb,
+                &mut self.hb,
+                &mut self.hb2,
+                &mut self.q8_x,
+                &mut self.q8_d,
+            )? && !try_gemv_pair(
                 &self.stream,
                 &self.k,
                 &self.layers[li].gate,

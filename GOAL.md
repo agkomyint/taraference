@@ -73,3 +73,17 @@ records both:
 The 750 sprint is not complete unless the reported field explicitly reaches 750.
 If only aggregate reaches it, label that as the aggregate milestone, not the
 single-stream milestone.
+
+## v0.5 measured candidate
+
+Qwen2.5-3B-Instruct-Q4_K_M on Tesla T4 (`sm_75`), coherent single-stream decode:
+
+- fixed 128-token prompt: **64.0–64.1 tok/s**;
+- mandatory multi-turn profile: **58.926–59.045 overall decode tok/s**;
+- first/last profile: **53.603–53.893 / 59.226–59.381 tok/s**;
+- context drop: **-10.49% to -10.18%** (later turns were faster);
+- peak VRAM: **2737 MiB**.
+
+The v0.5 additions are an activation-reusing equal-width Q4_K gate+up kernel,
+aligned compact Q6_K decode weights, and a cooperative four-warp Q6_K down
+projection that performs split-K reduction inside each output block.

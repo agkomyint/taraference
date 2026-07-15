@@ -105,8 +105,8 @@ jobs:
             tar -xzf tarafer-linux-x86_64.tar.gz
             chmod +x tarafer
             ./tarafer install          # → ~/.local/bin/tarafer (on PATH)
-            tarafer --download 0.5b
-            tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+            tarafer --download 3b
+            tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
             ```
 
             Update later on the same machine:
@@ -141,8 +141,8 @@ jobs:
               https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/tarafer-linux-x86_64.tar.gz
             tar -xzf tarafer-linux-x86_64.tar.gz && chmod +x tarafer
             ./tarafer install
-            tarafer --download 0.5b
-            tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+            tarafer --download 3b
+            tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
             # later: tarafer update
             ```
 

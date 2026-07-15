@@ -1,4 +1,4 @@
-// --decode fastv2 (compatibility fallback; flash is the v0.4 default)
+// --decode fastv2 (compatibility fallback; flash is the v0.5 default)
 // CUDA: attn_fast_v2 / attn_fast_v2_d  |  REGISTRY name: "fastv2"
 // f16 KV + tiled online softmax (fixed smem, no scores[ctx]).
 // grid (n_head, n_q)  block 128  smem = (head_dim + ATTN_TILE) * 4

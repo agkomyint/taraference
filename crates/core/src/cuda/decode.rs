@@ -100,7 +100,7 @@ pub static REGISTRY: &[DecodeSpec] = &[
     DecodeSpec {
         name: "flash",
         aliases: &["flashdec", "fd"],
-        description: "8-way flash decode + tiled prefill — v0.4 production path",
+        description: "8-way flash decode + tiled prefill — v0.5 production path",
         launch: AttnLaunch::Flash {
             partial: "attn_flash_partial",
             partial_d: "attn_flash_partial_d",

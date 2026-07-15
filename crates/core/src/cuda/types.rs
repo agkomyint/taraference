@@ -19,10 +19,13 @@ pub struct GpuMat {
     /// Optional decode-optimized representation; original GGUF data remains
     /// available for batched prefill/GEMM.
     pub decode_data: Option<CudaSlice<u8>>,
+    /// Aligned compact Q6_K blocks used by decode GEMVs.
+    pub compact_data: Option<CudaSlice<u8>>,
     pub n_rows: usize,
     pub n_cols: usize,
     pub col_bytes: usize,
     pub decode_col_bytes: usize,
+    pub compact_col_bytes: usize,
     pub wtype: WType,
 }
 
@@ -53,12 +56,16 @@ pub struct Kernels {
     pub gemv_q6: CudaFunction,
     pub gemv_q6_repack: CudaFunction,
     pub gemv_q6_repack_global: CudaFunction,
+    pub gemv_q6_compact_global: CudaFunction,
+    pub gemv_q6_compact_global_4way: CudaFunction,
     pub gemv_q8: CudaFunction,
     pub gemv_q4_splitk: CudaFunction,
+    pub gemv_q4_global_splitk: CudaFunction,
     pub gemv_q5_splitk: CudaFunction,
     pub gemv_q6_splitk: CudaFunction,
     pub gemv_q6_repack_splitk: CudaFunction,
     pub gemv_q6_repack_global_splitk: CudaFunction,
+    pub gemv_q6_compact_global_splitk: CudaFunction,
     pub gemv_q8_splitk: CudaFunction,
     pub gemv_splitk_reduce: CudaFunction,
     /// Fused dual single-token GEMV for Q5_0 (Q+K or gate+up; stage x once).
@@ -67,6 +74,7 @@ pub struct Kernels {
     pub gemv_q5_qkv: CudaFunction,
     /// Fused dual single-token GEMV for Q4_K (gate+up / Q+K on larger Q4_K_M).
     pub gemv_q4_pair: CudaFunction,
+    pub gemv_q4_dual: CudaFunction,
     pub gemv_q4_qkv: CudaFunction,
     pub gemm_q4: CudaFunction,
     pub gemm_q5: CudaFunction,
