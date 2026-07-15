@@ -6,6 +6,8 @@ CUDA multi-turn inference for **Qwen2.5** GGUF (defaults for **RTX 3050 Ti 4GB**
 
 **Performance goal:** one user, maximum decode tokens/sec — not multi-user concurrency. See [GOAL.md](GOAL.md).
 
+**Day-to-day loop** (SSH GPU ↔ laptop ↔ release CI ↔ `tarafer update`): [WORKFLOW.md](WORKFLOW.md).
+
 ---
 
 ## Fast install (recommended) — prebuilt Linux binary
