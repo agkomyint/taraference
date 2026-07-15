@@ -8,6 +8,12 @@ use anyhow::{bail, Context, Result};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::PushKernelArg;
 
+fn cuda_graph_debug(message: &str) {
+    if std::env::var_os("TARAFER_CUDA_GRAPH_DEBUG").is_some() {
+        eprintln!("{message}");
+    }
+}
+
 impl CudaModel {
     /// Run tokens through the model; return greedy next-token id.
     pub fn forward_greedy(&mut self, tokens: &[u32], cache: &mut CudaKv) -> Result<u32> {
@@ -80,7 +86,7 @@ impl CudaModel {
             return Ok(());
         }
         if cache.max_seq < 2 {
-            eprintln!("CUDA graph | skipped (max_seq < 2)");
+            cuda_graph_debug("CUDA graph | skipped (max_seq < 2)");
             return Ok(());
         }
 
@@ -129,9 +135,9 @@ impl CudaModel {
         })();
         if let Err(e) = probe_ok {
             let _ = self.stream.end_capture(flags0);
-            eprintln!(
+            cuda_graph_debug(&format!(
                 "CUDA graph | probe failed: {e:#} (eager decode continues; try --no-cuda-graph)"
-            );
+            ));
             return Ok(());
         }
 
@@ -141,7 +147,9 @@ impl CudaModel {
             .stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
         {
-            eprintln!("CUDA graph | begin_capture failed: {e:?} (eager continues)");
+            cuda_graph_debug(&format!(
+                "CUDA graph | begin_capture failed: {e:?} (eager continues)"
+            ));
             return Ok(());
         }
         let capture_result = (|| -> Result<()> {
@@ -154,14 +162,16 @@ impl CudaModel {
             g.upload().context("graph upload")?;
             self.decode_graph = Some(super::model::SendCudaGraph(g));
             self.graph_active = true;
-            eprintln!("CUDA graph | OK — single-token decode will REPLAY (faster launches)");
+            cuda_graph_debug("CUDA graph | OK — single-token decode will REPLAY (faster launches)");
             Ok(())
         })();
         if let Err(e) = capture_result {
             let _ = self.stream.end_capture(flags0);
             self.decode_graph = None;
             self.graph_active = false;
-            eprintln!("CUDA graph | full capture failed: {e:#} (eager decode continues)");
+            cuda_graph_debug(&format!(
+                "CUDA graph | full capture failed: {e:#} (eager decode continues)"
+            ));
         }
         Ok(())
     }

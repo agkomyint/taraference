@@ -744,30 +744,32 @@ impl CudaModel {
                     shared_mem_bytes: 0,
                 })?;
         }
+        use super::matmul::try_gemv_global_q8;
         if let Some(ref ow) = self.output {
-            gemv(
-                &self.stream,
-                &self.k,
-                ow,
-                &self.xb1,
-                &mut self.logits,
-                None,
-                GemvResidual::None,
-                &mut self.gemv_partial,
-                self.gemv_partial_stride,
-            )?;
+            if !try_gemv_global_q8(
+                &self.stream, &self.k, ow, &self.xb1, &mut self.logits,
+                None, GemvResidual::None, &mut self.q8_x, &mut self.q8_d,
+                &mut self.gemv_partial, self.gemv_partial_stride,
+            )? {
+                gemv(
+                    &self.stream, &self.k, ow, &self.xb1, &mut self.logits,
+                    None, GemvResidual::None, &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+            }
         } else {
-            gemv(
-                &self.stream,
-                &self.k,
-                &self.token_embd,
-                &self.xb1,
-                &mut self.logits,
-                None,
-                GemvResidual::None,
-                &mut self.gemv_partial,
+            if !try_gemv_global_q8(
+                &self.stream, &self.k, &self.token_embd, &self.xb1,
+                &mut self.logits, None, GemvResidual::None, &mut self.q8_x,
+                &mut self.q8_d, &mut self.gemv_partial,
                 self.gemv_partial_stride,
-            )?;
+            )? {
+                gemv(
+                    &self.stream, &self.k, &self.token_embd, &self.xb1,
+                    &mut self.logits, None, GemvResidual::None,
+                    &mut self.gemv_partial, self.gemv_partial_stride,
+                )?;
+            }
         }
         let n_vocab = self.cfg.n_vocab as i32;
         unsafe {

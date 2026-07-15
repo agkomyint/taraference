@@ -87,3 +87,18 @@ Qwen2.5-3B-Instruct-Q4_K_M on Tesla T4 (`sm_75`), coherent single-stream decode:
 The v0.5 additions are an activation-reusing equal-width Q4_K gate+up kernel,
 aligned compact Q6_K decode weights, and a cooperative four-warp Q6_K down
 projection that performs split-K reduction inside each output block.
+
+## v0.5.1 vocabulary-head fix
+
+Qwen2.5-3B-Instruct-Q4_K_M on Tesla T4 (`sm_75`), coherent single-stream decode:
+
+- fixed 128-token prompt: **65.2–65.7 tok/s**;
+- mandatory multi-turn profile: **59.961–60.030 overall decode tok/s**;
+- first/last profile: **54.606–54.829 / 60.218–60.341 tok/s**;
+- context drop: **-10.50% to -9.83%**;
+- peak VRAM: **2737 MiB**.
+
+The fix routes the tied Q6_K vocabulary projection through the existing compact
+Q6_K×Q8 kernel instead of the raw f32-activation fallback. This introduces the
+same per-32-value Q8 activation approximation already used by other v0.5 decode
+GEMVs; generated text remained coherent in both repeated profiles.
