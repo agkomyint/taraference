@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install mold (fast linker)
         run: |
@@ -75,7 +75,7 @@ jobs:
           ldd dist/taraference || true
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: taraference-linux-x86_64
           path: |
@@ -87,7 +87,7 @@ jobs:
 
       - name: Publish GitHub Release (tag push)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/taraference
@@ -118,7 +118,7 @@ jobs:
 
       - name: Publish GitHub Release (manual tag)
         if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.tag }}
