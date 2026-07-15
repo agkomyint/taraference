@@ -1,0 +1,6 @@
+[package]
+name = "cuda_probe"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+cudarc = { version = "0.19", default-features = false, features = ["cuda-13020", "std", "driver", "nvrtc", "cublas", "fallback-dynamic-loading"] }

@@ -1,0 +1,7 @@
+/target
+/models/**
+!/models/.gitkeep
+**/*.gguf
+.DS_Store
+*.pdb
+.env

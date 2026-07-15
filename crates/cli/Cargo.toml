@@ -1,0 +1,15 @@
+[package]
+name = "taraference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "taraference"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+taraference-core = { path = "../core" }
+taraference-gguf = { path = "../gguf" }

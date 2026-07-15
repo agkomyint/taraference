@@ -1,0 +1,12 @@
+[package]
+name = "taraference-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF model file loader for taraference"
+
+[dependencies]
+anyhow.workspace = true
+byteorder.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
