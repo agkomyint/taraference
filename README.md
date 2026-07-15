@@ -173,24 +173,32 @@ Try “clone from zero” in a plain Linux container (git only, no GPU): [`test/
 
 ### Download models (Hugging Face)
 
-Supported Q4_K_M weights land in **`models/`** (gitignored):
+Supported **Qwen2.5 Instruct Q4_K_M** (bartowski) land in **`models/`** (gitignored):
 
-```powershell
-# both 0.5B + 3B (skip files that already exist)
-cargo run --release -- --download
+| Tag | ~Size | Notes |
+|-----|------:|-------|
+| `0.5b` | 0.4 GiB | fastest profile |
+| `1.5b` | ~1 GiB | small step up |
+| `3b` | ~1.9 GiB | default mid-small |
+| **`7b`** | ~4.7 GiB | good on **T4 16 GB** |
+| **`14b`** | ~9 GiB | T4 OK for Q4; lower `--ctx` if OOM |
 
-# only one
-cargo run --release -- --download 0.5b
-cargo run --release -- --download 3b
-
-# force re-download
-cargo run --release -- --download all --force
-
-# custom directory
-cargo run --release -- --download --models-dir D:\taraference\models
+```bash
+tarafer --download list          # catalog
+tarafer --download 7b            # larger model for profile
+tarafer --download 14b
+tarafer --download large         # 7b + 14b
+tarafer --download profile       # 0.5b + 3b + 7b ladder
+tarafer --download all           # 0.5b + 3b only (install default; not huge)
+tarafer --download everything    # all sizes
 ```
 
-Sources (bartowski GGUF): `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf`, `Qwen2.5-3B-Instruct-Q4_K_M.gguf`.  
+```powershell
+# Windows (from source)
+cargo run --release -- --download 7b
+cargo run --release -- --download large --models-dir D:\taraference\models
+```
+
 Optional: set `HF_TOKEN` if Hugging Face rate-limits you.
 
 ```powershell

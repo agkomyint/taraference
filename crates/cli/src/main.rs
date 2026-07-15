@@ -32,6 +32,9 @@ Fast path on a new Linux GPU box:
   curl -fsSL .../tarafer-linux-x86_64.tar.gz | tar xz
   ./tarafer install
   tarafer --download 0.5b
+  tarafer --download 7b          # larger model (~4.7 GiB)
+  tarafer --download large       # 7b + 14b
+  tarafer --download list        # show all tags
   tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
 ";
 
@@ -46,8 +49,9 @@ struct Cli {
     /// Path to GGUF weights (file stem = OpenAI model id when serving).
     /// Optional if you only pass `--download`, or use `update` / `install`.
     model: Option<PathBuf>,
-    /// Download supported GGUF(s) from Hugging Face into `--models-dir`.
-    /// Value: `all` (default), `0.5b`, `3b`, or comma list. Skip existing unless `--force`.
+    /// Download GGUF(s) from Hugging Face into `--models-dir`.
+    /// `list` | `all` (0.5b+3b) | `small` | `large` (7b+14b) | `profile` | `7b` | `14b` | …
+    /// Skip existing unless `--force`.
     #[arg(long, value_name = "WHICH", num_args = 0..=1, default_missing_value = "all")]
     download: Option<String>,
     /// Directory for `--download` (default: `models` under the current working directory).
@@ -111,12 +115,18 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if let Some(ref which) = cli.download {
-        download_models(&cli.models_dir, which, cli.force)?;
+        let paths = download_models(&cli.models_dir, which, cli.force)?;
         // Download-only mode: no model path and no serve/profile/prompt.
         if cli.model.is_none() && cli.serve.is_none() && !cli.profile && cli.prompt.is_none() {
-            eprintln!(
-                "done. example:\n  tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
-            );
+            if paths.is_empty() {
+                // e.g. --download list
+                return Ok(());
+            }
+            eprintln!("done. examples:");
+            for p in paths.iter().take(5) {
+                eprintln!("  tarafer {}", p.display());
+                eprintln!("  tarafer {} --profile", p.display());
+            }
             return Ok(());
         }
     }
