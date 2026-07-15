@@ -1,0 +1,153 @@
+# Build a Linux x86_64 release binary and attach it to a GitHub Release.
+#
+# Triggers:
+#   - push of version tags: v0.1.0, v1.2.3, …
+#   - manual: Actions → Release → Run workflow
+#
+# Runtime still needs: NVIDIA driver + CUDA 13.x toolkit (NVRTC) on the machine.
+# GitHub-hosted runners have no GPU; this job only compiles.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/publish (e.g. v0.1.0). Leave empty to only build artifacts."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CUDA_PATH: /usr/local/cuda
+  CUDA_HOME: /usr/local/cuda
+
+jobs:
+  linux-x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA 13 toolkit (compile-time headers / NVRTC)
+        run: |
+          set -euo pipefail
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          # Minimal set for cudarc cuda-13020 + nvrtc dynamic load
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            cuda-nvcc-13-0 \
+            cuda-cudart-dev-13-0 \
+            cuda-nvrtc-dev-13-0 \
+            cuda-libraries-dev-13-0
+          # Symlink expected by many tools
+          if [[ ! -e /usr/local/cuda ]]; then
+            sudo ln -s /usr/local/cuda-13.0 /usr/local/cuda
+          fi
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          nvcc --version
+          ls /usr/local/cuda/lib64/libnvrtc* | head -5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release -p taraference
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BIN=target/release/taraference
+          test -x "$BIN"
+          strip "$BIN" || true
+          cp "$BIN" dist/taraference
+          tar -C dist -czf taraference-linux-x86_64.tar.gz taraference
+          (cd dist && sha256sum taraference > taraference.sha256)
+          sha256sum taraference-linux-x86_64.tar.gz > taraference-linux-x86_64.tar.gz.sha256
+          ls -lh dist/taraference taraference-linux-x86_64.tar.gz
+          file dist/taraference
+          ldd dist/taraference || true
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: taraference-linux-x86_64
+          path: |
+            dist/taraference
+            dist/taraference.sha256
+            taraference-linux-x86_64.tar.gz
+            taraference-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/taraference
+            dist/taraference.sha256
+            taraference-linux-x86_64.tar.gz
+            taraference-linux-x86_64.tar.gz.sha256
+          generate_release_notes: true
+          body: |
+            ## Prebuilt binary (Linux x86_64)
+
+            Fast path (no Rust compile):
+
+            ```bash
+            curl -fsSL -o taraference-linux-x86_64.tar.gz \
+              https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/taraference-linux-x86_64.tar.gz
+            tar -xzf taraference-linux-x86_64.tar.gz
+            chmod +x taraference
+            ./taraference --download 0.5b
+            ./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+            ```
+
+            Or after clone: `./scripts/get-binary.sh`
+
+            **Runtime requirements:** NVIDIA GPU + driver, CUDA **13.x** toolkit (NVRTC).
+            Built on Ubuntu 22.04 with CUDA 13 toolkit (`cudarc` `cuda-13020`).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish GitHub Release (manual tag)
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          files: |
+            dist/taraference
+            dist/taraference.sha256
+            taraference-linux-x86_64.tar.gz
+            taraference-linux-x86_64.tar.gz.sha256
+          generate_release_notes: true
+          body: |
+            ## Prebuilt binary (Linux x86_64)
+
+            ```bash
+            curl -fsSL -o taraference-linux-x86_64.tar.gz \
+              https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/taraference-linux-x86_64.tar.gz
+            tar -xzf taraference-linux-x86_64.tar.gz
+            chmod +x taraference
+            ./taraference --download 0.5b
+            ./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+            ```
+
+            **Runtime:** NVIDIA GPU + driver, CUDA 13.x (NVRTC).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

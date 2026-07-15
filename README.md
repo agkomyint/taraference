@@ -2,35 +2,54 @@
 
 CUDA multi-turn inference for **Qwen2.5** GGUF (defaults for **RTX 3050 Ti 4GB**).
 
-## Install (production / fresh machine)
+## Quick start (prebuilt Linux binary)
 
-One-shot setup scripts check **Rust**, **C++ build tools**, **NVIDIA driver**, **CUDA + NVRTC**, then **release-build** and **download models**:
+Fastest path on a remote GPU box (Lightning, SSH, etc.) — **no Rust compile**:
+
+```bash
+# download latest release binary
+curl -fsSL -o taraference-linux-x86_64.tar.gz \
+  https://github.com/agkomyint/taraference/releases/latest/download/taraference-linux-x86_64.tar.gz
+tar -xzf taraference-linux-x86_64.tar.gz
+chmod +x taraference
+
+./taraference --download 0.5b
+./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+```
+
+Or after cloning: `./scripts/get-binary.sh`
+
+**Runtime:** NVIDIA GPU + driver, CUDA **13.x** toolkit (NVRTC). Releases are built on Ubuntu 22.04 + CUDA 13.
+
+See [Releases](https://github.com/agkomyint/taraference/releases) for versioned assets (`taraference`, `.tar.gz`, `.sha256`).
+
+## Install from source
 
 ```powershell
 # Windows
+git clone https://github.com/agkomyint/taraference.git
+cd taraference
 .\scripts\install.ps1
-.\scripts\install.ps1 -Models 0.5b
 ```
 
 ```bash
 # Linux
-chmod +x scripts/install.sh
+git clone https://github.com/agkomyint/taraference.git
+cd taraference
 ./scripts/install.sh
-./scripts/install.sh --models 0.5b
 ```
 
-Details: [`scripts/README.md`](scripts/README.md).
+No flags required. That installs Rust if needed, builds release, downloads models into `models/`.
 
-Disposable **Linux Docker sandbox** (git + Ubuntu) to try clone/setup DX: [`test/`](test/).
+Then:
 
-### Requirements (short)
+```text
+./target/release/taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+```
 
-| Need | Notes |
-|------|--------|
-| NVIDIA GPU + driver | `nvidia-smi` works |
-| CUDA Toolkit ~13.x + **NVRTC** | Runtime kernel compile (`cudarc` / `cuda-13020`) |
-| Rust stable + Cargo | via rustup |
-| C++ linker | MSVC Build Tools (Windows) or `build-essential` (Linux) |
+**To build/run from source** you also need: NVIDIA GPU + driver, CUDA toolkit (~13.x with NVRTC), and a C++ linker (MSVC on Windows / build-essential on Linux).
+
+Try “clone from zero” in a plain Linux container (git only, no GPU): [`test/`](test/).
 
 ## Layout
 
