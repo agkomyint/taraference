@@ -1,12 +1,15 @@
-//! CLI entry: download models, interactive chat, profile, or OpenAI-compatible server.
+//! CLI entry: download models, interactive chat, profile, OpenAI server, self-update.
+//!
+//! Binary name: **`tarafer`** (crate package remains `taraference`).
 //!
 //! Layout:
 //! - **inference** — `taraference_core::InferenceEngine` / `Session`
 //! - **server** — `serve` module (OpenAI `/v1/*`)
-//! - **cli** — this binary (`download` + `profile` + flags)
+//! - **cli** — this binary (`download` + `profile` + `update` / `install`)
 
 mod download;
 mod profile;
+mod self_update;
 mod serve;
 
 use anyhow::{bail, Result};
@@ -16,14 +19,29 @@ use profile::{Profiler, ProfileMeta, TurnRow, MULTI_TURN_SCRIPT, PROFILE_MAX_NEW
 use std::path::PathBuf;
 use taraference_core::{DecodeBackend, InferenceEngine, SessionOptions};
 
+const AFTER_HELP: &str = "\
+Commands (no model path required):
+  tarafer update              Download latest GitHub release and replace this binary
+  tarafer update v0.2.0       Pin a release tag
+  tarafer install             Copy tarafer to ~/.local/bin (add to PATH)
+
+Fast path on a new Linux GPU box:
+  curl -fsSL .../tarafer-linux-x86_64.tar.gz | tar xz
+  ./tarafer install
+  tarafer --download 0.5b
+  tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+";
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "taraference",
-    about = "CUDA multi-turn GGUF inference (chat / profile / OpenAI server / model download)"
+    name = "tarafer",
+    version,
+    about = "CUDA multi-turn GGUF inference (chat / profile / OpenAI server / model download)",
+    after_help = AFTER_HELP
 )]
 struct Cli {
     /// Path to GGUF weights (file stem = OpenAI model id when serving).
-    /// Optional if you only pass `--download`.
+    /// Optional if you only pass `--download`, or use `update` / `install`.
     model: Option<PathBuf>,
     /// Download supported GGUF(s) from Hugging Face into `--models-dir`.
     /// Value: `all` (default), `0.5b`, `3b`, or comma list. Skip existing unless `--force`.
@@ -59,13 +77,43 @@ fn parse_decode(s: &str) -> Result<DecodeBackend, String> {
 }
 
 fn main() -> Result<()> {
+    // Lightweight subcommands so `tarafer update` does not conflict with a model path.
+    let mut argv: Vec<String> = std::env::args().collect();
+    if argv.len() >= 2 {
+        match argv[1].as_str() {
+            "update" | "--update" => {
+                let tag = argv.get(2).map(|s| s.as_str()).filter(|s| !s.starts_with('-'));
+                // Optional: tarafer update --install  → also land in ~/.local/bin
+                let also_install = argv.iter().any(|a| a == "--install" || a == "install");
+                if also_install {
+                    let dest = self_update::default_install_dir()?.join("tarafer");
+                    self_update::self_update(tag, Some(dest))?;
+                } else {
+                    self_update::self_update(tag, None)?;
+                }
+                return Ok(());
+            }
+            "install" | "--install" => {
+                // tarafer install [dir]
+                let dir = argv.get(2).map(PathBuf::from);
+                self_update::install_to_path(dir)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    // Drop the binary name for clap if we ever need re-parse; clap reads env::args itself.
+    let _ = &mut argv;
+
     let cli = Cli::parse();
 
     if let Some(ref which) = cli.download {
         download_models(&cli.models_dir, which, cli.force)?;
         // Download-only mode: no model path and no serve/profile/prompt.
         if cli.model.is_none() && cli.serve.is_none() && !cli.profile && cli.prompt.is_none() {
-            eprintln!("done. example:\n  cargo run --release -- models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf");
+            eprintln!(
+                "done. example:\n  tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+            );
             return Ok(());
         }
     }
@@ -74,8 +122,10 @@ fn main() -> Result<()> {
         Some(p) => p.clone(),
         None => bail!(
             "missing model path.\n  \
-             download:  cargo run --release -- --download\n  \
-             then run:  cargo run --release -- models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+             update:   tarafer update\n  \
+             install:  tarafer install\n  \
+             download: tarafer --download 0.5b\n  \
+             then run: tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
         ),
     };
 

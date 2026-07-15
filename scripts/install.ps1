@@ -99,7 +99,7 @@ if (Have "nvcc") {
 Step "Build (cargo build --release)"
 & cargo build --release -p taraference
 if ($LASTEXITCODE -ne 0) { Fail "build failed"; exit $LASTEXITCODE }
-$exe = Join-Path $Root "target\release\taraference.exe"
+$exe = Join-Path $Root "target\release\tarafer.exe"
 if (-not (Test-Path $exe)) { Fail "missing $exe"; exit 1 }
 Ok $exe
 
@@ -116,7 +116,7 @@ if (-not $SkipModels) {
 
 Step "Done"
 Write-Host @"
-  Binary:  $exe
+  Binary:  $exe  (CLI name: tarafer)
   Models:  $ModelsDir
 
   Chat:
@@ -124,5 +124,7 @@ Write-Host @"
 
   Server:
     $exe models\Qwen2.5-0.5B-Instruct-Q4_K_M.gguf --serve 3000
+
+  Linux remote: use prebuilt + ``tarafer update`` (see README).
 "@
 Ok "setup finished"

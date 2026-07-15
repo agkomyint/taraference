@@ -2,6 +2,8 @@
 
 CUDA multi-turn inference for **Qwen2.5** GGUF (defaults for **RTX 3050 Ti 4GB**).
 
+**CLI name:** **`tarafer`** (short command). The repo/crate is still `taraference`.
+
 **Performance goal:** one user, maximum decode tokens/sec — not multi-user concurrency. See [GOAL.md](GOAL.md).
 
 ---
@@ -24,27 +26,29 @@ You **do not** need Rust, Cargo, or a local compile. CI ships a ready Linux bina
 
 Windows / macOS: use [Install from source](#install-from-source) for now (no prebuilt yet).
 
-### One-liner install + chat
+### One-liner install + chat (on PATH)
 
 ```bash
-# 1) binary (~seconds)
-curl -fsSL -o taraference-linux-x86_64.tar.gz \
-  https://github.com/agkomyint/taraference/releases/latest/download/taraference-linux-x86_64.tar.gz
-tar -xzf taraference-linux-x86_64.tar.gz
-chmod +x taraference
+# 1) download binary (~seconds)
+curl -fsSL -o tarafer-linux-x86_64.tar.gz \
+  https://github.com/agkomyint/taraference/releases/latest/download/tarafer-linux-x86_64.tar.gz
+tar -xzf tarafer-linux-x86_64.tar.gz
+chmod +x tarafer
 
-# 2) small model (~1 min depending on network)
-./taraference --download 0.5b
+# 2) put on PATH → ~/.local/bin/tarafer
+./tarafer install
+# if needed:  export PATH="$HOME/.local/bin:$PATH"
 
-# 3) run (first load compiles CUDA kernels via NVRTC — a few seconds)
-./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+# 3) model + run
+tarafer --download 0.5b
+tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
 ```
 
 Interactive chat: type messages, `/reset`, `/quit`.  
 One-shot prompt:
 
 ```bash
-./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
   --prompt "Say hi in one short sentence." -n 64
 ```
 
@@ -54,25 +58,37 @@ One-shot prompt:
 git clone https://github.com/agkomyint/taraference.git
 cd taraference
 chmod +x scripts/get-binary.sh
-./scripts/get-binary.sh              # → ./taraference from latest release
-./taraference --download 0.5b
-./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+./scripts/get-binary.sh              # → ~/.local/bin/tarafer
+tarafer --download 0.5b
+tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
 ```
 
-Pin a version: `./scripts/get-binary.sh v0.1.2`
+Pin a version: `./scripts/get-binary.sh v0.2.0`
+
+### Update on the same machine (no re-clone)
+
+Once `tarafer` is installed, pull the newest GitHub release binary in place:
+
+```bash
+tarafer update                 # replace this binary with latest release
+tarafer update v0.2.0          # pin a tag
+tarafer update --install       # download latest into ~/.local/bin/tarafer
+```
+
+You do **not** need to re-run `curl` by hand after the first install.
 
 ### OpenAI-compatible server (same binary)
 
 ```bash
-./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf --serve
+tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf --serve
 # default http://127.0.0.1:8787  — use --serve 3000 for another port
 ```
 
 ### Larger model (3B)
 
 ```bash
-./taraference --download 3b
-./taraference models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+tarafer --download 3b
+tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
 ```
 
 Fits comfortably on **16 GB** GPUs (e.g. Tesla T4). On **4 GB** laptops prefer **0.5B** or lower context (`--ctx`).
@@ -88,19 +104,24 @@ Release assets (see [Releases](https://github.com/agkomyint/taraference/releases
 
 | Asset | Purpose |
 |-------|---------|
-| `taraference-linux-x86_64.tar.gz` | Packed binary (use this) |
-| `taraference` | Same binary, unpacked |
+| `tarafer-linux-x86_64.tar.gz` | Packed binary (use this) |
+| `tarafer` | Same binary, unpacked |
 | `*.sha256` | Checksums |
 
-Example on a cloud T4: binary download **&lt;1 s**, 0.5B model **~1–2 s** on a good link, first process load **~few seconds** (NVRTC), then interactive decode.
+| Command | What it does |
+|---------|----------------|
+| `tarafer install` | Copy binary → `~/.local/bin/tarafer` (PATH) |
+| `tarafer update` | Self-update from latest GitHub Release |
+| `tarafer --download 0.5b` | Fetch GGUF weights |
 
 ### Troubleshooting (prebuilt)
 
 | Symptom | Fix |
 |---------|-----|
+| `tarafer: command not found` | Run `./tarafer install` and add `~/.local/bin` to `PATH` |
 | `nvidia-smi` missing | Install NVIDIA driver / use a GPU machine |
 | NVRTC / CUDA load errors | Install **CUDA 13.x toolkit** (not only the driver) |
-| `CUDA_ERROR_INVALID_PTX` on old binaries | Upgrade to **v0.1.2+** (runtime GPU arch detection) |
+| `CUDA_ERROR_INVALID_PTX` on old binaries | `tarafer update` to **v0.1.2+** (runtime GPU arch detection) |
 | HF download slow / rate-limited | Set `HF_TOKEN` and re-run `--download` |
 
 ---
@@ -123,12 +144,13 @@ cd taraference
 ./scripts/install.sh
 ```
 
-No flags required. That installs Rust if needed, builds release, downloads models into `models/`.
+No flags required. That installs Rust if needed, builds release, downloads models into `models/`, and runs `tarafer install` onto `~/.local/bin` (Linux).
 
 Then:
 
 ```text
-./target/release/taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+# or: ./target/release/tarafer models/...
 ```
 
 **Extra needs vs prebuilt:** Rust stable + Cargo, C++ linker (MSVC / `build-essential`). Same GPU + CUDA 13.x NVRTC at **run** time.

@@ -91,11 +91,14 @@ else
 fi
 
 # ── Build ───────────────────────────────────────────────────────────────────
-step "Build (cargo build --release)"
+step "Build (cargo build --release → tarafer)"
 cargo build --release -p taraference
-BIN="$ROOT/target/release/taraference"
+BIN="$ROOT/target/release/tarafer"
 [[ -x "$BIN" ]] || { fail "missing $BIN"; exit 1; }
 ok "$BIN"
+
+step "Install onto PATH (~/.local/bin)"
+"$BIN" install || warn "tarafer install failed — binary still at $BIN"
 
 # ── Models ──────────────────────────────────────────────────────────────────
 if [[ "$SKIP_MODELS" -eq 0 ]]; then
@@ -110,13 +113,16 @@ fi
 # ── Done ────────────────────────────────────────────────────────────────────
 step "Done"
 cat <<EOF
-  Binary:  $BIN
+  Binary:  $BIN  (also try: tarafer on PATH after install)
   Models:  $MODELS_DIR
 
   Chat:
-    $BIN models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
 
   Server:
-    $BIN models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf --serve 3000
+    tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf --serve 3000
+
+  Update prebuilt later:
+    tarafer update
 EOF
 ok "setup finished"

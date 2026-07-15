@@ -2,16 +2,33 @@
 
 ## Prebuilt binary (fastest)
 
-**Preferred path for remote GPUs** — full docs in the root [README](../README.md#fast-install-recommended--prebuilt-linux-binary).
+**Preferred path for remote GPUs** — full docs in the root
+[README](../README.md#fast-install-recommended--prebuilt-linux-binary).
 
-Linux x86_64 only — downloads the latest [GitHub Release](https://github.com/agkomyint/taraference/releases):
+CLI name: **`tarafer`**.
 
 ```bash
-./scripts/get-binary.sh              # → ./taraference
-./scripts/get-binary.sh v0.1.2       # pin a tag
+./scripts/get-binary.sh              # → ~/.local/bin/tarafer
+./scripts/get-binary.sh v0.2.0       # pin a tag
 ```
 
-Then: `./taraference --download 0.5b` and run. Needs GPU + CUDA 13.x NVRTC (no Rust).
+Then:
+
+```bash
+tarafer --download 0.5b
+tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+```
+
+### Update / PATH
+
+| Command | Effect |
+|---------|--------|
+| `tarafer install` | Copy binary to `~/.local/bin/tarafer` |
+| `tarafer update` | Download latest GitHub Release over this binary |
+| `tarafer update --install` | Latest → `~/.local/bin/tarafer` |
+
+Needs GPU + CUDA 13.x NVRTC (no Rust).
+
 ## Build from source
 
 **One command** after clone (no flags required):
@@ -26,24 +43,20 @@ Then: `./taraference --download 0.5b` and run. Needs GPU + CUDA 13.x NVRTC (no R
 ./scripts/install.sh
 ```
 
-Optional only:
+Builds `target/release/tarafer`, optionally installs to PATH, downloads models.
+
+Optional:
 
 | Flag | Meaning |
 |------|---------|
 | `--skip-models` / `-SkipModels` | don’t download GGUFs |
 | `--force` / `-Force` | re-download GGUFs |
 
-Installs Rust if needed, builds `target/release/taraference`, downloads models into `models/`.
-
-Inference still needs an **NVIDIA GPU + driver + CUDA toolkit (NVRTC)** on the machine.
-
 ## Publishing a release
 
-Push a version tag (or run **Actions → Release** manually):
-
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-CI builds `taraference-linux-x86_64.tar.gz` and attaches it to the GitHub Release.
+CI builds `tarafer-linux-x86_64.tar.gz` and attaches it to the GitHub Release.
