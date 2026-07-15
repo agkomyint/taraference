@@ -1,15 +1,17 @@
-//! CLI entry: interactive chat, profile, or OpenAI-compatible server.
+//! CLI entry: download models, interactive chat, profile, or OpenAI-compatible server.
 //!
 //! Layout:
 //! - **inference** — `taraference_core::InferenceEngine` / `Session`
 //! - **server** — `serve` module (OpenAI `/v1/*`)
-//! - **cli** — this binary (`profile` + flags)
+//! - **cli** — this binary (`download` + `profile` + flags)
 
+mod download;
 mod profile;
 mod serve;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
+use download::download_models;
 use profile::{Profiler, ProfileMeta, TurnRow, MULTI_TURN_SCRIPT, PROFILE_MAX_NEW};
 use std::path::PathBuf;
 use taraference_core::{DecodeBackend, InferenceEngine, SessionOptions};
@@ -17,11 +19,22 @@ use taraference_core::{DecodeBackend, InferenceEngine, SessionOptions};
 #[derive(Parser, Debug)]
 #[command(
     name = "taraference",
-    about = "CUDA multi-turn GGUF inference (chat / profile / OpenAI server)"
+    about = "CUDA multi-turn GGUF inference (chat / profile / OpenAI server / model download)"
 )]
 struct Cli {
-    /// Path to GGUF weights (also the only OpenAI model id = file stem when serving).
-    model: PathBuf,
+    /// Path to GGUF weights (file stem = OpenAI model id when serving).
+    /// Optional if you only pass `--download`.
+    model: Option<PathBuf>,
+    /// Download supported GGUF(s) from Hugging Face into `--models-dir`.
+    /// Value: `all` (default), `0.5b`, `3b`, or comma list. Skip existing unless `--force`.
+    #[arg(long, value_name = "WHICH", num_args = 0..=1, default_missing_value = "all")]
+    download: Option<String>,
+    /// Directory for `--download` (default: `models` under the current working directory).
+    #[arg(long, default_value = "models")]
+    models_dir: PathBuf,
+    /// Re-download even if the GGUF already exists.
+    #[arg(long, default_value_t = false)]
+    force: bool,
     /// Max tokens per assistant reply (default sized for full answers on 4GB).
     #[arg(short = 'n', long, default_value_t = 512)]
     max_new: usize,
@@ -48,17 +61,41 @@ fn parse_decode(s: &str) -> Result<DecodeBackend, String> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(port) = cli.serve {
-        if cli.profile {
-            anyhow::bail!("--serve and --profile cannot be used together");
+    if let Some(ref which) = cli.download {
+        download_models(&cli.models_dir, which, cli.force)?;
+        // Download-only mode: no model path and no serve/profile/prompt.
+        if cli.model.is_none() && cli.serve.is_none() && !cli.profile && cli.prompt.is_none() {
+            eprintln!("done. example:\n  cargo run --release -- models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf");
+            return Ok(());
         }
-        return run_serve(&cli, port);
     }
 
-    let mut engine = InferenceEngine::load_path(&cli.model, cli.decode, cli.ctx, cli.max_new)?;
+    let model = match &cli.model {
+        Some(p) => p.clone(),
+        None => bail!(
+            "missing model path.\n  \
+             download:  cargo run --release -- --download\n  \
+             then run:  cargo run --release -- models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+        ),
+    };
+
+    // Rebuild a minimal view for subcommands that need model path as PathBuf.
+    let cli = Cli {
+        model: Some(model.clone()),
+        ..cli
+    };
+
+    if let Some(port) = cli.serve {
+        if cli.profile {
+            bail!("--serve and --profile cannot be used together");
+        }
+        return run_serve(&cli, &model, port);
+    }
+
+    let mut engine = InferenceEngine::load_path(&model, cli.decode, cli.ctx, cli.max_new)?;
 
     if cli.profile {
-        run_profile(&mut engine, &cli)?;
+        run_profile(&mut engine, &cli, &model)?;
     } else {
         let opts = SessionOptions::interactive(cli.max_new);
         let mut session = engine.session(opts);
@@ -71,8 +108,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_serve(cli: &Cli, port: u16) -> Result<()> {
-    // RUST_LOG=debug for verbose tower/http; default = request + completion lines.
+fn run_serve(cli: &Cli, model: &PathBuf, port: u16) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -84,7 +120,7 @@ fn run_serve(cli: &Cli, port: u16) -> Result<()> {
         .init();
 
     tracing::info!(
-        model = %cli.model.display(),
+        model = %model.display(),
         port,
         ctx = cli.ctx,
         max_new = cli.max_new,
@@ -92,7 +128,7 @@ fn run_serve(cli: &Cli, port: u16) -> Result<()> {
         "starting serve mode"
     );
 
-    let engine = InferenceEngine::load_path(&cli.model, cli.decode, cli.ctx, cli.max_new)?;
+    let engine = InferenceEngine::load_path(model, cli.decode, cli.ctx, cli.max_new)?;
     tracing::info!(
         model_id = %engine.model_id,
         weight_gib = format!("{:.2}", engine.weight_gib),
@@ -106,7 +142,7 @@ fn run_serve(cli: &Cli, port: u16) -> Result<()> {
     rt.block_on(serve::run(engine, port))
 }
 
-fn run_profile(engine: &mut InferenceEngine, cli: &Cli) -> Result<()> {
+fn run_profile(engine: &mut InferenceEngine, cli: &Cli, model: &PathBuf) -> Result<()> {
     let max_new = cli.max_new.min(PROFILE_MAX_NEW);
     let script: Vec<String> = if let Some(ref p) = cli.prompt {
         vec![p.clone()]
@@ -121,7 +157,7 @@ fn run_profile(engine: &mut InferenceEngine, cli: &Cli) -> Result<()> {
     };
 
     let meta = ProfileMeta {
-        model_path: cli.model.display().to_string(),
+        model_path: model.display().to_string(),
         cfg: engine.cfg().clone(),
         weight_gib: engine.weight_gib,
         max_seq: engine.max_seq,

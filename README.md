@@ -10,11 +10,33 @@ CUDA multi-turn inference for **Qwen2.5** GGUF (defaults for **RTX 3050 Ti 4GB**
 | **Server** | `crates/cli/src/serve` | OpenAI-compatible HTTP (`/v1/models`, `/v1/chat/completions`) |
 | **CLI** | `crates/cli` | interactive chat, `--profile`, `--serve` |
 
+### Download models (Hugging Face)
+
+Supported Q4_K_M weights land in **`models/`** (gitignored):
+
+```powershell
+# both 0.5B + 3B (skip files that already exist)
+cargo run --release -- --download
+
+# only one
+cargo run --release -- --download 0.5b
+cargo run --release -- --download 3b
+
+# force re-download
+cargo run --release -- --download all --force
+
+# custom directory
+cargo run --release -- --download --models-dir D:\taraference\models
+```
+
+Sources (bartowski GGUF): `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf`, `Qwen2.5-3B-Instruct-Q4_K_M.gguf`.  
+Optional: set `HF_TOKEN` if Hugging Face rate-limits you.
+
 ```powershell
 cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
 ```
 
-No flags needed. Defaults:
+No flags needed after models are present. Defaults:
 
 | Setting | Value | Why |
 |---------|------:|-----|
