@@ -26,7 +26,7 @@ pub enum SmemRule {
     HeadPlusSeq,
     /// `seq_len * 4` — basic baseline.
     SeqOnly,
-    /// `(head_dim + tile) * 4` — fixed tile (v2-style).
+    /// `(head_dim + tile) * 4` — fixed tile (v2-style; lean smem for occupancy).
     HeadPlusTile { tile: u32 },
     /// `head_dim * 2 * 4` — online decode (Q + reduce).
     HeadTimes2,

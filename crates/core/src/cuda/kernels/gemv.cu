@@ -423,8 +423,38 @@ extern "C" __global__ void gemv_splitk_reduce(
     out[j] = acc;
 }
 
-// ── Fused Q+K GEMV (decode, Q5_0): stage x once ───────────────────────────
-// Q4_K_M often uses Q5_0 for Q and K with a different type for V.
+// ── Fused dual GEMV (decode, Q5_0): stage x once ───────────────────────────
+// Used for Q+K and for gate+up (same n_rows, same quant, two outs).
+
+__device__ __forceinline__ float dot_q5_0_col_xs(
+    const unsigned char* __restrict__ col,
+    const float* __restrict__ xs,
+    int n_rows,
+    int lane
+) {
+    float acc = 0.f;
+    int nb = n_rows / 32;
+    for (int bi = lane; bi < nb; bi += 32) {
+        const unsigned char* base = col + bi * 22;
+        float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        unsigned int qh = (unsigned int)base[2]
+            | ((unsigned int)base[3] << 8)
+            | ((unsigned int)base[4] << 16)
+            | ((unsigned int)base[5] << 24);
+        const unsigned char* qs = base + 6;
+        int yo = bi * 32;
+        #pragma unroll
+        for (int t = 0; t < 16; t++) {
+            unsigned char xh0 = (unsigned char)(((qh >> t) << 4) & 0x10u);
+            unsigned char xh1 = (unsigned char)(((qh >> (t + 12))) & 0x10u);
+            int x0 = (int)((qs[t] & 0x0F) | xh0);
+            int x1 = (int)((qs[t] >> 4) | xh1);
+            acc += (float)(x0 - 16) * d * xs[yo + t];
+            acc += (float)(x1 - 16) * d * xs[yo + 16 + t];
+        }
+    }
+    return warp_sum(acc);
+}
 
 extern "C" __global__ void gemv_q5_0_qk(
     const unsigned char* __restrict__ wq,
@@ -465,28 +495,111 @@ extern "C" __global__ void gemv_q5_0_qk(
         oj = jk;
     }
 
-    float acc = 0.f;
-    int nb = n_rows / 32;
-    for (int bi = lane; bi < nb; bi += 32) {
-        const unsigned char* base = wcol + bi * 22;
-        float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
-        unsigned int qh = (unsigned int)base[2]
-            | ((unsigned int)base[3] << 8)
-            | ((unsigned int)base[4] << 16)
-            | ((unsigned int)base[5] << 24);
-        const unsigned char* qs = base + 6;
-        int yo = bi * 32;
-        #pragma unroll
-        for (int t = 0; t < 16; t++) {
-            unsigned char xh0 = (unsigned char)(((qh >> t) << 4) & 0x10u);
-            unsigned char xh1 = (unsigned char)(((qh >> (t + 12))) & 0x10u);
-            int x0 = (int)((qs[t] & 0x0F) | xh0);
-            int x1 = (int)((qs[t] >> 4) | xh1);
-            acc += (float)(x0 - 16) * d * xs[yo + t];
-            acc += (float)(x1 - 16) * d * xs[yo + 16 + t];
-        }
+    float acc = dot_q5_0_col_xs(wcol, xs, n_rows, lane);
+    if (lane == 0) {
+        if (use_bias) acc += bias[oj];
+        out[oj] = acc;
     }
-    acc = warp_sum(acc);
+}
+
+// ── Fused dual GEMV (decode, Q4_K): stage x once (gate+up / Q+K on 3B+) ───
+
+extern "C" __global__ void gemv_q4_k_pair(
+    const unsigned char* __restrict__ wa,
+    const unsigned char* __restrict__ wb,
+    const float* __restrict__ x,
+    float* __restrict__ out_a,
+    float* __restrict__ out_b,
+    int n_rows, int n_a, int n_b, int col_bytes,
+    int use_bias,
+    const float* __restrict__ ba,
+    const float* __restrict__ bb
+) {
+    extern __shared__ float xs[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    __syncthreads();
+
+    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    int n_tot = n_a + n_b;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    const float* bias;
+    int oj;
+    if (j < n_a) {
+        wcol = wa + (size_t)j * (size_t)col_bytes;
+        out = out_a;
+        bias = ba;
+        oj = j;
+    } else {
+        int jb = j - n_a;
+        wcol = wb + (size_t)jb * (size_t)col_bytes;
+        out = out_b;
+        bias = bb;
+        oj = jb;
+    }
+
+    float acc = dot_q4_k_col_xs(wcol, xs, n_rows, lane);
+    if (lane == 0) {
+        if (use_bias) acc += bias[oj];
+        out[oj] = acc;
+    }
+}
+
+// Fused Q+K+V when all three are Q5_0 (stage x once; common on many Q4_K_M layers).
+extern "C" __global__ void gemv_q5_0_qkv(
+    const unsigned char* __restrict__ wq,
+    const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wv,
+    const float* __restrict__ x,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int n_rows, int n_q, int n_k, int n_v, int col_bytes,
+    int use_bias,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv
+) {
+    extern __shared__ float xs[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    __syncthreads();
+
+    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    int n_tot = n_q + n_k + n_v;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    const float* bias;
+    int oj;
+    if (j < n_q) {
+        wcol = wq + (size_t)j * (size_t)col_bytes;
+        out = q;
+        bias = bq;
+        oj = j;
+    } else if (j < n_q + n_k) {
+        int jk = j - n_q;
+        wcol = wk + (size_t)jk * (size_t)col_bytes;
+        out = k;
+        bias = bk;
+        oj = jk;
+    } else {
+        int jv = j - n_q - n_k;
+        wcol = wv + (size_t)jv * (size_t)col_bytes;
+        out = v;
+        bias = bv;
+        oj = jv;
+    }
+
+    float acc = dot_q5_0_col_xs(wcol, xs, n_rows, lane);
     if (lane == 0) {
         if (use_bias) acc += bias[oj];
         out[oj] = acc;

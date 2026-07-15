@@ -41,7 +41,8 @@ extern "C" __global__ void silu_mul_f32(
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) {
         float v = gate[i];
-        gate[i] = (v * (1.f / (1.f + expf(-v)))) * up[i];
+        // Fast SiLU: v * sigmoid(v); use intrinsic exp.
+        gate[i] = (v / (1.f + __expf(-v))) * up[i];
     }
 }
 

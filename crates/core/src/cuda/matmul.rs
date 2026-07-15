@@ -213,49 +213,189 @@ fn gemv_splitk(
     Ok(())
 }
 
-/// Decode Q+K in one GEMV when both are Q5_0 with matching layout (stage x once).
+/// Decode dual GEMV (Q+K or gate+up): Q5_0 or Q4_K, stage `x` once.
 /// Returns true if fused path ran.
-pub(crate) fn try_gemv_q5_qk(
+pub(crate) fn try_gemv_pair(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    wa: &GpuMat,
+    wb: &GpuMat,
+    x: &CudaSlice<f32>,
+    out_a: &mut CudaSlice<f32>,
+    out_b: &mut CudaSlice<f32>,
+    ba: Option<&CudaSlice<f32>>,
+    bb: Option<&CudaSlice<f32>>,
+) -> Result<bool> {
+    if try_gemv_q5_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb)? {
+        return Ok(true);
+    }
+    try_gemv_q4_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb)
+}
+
+fn try_gemv_q4_pair(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    wa: &GpuMat,
+    wb: &GpuMat,
+    x: &CudaSlice<f32>,
+    out_a: &mut CudaSlice<f32>,
+    out_b: &mut CudaSlice<f32>,
+    ba: Option<&CudaSlice<f32>>,
+    bb: Option<&CudaSlice<f32>>,
+) -> Result<bool> {
+    if wa.wtype != WType::Q4K
+        || wb.wtype != WType::Q4K
+        || wa.n_rows != wb.n_rows
+        || wa.col_bytes != wb.col_bytes
+    {
+        return Ok(false);
+    }
+    let both_bias = ba.is_some() && bb.is_some();
+    let no_bias = ba.is_none() && bb.is_none();
+    if !both_bias && !no_bias {
+        return Ok(false);
+    }
+    let n_rows = wa.n_rows as i32;
+    let n_a = wa.n_cols as i32;
+    let n_b = wb.n_cols as i32;
+    let col_bytes = wa.col_bytes as i32;
+    let use_bias: i32 = if both_bias { 1 } else { 0 };
+    let ba_p: &CudaSlice<f32> = ba.unwrap_or(x);
+    let bb_p: &CudaSlice<f32> = bb.unwrap_or(x);
+    let n_tot = (wa.n_cols + wb.n_cols) as u32;
+    unsafe {
+        stream
+            .launch_builder(&k.gemv_q4_pair)
+            .arg(&wa.data)
+            .arg(&wb.data)
+            .arg(x)
+            .arg(out_a)
+            .arg(out_b)
+            .arg(&n_rows)
+            .arg(&n_a)
+            .arg(&n_b)
+            .arg(&col_bytes)
+            .arg(&use_bias)
+            .arg(ba_p)
+            .arg(bb_p)
+            .launch(lc_gemv(n_tot, wa.n_rows as u32))?;
+    }
+    Ok(true)
+}
+
+/// Decode dual Q5_0 GEMV (Q+K or gate+up): stage `x` once.
+/// Returns true if fused path ran.
+fn try_gemv_q5_pair(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    wa: &GpuMat,
+    wb: &GpuMat,
+    x: &CudaSlice<f32>,
+    out_a: &mut CudaSlice<f32>,
+    out_b: &mut CudaSlice<f32>,
+    ba: Option<&CudaSlice<f32>>,
+    bb: Option<&CudaSlice<f32>>,
+) -> Result<bool> {
+    if wa.wtype != WType::Q5_0
+        || wb.wtype != WType::Q5_0
+        || wa.n_rows != wb.n_rows
+        || wa.col_bytes != wb.col_bytes
+    {
+        return Ok(false);
+    }
+    // Mixed bias (one Some, one None) cannot use single use_bias flag safely.
+    let both_bias = ba.is_some() && bb.is_some();
+    let no_bias = ba.is_none() && bb.is_none();
+    if !both_bias && !no_bias {
+        return Ok(false);
+    }
+    let n_rows = wa.n_rows as i32;
+    let n_a = wa.n_cols as i32;
+    let n_b = wb.n_cols as i32;
+    let col_bytes = wa.col_bytes as i32;
+    let use_bias: i32 = if both_bias { 1 } else { 0 };
+    let ba_p: &CudaSlice<f32> = ba.unwrap_or(x);
+    let bb_p: &CudaSlice<f32> = bb.unwrap_or(x);
+    let n_tot = (wa.n_cols + wb.n_cols) as u32;
+    unsafe {
+        stream
+            .launch_builder(&k.gemv_q5_qk)
+            .arg(&wa.data)
+            .arg(&wb.data)
+            .arg(x)
+            .arg(out_a)
+            .arg(out_b)
+            .arg(&n_rows)
+            .arg(&n_a)
+            .arg(&n_b)
+            .arg(&col_bytes)
+            .arg(&use_bias)
+            .arg(ba_p)
+            .arg(bb_p)
+            .launch(lc_gemv(n_tot, wa.n_rows as u32))?;
+    }
+    Ok(true)
+}
+
+/// Decode Q+K+V in one GEMV when all three are Q5_0 (stage `x` once).
+pub(crate) fn try_gemv_q5_qkv(
     stream: &Arc<CudaStream>,
     k: &Kernels,
     wq: &GpuMat,
     wk: &GpuMat,
+    wv: &GpuMat,
     x: &CudaSlice<f32>,
     q: &mut CudaSlice<f32>,
     k_out: &mut CudaSlice<f32>,
+    v_out: &mut CudaSlice<f32>,
     bq: Option<&CudaSlice<f32>>,
     bk: Option<&CudaSlice<f32>>,
+    bv: Option<&CudaSlice<f32>>,
 ) -> Result<bool> {
     if wq.wtype != WType::Q5_0
         || wk.wtype != WType::Q5_0
+        || wv.wtype != WType::Q5_0
         || wq.n_rows != wk.n_rows
+        || wq.n_rows != wv.n_rows
         || wq.col_bytes != wk.col_bytes
+        || wq.col_bytes != wv.col_bytes
     {
+        return Ok(false);
+    }
+    let all_bias = bq.is_some() && bk.is_some() && bv.is_some();
+    let no_bias = bq.is_none() && bk.is_none() && bv.is_none();
+    if !all_bias && !no_bias {
         return Ok(false);
     }
     let n_rows = wq.n_rows as i32;
     let n_q = wq.n_cols as i32;
     let n_k = wk.n_cols as i32;
+    let n_v = wv.n_cols as i32;
     let col_bytes = wq.col_bytes as i32;
-    let use_bias: i32 = if bq.is_some() && bk.is_some() { 1 } else { 0 };
+    let use_bias: i32 = if all_bias { 1 } else { 0 };
     let bq_p: &CudaSlice<f32> = bq.unwrap_or(x);
     let bk_p: &CudaSlice<f32> = bk.unwrap_or(x);
-    let n_tot = (wq.n_cols + wk.n_cols) as u32;
+    let bv_p: &CudaSlice<f32> = bv.unwrap_or(x);
+    let n_tot = (wq.n_cols + wk.n_cols + wv.n_cols) as u32;
     unsafe {
         stream
-            .launch_builder(&k.gemv_q5_qk)
+            .launch_builder(&k.gemv_q5_qkv)
             .arg(&wq.data)
             .arg(&wk.data)
+            .arg(&wv.data)
             .arg(x)
             .arg(q)
             .arg(k_out)
+            .arg(v_out)
             .arg(&n_rows)
             .arg(&n_q)
             .arg(&n_k)
+            .arg(&n_v)
             .arg(&col_bytes)
             .arg(&use_bias)
             .arg(bq_p)
             .arg(bk_p)
+            .arg(bv_p)
             .launch(lc_gemv(n_tot, wq.n_rows as u32))?;
     }
     Ok(true)

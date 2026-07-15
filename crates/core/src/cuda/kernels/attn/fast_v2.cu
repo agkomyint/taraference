@@ -2,6 +2,9 @@
 // CUDA: attn_fast_v2  |  REGISTRY name: "fastv2"
 // f16 KV + tiled online softmax (fixed smem, no scores[ctx]).
 // grid (n_head, n_q)  block 128  smem = (head_dim + ATTN_TILE) * 4
+//
+// Note: full K/V tiles in smem help 0.5B (hd=64) but collapse occupancy on
+// 3B (hd=128, ~33KB smem) — keep lean smem for multi-model speed.
 
 #define ATTN_TILE 64
 

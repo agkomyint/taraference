@@ -2,7 +2,7 @@
 
 use super::decode::{find_by_name, AttnLaunch, SmemRule};
 use super::kv::CudaKv;
-use super::matmul::{gemm, gemv, try_gemv_q5_qk, GemvResidual};
+use super::matmul::{gemm, gemv, try_gemv_pair, try_gemv_q5_qkv, GemvResidual};
 use super::model::CudaModel;
 use anyhow::Result;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -59,9 +59,24 @@ impl CudaModel {
         }
 
         // Decode: fuse bias into GEMV. Prefill: GEMM + bias.
-        // Q+K: monomorphic Q5_0 fused GEMV (stages x once). V often Q8_0 in Q4_K_M.
+        // Prefer Q5_0 Q+K+V fuse; else Q+K pair + separate V; else three GEMVs.
         if d.n_tok == 1 {
-            if !try_gemv_q5_qk(
+            if try_gemv_q5_qkv(
+                &self.stream,
+                &self.k,
+                &self.layers[li].wq,
+                &self.layers[li].wk,
+                &self.layers[li].wv,
+                &self.xb,
+                &mut self.q,
+                &mut self.k_buf,
+                &mut self.v_buf,
+                self.layers[li].bq.as_ref(),
+                self.layers[li].bk.as_ref(),
+                self.layers[li].bv.as_ref(),
+            )? {
+                // fused Q+K+V
+            } else if try_gemv_pair(
                 &self.stream,
                 &self.k,
                 &self.layers[li].wq,
@@ -72,6 +87,18 @@ impl CudaModel {
                 self.layers[li].bq.as_ref(),
                 self.layers[li].bk.as_ref(),
             )? {
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &self.layers[li].wv,
+                    &self.xb,
+                    &mut self.v_buf,
+                    self.layers[li].bv.as_ref(),
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+            } else {
                 gemv(
                     &self.stream,
                     &self.k,
@@ -94,18 +121,18 @@ impl CudaModel {
                     &mut self.gemv_partial,
                     self.gemv_partial_stride,
                 )?;
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &self.layers[li].wv,
+                    &self.xb,
+                    &mut self.v_buf,
+                    self.layers[li].bv.as_ref(),
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
             }
-            gemv(
-                &self.stream,
-                &self.k,
-                &self.layers[li].wv,
-                &self.xb,
-                &mut self.v_buf,
-                self.layers[li].bv.as_ref(),
-                GemvResidual::None,
-                &mut self.gemv_partial,
-                self.gemv_partial_stride,
-            )?;
         } else {
             gemm(
                 &self.stream,
@@ -281,28 +308,41 @@ impl CudaModel {
                 })?;
         }
         if d.n_tok == 1 {
-            gemv(
+            // gate+up often same quant (Q5_0 or Q4_K) → stage xb once.
+            if !try_gemv_pair(
                 &self.stream,
                 &self.k,
                 &self.layers[li].gate,
-                &self.xb,
-                &mut self.hb,
-                None,
-                GemvResidual::None,
-                &mut self.gemv_partial,
-                self.gemv_partial_stride,
-            )?;
-            gemv(
-                &self.stream,
-                &self.k,
                 &self.layers[li].up,
                 &self.xb,
+                &mut self.hb,
                 &mut self.hb2,
                 None,
-                GemvResidual::None,
-                &mut self.gemv_partial,
-                self.gemv_partial_stride,
-            )?;
+                None,
+            )? {
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &self.layers[li].gate,
+                    &self.xb,
+                    &mut self.hb,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &self.layers[li].up,
+                    &self.xb,
+                    &mut self.hb2,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+            }
         } else {
             gemm(
                 &self.stream,

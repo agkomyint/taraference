@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "taraference"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-core"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "cudarc",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-gguf"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "byteorder",

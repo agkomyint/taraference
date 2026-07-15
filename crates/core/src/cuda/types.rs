@@ -47,8 +47,12 @@ pub struct Kernels {
     pub gemv_q6_splitk: CudaFunction,
     pub gemv_q8_splitk: CudaFunction,
     pub gemv_splitk_reduce: CudaFunction,
-    /// Fused Q+K single-token GEMV for Q5_0 (stage x once).
+    /// Fused dual single-token GEMV for Q5_0 (Q+K or gate+up; stage x once).
     pub gemv_q5_qk: CudaFunction,
+    /// Fused Q+K+V single-token GEMV for Q5_0 when all three match.
+    pub gemv_q5_qkv: CudaFunction,
+    /// Fused dual single-token GEMV for Q4_K (gate+up / Q+K on larger Q4_K_M).
+    pub gemv_q4_pair: CudaFunction,
     pub gemm_q4: CudaFunction,
     pub gemm_q5: CudaFunction,
     pub gemm_q6: CudaFunction,
