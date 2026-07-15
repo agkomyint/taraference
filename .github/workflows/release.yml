@@ -49,13 +49,14 @@ jobs:
             cuda-cudart-dev-13-0 \
             cuda-nvrtc-dev-13-0 \
             cuda-libraries-dev-13-0
-          # Symlink expected by many tools
+          # Symlink expected by many tools (apt often already sets alternatives)
           if [[ ! -e /usr/local/cuda ]]; then
-            sudo ln -s /usr/local/cuda-13.0 /usr/local/cuda
+            sudo ln -sfn /usr/local/cuda-13.0 /usr/local/cuda
           fi
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-          nvcc --version
+          # PATH update applies to later steps; use absolute path here
+          /usr/local/cuda/bin/nvcc --version
           ls /usr/local/cuda/lib64/libnvrtc* | head -5
 
       - name: Install Rust
