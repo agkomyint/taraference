@@ -5,7 +5,8 @@
 #   - manual: Actions → Release → Run workflow
 #
 # Runtime still needs: NVIDIA driver + CUDA 13.x toolkit (NVRTC) on the machine.
-# GitHub-hosted runners have no GPU; this job only compiles.
+# Compile does NOT need the CUDA toolkit: cudarc is built with
+# fallback-dynamic-loading + cuda-13020 feature flags.
 
 name: Release
 
@@ -25,8 +26,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CUDA_PATH: /usr/local/cuda
-  CUDA_HOME: /usr/local/cuda
+  CARGO_INCREMENTAL: "0"
+  # Faster link step on Linux CI
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+  # Pin CUDA API for cudarc even when toolkit is absent on the builder
+  CUDARC_CUDA_VERSION: "13020"
 
 jobs:
   linux-x86_64:
@@ -37,36 +41,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install CUDA 13 toolkit (compile-time headers / NVRTC)
+      - name: Install mold (fast linker)
         run: |
-          set -euo pipefail
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          # Minimal set for cudarc cuda-13020 + nvrtc dynamic load
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            cuda-nvcc-13-0 \
-            cuda-cudart-dev-13-0 \
-            cuda-nvrtc-dev-13-0 \
-            cuda-libraries-dev-13-0
-          # Symlink expected by many tools (apt often already sets alternatives)
-          if [[ ! -e /usr/local/cuda ]]; then
-            sudo ln -sfn /usr/local/cuda-13.0 /usr/local/cuda
-          fi
-          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-          # PATH update applies to later steps; use absolute path here
-          /usr/local/cuda/bin/nvcc --version
-          ls /usr/local/cuda/lib64/libnvrtc* | head -5
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mold
+          mold --version
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux
+          cache-on-failure: true
 
       - name: Build release
-        run: cargo build --release -p taraference
+        run: cargo build --release -p taraference --locked
 
       - name: Package
         run: |
@@ -121,7 +112,7 @@ jobs:
             Or after clone: `./scripts/get-binary.sh`
 
             **Runtime requirements:** NVIDIA GPU + driver, CUDA **13.x** toolkit (NVRTC).
-            Built on Ubuntu 22.04 with CUDA 13 toolkit (`cudarc` `cuda-13020`).
+            Binary is linked with dynamic CUDA load (`cudarc` `cuda-13020`).
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
