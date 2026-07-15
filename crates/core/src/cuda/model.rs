@@ -59,9 +59,7 @@ impl CudaModel {
             v.push(self.stream.alloc_zeros::<u16>(slot)?);
         }
         let kv_mib = (self.cfg.n_layer * slot * 2 * 2) as f64 / (1024.0 * 1024.0);
-        eprintln!(
-            "KV    | f16  max_seq={max_seq}  ~{kv_mib:.1} MiB (all layers K+V)"
-        );
+        eprintln!("KV    | f16  max_seq={max_seq}  ~{kv_mib:.1} MiB (all layers K+V)");
         Ok(CudaKv {
             k,
             v,

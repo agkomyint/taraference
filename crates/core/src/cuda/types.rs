@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// Max tokens in one prefill GEMM launch.
 pub const MAX_BATCH: usize = 256;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WType {
     Q4K,
     Q5_0,
@@ -47,6 +47,8 @@ pub struct Kernels {
     pub gemv_q6_splitk: CudaFunction,
     pub gemv_q8_splitk: CudaFunction,
     pub gemv_splitk_reduce: CudaFunction,
+    /// Fused Q+K single-token GEMV for Q5_0 (stage x once).
+    pub gemv_q5_qk: CudaFunction,
     pub gemm_q4: CudaFunction,
     pub gemm_q5: CudaFunction,
     pub gemm_q6: CudaFunction,

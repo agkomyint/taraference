@@ -213,6 +213,54 @@ fn gemv_splitk(
     Ok(())
 }
 
+/// Decode Q+K in one GEMV when both are Q5_0 with matching layout (stage x once).
+/// Returns true if fused path ran.
+pub(crate) fn try_gemv_q5_qk(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    wq: &GpuMat,
+    wk: &GpuMat,
+    x: &CudaSlice<f32>,
+    q: &mut CudaSlice<f32>,
+    k_out: &mut CudaSlice<f32>,
+    bq: Option<&CudaSlice<f32>>,
+    bk: Option<&CudaSlice<f32>>,
+) -> Result<bool> {
+    if wq.wtype != WType::Q5_0
+        || wk.wtype != WType::Q5_0
+        || wq.n_rows != wk.n_rows
+        || wq.col_bytes != wk.col_bytes
+    {
+        return Ok(false);
+    }
+    let n_rows = wq.n_rows as i32;
+    let n_q = wq.n_cols as i32;
+    let n_k = wk.n_cols as i32;
+    let col_bytes = wq.col_bytes as i32;
+    let use_bias: i32 = if bq.is_some() && bk.is_some() { 1 } else { 0 };
+    let bq_p: &CudaSlice<f32> = bq.unwrap_or(x);
+    let bk_p: &CudaSlice<f32> = bk.unwrap_or(x);
+    let n_tot = (wq.n_cols + wk.n_cols) as u32;
+    unsafe {
+        stream
+            .launch_builder(&k.gemv_q5_qk)
+            .arg(&wq.data)
+            .arg(&wk.data)
+            .arg(x)
+            .arg(q)
+            .arg(k_out)
+            .arg(&n_rows)
+            .arg(&n_q)
+            .arg(&n_k)
+            .arg(&col_bytes)
+            .arg(&use_bias)
+            .arg(bq_p)
+            .arg(bk_p)
+            .launch(lc_gemv(n_tot, wq.n_rows as u32))?;
+    }
+    Ok(true)
+}
+
 pub(crate) fn gemm(
     stream: &Arc<CudaStream>,
     k: &Kernels,

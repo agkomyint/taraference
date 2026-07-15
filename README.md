@@ -6,6 +6,8 @@ CUDA multi-turn inference for **Qwen2.5** GGUF (defaults for **RTX 3050 Ti 4GB**
 
 **Performance goal:** one user, maximum decode tokens/sec — not multi-user concurrency. See [GOAL.md](GOAL.md).
 
+**Decode speed (GOAL.md):** fused Q5_0 Q+K GEMV when both projections are Q5_0 (common in Q4_K_M; stages `x` once). Dynamic NVRTC `sm_XX`. Use binary **`tarafer`** (`target/release/tarafer.exe`).
+
 **Day-to-day loop** (SSH GPU ↔ laptop ↔ release CI ↔ `tarafer update`): [WORKFLOW.md](WORKFLOW.md).
 
 ---

@@ -422,3 +422,73 @@ extern "C" __global__ void gemv_splitk_reduce(
     if (use_bias) acc += bias[j];
     out[j] = acc;
 }
+
+// ── Fused Q+K GEMV (decode, Q5_0): stage x once ───────────────────────────
+// Q4_K_M often uses Q5_0 for Q and K with a different type for V.
+
+extern "C" __global__ void gemv_q5_0_qk(
+    const unsigned char* __restrict__ wq,
+    const unsigned char* __restrict__ wk,
+    const float* __restrict__ x,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    int n_rows, int n_q, int n_k, int col_bytes,
+    int use_bias,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk
+) {
+    extern __shared__ float xs[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
+    __syncthreads();
+
+    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    int n_tot = n_q + n_k;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    const float* bias;
+    int oj;
+    if (j < n_q) {
+        wcol = wq + (size_t)j * (size_t)col_bytes;
+        out = q;
+        bias = bq;
+        oj = j;
+    } else {
+        int jk = j - n_q;
+        wcol = wk + (size_t)jk * (size_t)col_bytes;
+        out = k;
+        bias = bk;
+        oj = jk;
+    }
+
+    float acc = 0.f;
+    int nb = n_rows / 32;
+    for (int bi = lane; bi < nb; bi += 32) {
+        const unsigned char* base = wcol + bi * 22;
+        float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        unsigned int qh = (unsigned int)base[2]
+            | ((unsigned int)base[3] << 8)
+            | ((unsigned int)base[4] << 16)
+            | ((unsigned int)base[5] << 24);
+        const unsigned char* qs = base + 6;
+        int yo = bi * 32;
+        #pragma unroll
+        for (int t = 0; t < 16; t++) {
+            unsigned char xh0 = (unsigned char)(((qh >> t) << 4) & 0x10u);
+            unsigned char xh1 = (unsigned char)(((qh >> (t + 12))) & 0x10u);
+            int x0 = (int)((qs[t] & 0x0F) | xh0);
+            int x1 = (int)((qs[t] >> 4) | xh1);
+            acc += (float)(x0 - 16) * d * xs[yo + t];
+            acc += (float)(x1 - 16) * d * xs[yo + 16 + t];
+        }
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        if (use_bias) acc += bias[oj];
+        out[oj] = acc;
+    }
+}

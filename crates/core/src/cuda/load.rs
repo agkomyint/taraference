@@ -94,6 +94,7 @@ impl CudaModel {
             gemv_q6_splitk: module.load_function("gemv_q6_k_splitk")?,
             gemv_q8_splitk: module.load_function("gemv_q8_0_splitk")?,
             gemv_splitk_reduce: module.load_function("gemv_splitk_reduce")?,
+            gemv_q5_qk: module.load_function("gemv_q5_0_qk")?,
             gemm_q4: module.load_function("gemm_q4_k")?,
             gemm_q5: module.load_function("gemm_q5_0")?,
             gemm_q6: module.load_function("gemm_q6_k")?,
@@ -166,7 +167,7 @@ impl CudaModel {
                 down: upload_mat(&format!("{p}.ffn_down.weight"))?,
             });
         }
-        eprintln!("ready");
+        eprintln!("ready | decode opts: fused Q5 Q+K GEMV when applicable");
 
         let n_embd = cfg.n_embd;
         let n_kv = cfg.n_head_kv * cfg.head_dim();
