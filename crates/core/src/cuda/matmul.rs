@@ -9,12 +9,27 @@ use std::sync::Arc;
 /// Must match `GEMV_WARPS` in gemv.cu.
 const GEMV_WARPS: u32 = 8;
 const GEMV_THREADS: u32 = GEMV_WARPS * 32;
+/// Must match `GEMV_SPLIT_MAX` in gemv.cu / load.rs.
+pub(crate) const GEMV_SPLIT_MAX: u32 = 8;
+/// Only split-K when staging `x` would use large shared memory (FFN-tall mats).
+/// Below this, classic GEMV already has enough column-parallelism; a reduce would hurt.
+const GEMV_SPLITK_MIN_ROWS: usize = 4096;
+/// Cap smem for baseline path; if larger, prefer split-K even if rows slightly lower.
+const GEMV_BASELINE_SMEM_CAP: usize = 24 * 1024;
 
 pub(crate) fn lc_gemv(n_cols: u32, n_rows: u32) -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((n_cols + GEMV_WARPS - 1) / GEMV_WARPS, 1, 1),
         block_dim: (GEMV_THREADS, 1, 1),
         shared_mem_bytes: n_rows * 4,
+    }
+}
+
+fn lc_gemv_splitk(n_cols: u32, n_split: u32, rows_per_split: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((n_cols + GEMV_WARPS - 1) / GEMV_WARPS, n_split, 1),
+        block_dim: (GEMV_THREADS, 1, 1),
+        shared_mem_bytes: rows_per_split * 4,
     }
 }
 
@@ -26,20 +41,52 @@ pub(crate) fn lc_gemm_cols(n_cols: u32) -> LaunchConfig {
     }
 }
 
+/// How many K-splits to use (1 = classic GEMV).
+pub(crate) fn gemv_n_split(n_rows: usize) -> u32 {
+    let smem = n_rows * 4;
+    if n_rows < GEMV_SPLITK_MIN_ROWS && smem <= GEMV_BASELINE_SMEM_CAP {
+        return 1;
+    }
+    // Tall FFN down (e.g. n_rows=11008): 4-way split cuts smem ~4× and multiplies blocks.
+    // (Avoid 8-way: extra reduce traffic can erase the win on laptop GPUs.)
+    4u32.min(GEMV_SPLIT_MAX)
+}
+
 /// Residual stream handling for single-token GEMV.
 #[derive(Clone, Copy)]
 pub(crate) enum GemvResidual<'a> {
     None,
-    /// `out = W x + residual` (separate buffer).
-    #[allow(dead_code)] // ready for other fused paths
+    #[allow(dead_code)]
     Add(&'a CudaSlice<f32>),
-    /// `y = W x + y` — fuse residual add into the matvec (decode residual stream).
-    /// Kernel only touches index `j` as read-then-write; safe alias of out/residual.
+    /// `y = W x + y`
     InPlace,
 }
 
 /// `y = W x [+ bias] [+ residual]` (single-token GEMV).
+/// Uses split-K when `n_rows` is large (needs `partial` buffer from the model).
 pub(crate) fn gemv(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    w: &GpuMat,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    bias: Option<&CudaSlice<f32>>,
+    residual: GemvResidual<'_>,
+    partial: &mut CudaSlice<f32>,
+    partial_stride: usize,
+) -> Result<()> {
+    let n_split = gemv_n_split(w.n_rows);
+    if n_split <= 1 {
+        return gemv_baseline(stream, k, w, x, y, bias, residual);
+    }
+    if w.n_cols > partial_stride {
+        // Safety fallback if a mat is wider than the arena (should not happen).
+        return gemv_baseline(stream, k, w, x, y, bias, residual);
+    }
+    gemv_splitk(stream, k, w, x, y, bias, residual, partial, n_split)
+}
+
+fn gemv_baseline(
     stream: &Arc<CudaStream>,
     k: &Kernels,
     w: &GpuMat,
@@ -52,13 +99,11 @@ pub(crate) fn gemv(
     let n_cols = w.n_cols as i32;
     let col_bytes = w.col_bytes as i32;
     let use_bias: i32 = if bias.is_some() { 1 } else { 0 };
-    // 0 = none, 1 = separate residual buf, 2 = in-place out[j] += (see gemv.cu).
     let use_res: i32 = match residual {
         GemvResidual::None => 0,
         GemvResidual::Add(_) => 1,
         GemvResidual::InPlace => 2,
     };
-    // Dummy pointer when unused (flags gate loads).
     let bias_ptr: &CudaSlice<f32> = bias.unwrap_or(x);
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4,
@@ -79,7 +124,6 @@ pub(crate) fn gemv(
             .arg(&use_res);
         match residual {
             GemvResidual::None | GemvResidual::InPlace => {
-                // Mode 2 reads residual from `out`; pointer unused but required.
                 lb.arg(x);
             }
             GemvResidual::Add(r) => {
@@ -91,6 +135,84 @@ pub(crate) fn gemv(
     Ok(())
 }
 
+fn gemv_splitk(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    w: &GpuMat,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    bias: Option<&CudaSlice<f32>>,
+    residual: GemvResidual<'_>,
+    partial: &mut CudaSlice<f32>,
+    n_split: u32,
+) -> Result<()> {
+    let n_rows = w.n_rows as i32;
+    let n_cols = w.n_cols as i32;
+    let col_bytes = w.col_bytes as i32;
+    let n_split_i = n_split as i32;
+    let use_bias: i32 = if bias.is_some() { 1 } else { 0 };
+    let use_res: i32 = match residual {
+        GemvResidual::None => 0,
+        GemvResidual::Add(_) => 1,
+        GemvResidual::InPlace => 2,
+    };
+    let bias_ptr: &CudaSlice<f32> = bias.unwrap_or(x);
+
+    // Max rows any split owns (ceil). Superblock-aligned types use 256; group types 32 —
+    // host smem is an upper bound; over-allocating smem is OK, under-alloc is not.
+    let block = if matches!(w.wtype, WType::Q4K | WType::Q6K) {
+        256usize
+    } else {
+        32usize
+    };
+    let n_blocks = w.n_rows / block;
+    let max_blocks_per_split = (n_blocks + n_split as usize - 1) / n_split as usize;
+    let rows_per_split = (max_blocks_per_split * block).max(block) as u32;
+
+    let f = match w.wtype {
+        WType::Q4K => &k.gemv_q4_splitk,
+        WType::Q5_0 => &k.gemv_q5_splitk,
+        WType::Q6K => &k.gemv_q6_splitk,
+        WType::Q8_0 => &k.gemv_q8_splitk,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(f)
+            .arg(&w.data)
+            .arg(x)
+            .arg(&mut *partial)
+            .arg(&n_rows)
+            .arg(&n_cols)
+            .arg(&col_bytes)
+            .arg(&n_split_i)
+            .launch(lc_gemv_splitk(w.n_cols as u32, n_split, rows_per_split))?;
+
+        let mut lb = stream.launch_builder(&k.gemv_splitk_reduce);
+        lb.arg(&*partial)
+            .arg(y)
+            .arg(&n_cols)
+            .arg(&n_split_i)
+            .arg(&use_bias)
+            .arg(bias_ptr)
+            .arg(&use_res);
+        match residual {
+            GemvResidual::None | GemvResidual::InPlace => {
+                lb.arg(x);
+            }
+            GemvResidual::Add(r) => {
+                lb.arg(r);
+            }
+        }
+        lb.launch(LaunchConfig {
+            grid_dim: ((w.n_cols as u32 + 255) / 256, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn gemm(
     stream: &Arc<CudaStream>,
     k: &Kernels,
@@ -98,9 +220,21 @@ pub(crate) fn gemm(
     x: &CudaSlice<f32>,
     y: &mut CudaSlice<f32>,
     n_tok: i32,
+    partial: &mut CudaSlice<f32>,
+    partial_stride: usize,
 ) -> Result<()> {
     if n_tok == 1 {
-        return gemv(stream, k, w, x, y, None, GemvResidual::None);
+        return gemv(
+            stream,
+            k,
+            w,
+            x,
+            y,
+            None,
+            GemvResidual::None,
+            partial,
+            partial_stride,
+        );
     }
     let n_rows = w.n_rows as i32;
     let n_cols = w.n_cols as i32;

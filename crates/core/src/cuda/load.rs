@@ -78,6 +78,11 @@ impl CudaModel {
             gemv_q5: module.load_function("gemv_q5_0")?,
             gemv_q6: module.load_function("gemv_q6_k")?,
             gemv_q8: module.load_function("gemv_q8_0")?,
+            gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
+            gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,
+            gemv_q6_splitk: module.load_function("gemv_q6_k_splitk")?,
+            gemv_q8_splitk: module.load_function("gemv_q8_0_splitk")?,
+            gemv_splitk_reduce: module.load_function("gemv_splitk_reduce")?,
             gemm_q4: module.load_function("gemm_q4_k")?,
             gemm_q5: module.load_function("gemm_q5_0")?,
             gemm_q6: module.load_function("gemm_q6_k")?,
@@ -155,6 +160,13 @@ impl CudaModel {
         let n_embd = cfg.n_embd;
         let n_kv = cfg.n_head_kv * cfg.head_dim();
         let b = MAX_BATCH;
+        // Split-K partials: enough for largest single-token GEMV (usually vocab).
+        let gemv_partial_stride = cfg
+            .n_vocab
+            .max(cfg.n_ff)
+            .max(n_embd)
+            .max(n_kv);
+        const GEMV_SPLIT_MAX: usize = 8;
         Ok(Self {
             x: stream.alloc_zeros(b * n_embd)?,
             xb: stream.alloc_zeros(b * n_embd)?,
@@ -169,6 +181,8 @@ impl CudaModel {
             logits: stream.alloc_zeros(cfg.n_vocab)?,
             argmax_buf: stream.alloc_zeros(1)?,
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,
+            gemv_partial: stream.alloc_zeros(GEMV_SPLIT_MAX * gemv_partial_stride)?,
+            gemv_partial_stride,
             cfg,
             decode,
             stream,

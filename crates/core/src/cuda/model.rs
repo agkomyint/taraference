@@ -33,6 +33,10 @@ pub struct CudaModel {
     pub(crate) logits: CudaSlice<f32>,
     pub(crate) argmax_buf: CudaSlice<i32>,
     pub(crate) tok_buf: CudaSlice<i32>,
+    /// Split-K GEMV partials: layout `[GEMV_SPLIT_MAX, max_gemv_cols]`.
+    pub(crate) gemv_partial: CudaSlice<f32>,
+    /// Capacity of one partial row (= max n_cols among gemv mats / vocab).
+    pub(crate) gemv_partial_stride: usize,
 }
 
 impl CudaModel {

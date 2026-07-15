@@ -68,6 +68,8 @@ impl CudaModel {
                 &mut self.q,
                 self.layers[li].bq.as_ref(),
                 GemvResidual::None,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             gemv(
                 &self.stream,
@@ -77,6 +79,8 @@ impl CudaModel {
                 &mut self.k_buf,
                 self.layers[li].bk.as_ref(),
                 GemvResidual::None,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             gemv(
                 &self.stream,
@@ -86,6 +90,8 @@ impl CudaModel {
                 &mut self.v_buf,
                 self.layers[li].bv.as_ref(),
                 GemvResidual::None,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
         } else {
             gemm(
@@ -95,6 +101,8 @@ impl CudaModel {
                 &self.xb,
                 &mut self.q,
                 d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             if let Some(ref b) = self.layers[li].bq {
                 let feat = d.n_embd;
@@ -115,6 +123,8 @@ impl CudaModel {
                 &self.xb,
                 &mut self.k_buf,
                 d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             if let Some(ref b) = self.layers[li].bk {
                 let feat = (d.n_kv_heads * d.head_dim) as i32;
@@ -137,6 +147,8 @@ impl CudaModel {
                 &self.xb,
                 &mut self.v_buf,
                 d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             if let Some(ref b) = self.layers[li].bv {
                 let feat = (d.n_kv_heads * d.head_dim) as i32;
@@ -212,6 +224,8 @@ impl CudaModel {
                 &mut self.x,
                 None,
                 GemvResidual::InPlace,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
         } else {
             gemm(
@@ -221,6 +235,8 @@ impl CudaModel {
                 &self.xb,
                 &mut self.xb2,
                 d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
             unsafe {
@@ -260,6 +276,8 @@ impl CudaModel {
                 &mut self.hb,
                 None,
                 GemvResidual::None,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             gemv(
                 &self.stream,
@@ -269,6 +287,8 @@ impl CudaModel {
                 &mut self.hb2,
                 None,
                 GemvResidual::None,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
         } else {
             gemm(
@@ -278,6 +298,8 @@ impl CudaModel {
                 &self.xb,
                 &mut self.hb,
                 d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             gemm(
                 &self.stream,
@@ -286,6 +308,8 @@ impl CudaModel {
                 &self.xb,
                 &mut self.hb2,
                 d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
         }
         let ff_n = (d.n_ff_u * d.n_tok_u) as i32;
@@ -307,6 +331,8 @@ impl CudaModel {
                 &mut self.x,
                 None,
                 GemvResidual::InPlace,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
         } else {
             gemm(
@@ -316,6 +342,8 @@ impl CudaModel {
                 &self.hb,
                 &mut self.xb2,
                 d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
             let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
             unsafe {
@@ -447,6 +475,8 @@ impl CudaModel {
                 &mut self.logits,
                 None,
                 GemvResidual::None,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
         } else {
             gemv(
@@ -457,6 +487,8 @@ impl CudaModel {
                 &mut self.logits,
                 None,
                 GemvResidual::None,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )?;
         }
         let n_vocab = self.cfg.n_vocab as i32;
