@@ -2,6 +2,36 @@
 
 CUDA multi-turn inference for **Qwen2.5** GGUF (defaults for **RTX 3050 Ti 4GB**).
 
+## Install (production / fresh machine)
+
+One-shot setup scripts check **Rust**, **C++ build tools**, **NVIDIA driver**, **CUDA + NVRTC**, then **release-build** and **download models**:
+
+```powershell
+# Windows
+.\scripts\install.ps1
+.\scripts\install.ps1 -Models 0.5b
+```
+
+```bash
+# Linux
+chmod +x scripts/install.sh
+./scripts/install.sh
+./scripts/install.sh --models 0.5b
+```
+
+Details: [`scripts/README.md`](scripts/README.md).
+
+Disposable **Linux Docker sandbox** (git + Ubuntu) to try clone/setup DX: [`test/`](test/).
+
+### Requirements (short)
+
+| Need | Notes |
+|------|--------|
+| NVIDIA GPU + driver | `nvidia-smi` works |
+| CUDA Toolkit ~13.x + **NVRTC** | Runtime kernel compile (`cudarc` / `cuda-13020`) |
+| Rust stable + Cargo | via rustup |
+| C++ linker | MSVC Build Tools (Windows) or `build-essential` (Linux) |
+
 ## Layout
 
 | Piece | Where | Role |
