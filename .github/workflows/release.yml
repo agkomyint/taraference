@@ -51,7 +51,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        # v2.9+ runs on Node 24 (avoids Node 20 deprecation warnings)
+        uses: Swatinem/rust-cache@v2.9.1
         with:
           shared-key: release-linux
           cache-on-failure: true
@@ -75,7 +76,7 @@ jobs:
           ldd dist/taraference || true
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: taraference-linux-x86_64
           path: |
