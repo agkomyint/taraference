@@ -1,5 +1,6 @@
 //! Load GGUF weights onto GPU and compile NVRTC kernels.
 
+use super::decode::DecodeBackend;
 use super::kernels::SOURCE;
 use super::model::CudaModel;
 use super::types::{GpuLayer, GpuMat, Kernels, WType, MAX_BATCH};
@@ -32,16 +33,21 @@ fn f32_host(gguf: &GgufFile, name: &str) -> Result<Vec<f32>> {
 
 impl CudaModel {
     pub fn load(gguf: &GgufFile) -> Result<Self> {
+        Self::load_with(gguf, DecodeBackend::default())
+    }
+
+    pub fn load_with(gguf: &GgufFile, decode: DecodeBackend) -> Result<Self> {
         let cfg = ModelConfig::from_gguf(gguf)?;
         eprintln!(
-            "GPU | {} L={} d={} heads={}/{} ff={} | {:.2} GiB Q-weights",
+            "GPU | {} L={} d={} heads={}/{} ff={} | {:.2} GiB Q-weights | decode={}",
             cfg.architecture,
             cfg.n_layer,
             cfg.n_embd,
             cfg.n_head,
             cfg.n_head_kv,
             cfg.n_ff,
-            gguf.total_tensor_bytes() as f64 / (1024.0 * 1024.0 * 1024.0)
+            gguf.total_tensor_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+            decode.name()
         );
 
         let ctx = CudaContext::new(0).context("CudaContext")?;
@@ -81,7 +87,9 @@ impl CudaModel {
             add: module.load_function("add_f32")?,
             add_bias: module.load_function("add_bias_f32")?,
             rope: module.load_function("rope_neox_f32")?,
-            attn: module.load_function("attn_f32")?,
+            attn_fast: module.load_function("attn_f32")?,
+            attn_basic: module.load_function("attn_basic_f32")?,
+            attn_online: module.load_function("attn_online_f32")?,
             copy_kv: module.load_function("copy_kv_f32")?,
             argmax: module.load_function("argmax_f32")?,
             copy_last: module.load_function("copy_last_row")?,
@@ -147,6 +155,7 @@ impl CudaModel {
             argmax_buf: stream.alloc_zeros(1)?,
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,
             cfg,
+            decode,
             stream,
             _ctx: ctx,
             _module: module,

@@ -7,6 +7,6 @@ pub mod session;
 pub mod tokenizer;
 
 pub use config::ModelConfig;
-pub use cuda::{CudaKv, CudaModel};
-pub use session::{Session, TurnStats};
+pub use cuda::{CudaKv, CudaModel, DecodeBackend};
+pub use session::{Session, StopReason, TurnStats};
 pub use tokenizer::Tokenizer;

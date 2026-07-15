@@ -6,6 +6,14 @@ use anyhow::Result;
 use std::io::{self, Write};
 use std::time::Instant;
 
+/// Why generation stopped this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Eos,
+    MaxNew,
+    Empty,
+}
+
 /// Timing / token counts from one `turn`.
 #[derive(Debug, Clone)]
 pub struct TurnStats {
@@ -16,8 +24,17 @@ pub struct TurnStats {
     pub decode_ms: f64,
     pub decode_tps: f64,
     pub prefill_tps: f64,
+    /// Time from start of turn until first assistant token is ready (tokenize + prefill).
+    pub ttft_ms: f64,
+    pub tokenize_ms: f64,
+    pub ctx_before: usize,
     pub ctx_len: usize,
+    pub max_seq: usize,
+    pub max_new: usize,
     pub wall_ms: f64,
+    pub stop: StopReason,
+    pub hit_max_new: bool,
+    pub first: bool,
 }
 
 pub struct Session<'a> {
@@ -47,6 +64,14 @@ impl<'a> Session<'a> {
         })
     }
 
+    pub fn max_seq(&self) -> usize {
+        self.cache.max_seq
+    }
+
+    pub fn ctx_len(&self) -> usize {
+        self.cache.len
+    }
+
     fn build_user_prompt(&self, user: &str, first: bool) -> String {
         let mut s = String::new();
         if first {
@@ -64,8 +89,12 @@ impl<'a> Session<'a> {
     pub fn turn(&mut self, user: &str) -> Result<TurnStats> {
         let wall = Instant::now();
         let first = !self.primed;
+        let ctx_before = self.cache.len;
+
+        let t_tok = Instant::now();
         let prompt = self.build_user_prompt(user, first);
         let ids = self.tok.encode(&prompt, false);
+        let tokenize_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
         if ids.is_empty() {
             anyhow::bail!("tokenizer produced 0 tokens for prompt");
         }
@@ -75,20 +104,27 @@ impl<'a> Session<'a> {
         let t0 = Instant::now();
         let mut next = self.model.forward_greedy(&ids, &mut self.cache)?;
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let ttft_ms = wall.elapsed().as_secs_f64() * 1000.0;
 
         let mut reply_ids = Vec::new();
         let mut reply = String::new();
         print!("assistant: ");
         let _ = io::stdout().flush();
 
+        let mut stop = StopReason::MaxNew;
         let t1 = Instant::now();
-        for _ in 0..self.max_new {
+        for step in 0..self.max_new {
             let piece = self.tok.decode(&[next]);
             if next == self.tok.eos_id
                 || piece == "<|im_end|>"
                 || piece == "<|endoftext|>"
                 || piece == "<|im_start|>"
             {
+                stop = if step == 0 && reply_ids.is_empty() {
+                    StopReason::Empty
+                } else {
+                    StopReason::Eos
+                };
                 break;
             }
             reply_ids.push(next);
@@ -96,6 +132,9 @@ impl<'a> Session<'a> {
             print!("{piece}");
             let _ = io::stdout().flush();
             next = self.model.forward_greedy(&[next], &mut self.cache)?;
+            if step + 1 == self.max_new {
+                stop = StopReason::MaxNew;
+            }
         }
 
         let end = self.tok.encode("<|im_end|>\n", false);
@@ -116,9 +155,14 @@ impl<'a> Session<'a> {
         } else {
             0.0
         };
+        let hit_max_new = stop == StopReason::MaxNew && n > 0;
+        if n == 0 {
+            stop = StopReason::Empty;
+        }
+
         println!();
         eprintln!(
-            "[{n} tok | prefill {prefill_ms:.0} ms | decode {decode_tps:.1} tok/s | ctx {}]",
+            "[{n} tok | prefill {prefill_ms:.0} ms | decode {decode_tps:.1} tok/s | ctx {} | stop={stop:?}]",
             self.cache.len
         );
 
@@ -130,8 +174,16 @@ impl<'a> Session<'a> {
             decode_ms,
             decode_tps,
             prefill_tps,
+            ttft_ms,
+            tokenize_ms,
+            ctx_before,
             ctx_len: self.cache.len,
+            max_seq: self.cache.max_seq,
+            max_new: self.max_new,
             wall_ms: wall.elapsed().as_secs_f64() * 1000.0,
+            stop,
+            hit_max_new,
+            first,
         })
     }
 

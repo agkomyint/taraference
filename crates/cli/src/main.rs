@@ -2,11 +2,9 @@ mod profile;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use profile::{
-    Profiler, TurnRow, MULTI_TURN_SCRIPT, PROFILE_MAX_NEW, PROFILE_PROMPT,
-};
+use profile::{Profiler, ProfileMeta, TurnRow, MULTI_TURN_SCRIPT, PROFILE_MAX_NEW};
 use std::path::PathBuf;
-use taraference_core::{CudaModel, Session, Tokenizer};
+use taraference_core::{CudaModel, DecodeBackend, Session, Tokenizer};
 use taraference_gguf::GgufFile;
 
 #[derive(Parser, Debug)]
@@ -21,10 +19,16 @@ struct Cli {
     ctx: usize,
     #[arg(long)]
     prompt: Option<String>,
-    /// Benchmark: multi-turn chat + CPU/GPU sampling + report.
-    /// Default script is 5 realistic turns (KV grows). With `--prompt`, single-turn only.
+    /// Attention / decode backend for A/B tests: fast | basic | online
+    #[arg(long, default_value = "fast", value_parser = parse_decode)]
+    decode: DecodeBackend,
+    /// Benchmark: multi-turn chat + CPU/GPU sampling + rich report.
     #[arg(long, default_value_t = false)]
     profile: bool,
+}
+
+fn parse_decode(s: &str) -> Result<DecodeBackend, String> {
+    s.parse::<DecodeBackend>().map_err(|e| e.to_string())
 }
 
 fn main() -> Result<()> {
@@ -32,12 +36,13 @@ fn main() -> Result<()> {
     eprintln!("loading {} …", cli.model.display());
     let gguf =
         GgufFile::open(&cli.model).with_context(|| format!("open {}", cli.model.display()))?;
+    let weight_gib = gguf.total_tensor_bytes() as f64 / (1024.0 * 1024.0 * 1024.0);
     let tok = Tokenizer::from_gguf(&gguf)?;
-    let mut model = CudaModel::load(&gguf)?;
+    let mut model = CudaModel::load_with(&gguf, cli.decode)?;
     let max_seq = cli.ctx.min(model.cfg.n_ctx);
 
     if cli.profile {
-        run_profile(&mut model, &tok, max_seq, &cli)?;
+        run_profile(&mut model, &tok, max_seq, weight_gib, &cli)?;
     } else {
         let mut session = Session::new(&mut model, &tok, max_seq, cli.max_new)?;
         if let Some(p) = cli.prompt {
@@ -53,11 +58,10 @@ fn run_profile(
     model: &mut CudaModel,
     tok: &Tokenizer,
     max_seq: usize,
+    weight_gib: f64,
     cli: &Cli,
 ) -> Result<()> {
     let max_new = cli.max_new.min(PROFILE_MAX_NEW);
-
-    // Custom --prompt ⇒ single-turn microbench; otherwise multi-turn real-use script.
     let script: Vec<String> = if let Some(ref p) = cli.prompt {
         vec![p.clone()]
     } else {
@@ -70,8 +74,19 @@ fn run_profile(
         "multi-turn"
     };
 
+    let meta = ProfileMeta {
+        model_path: cli.model.display().to_string(),
+        cfg: model.cfg.clone(),
+        weight_gib,
+        max_seq,
+        max_new,
+        sample_interval_ms: 100,
+        decode: model.decode,
+    };
+
     eprintln!(
-        "profile mode ({mode}) | max_new={max_new} | turns={} | sample every 100ms",
+        "profile mode ({mode}) | decode={} | max_new={max_new} | turns={}",
+        model.decode.name(),
         script.len()
     );
     for (i, u) in script.iter().enumerate() {
@@ -93,6 +108,6 @@ fn run_profile(
         });
     }
 
-    prof.stop_and_report(&rows, mode);
+    prof.stop_and_report(&rows, mode, &meta);
     Ok(())
 }

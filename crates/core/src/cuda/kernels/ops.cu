@@ -1,4 +1,5 @@
-// Batch RMSNorm: one block per token
+// Elementwise + RoPE + KV + attention + argmax
+
 extern "C" __global__ void rms_norm_f32(
     const float* __restrict__ x,
     const float* __restrict__ w,
@@ -58,7 +59,6 @@ extern "C" __global__ void add_bias_f32(
     if (i < total) x[i] += b[i % n_feat];
 }
 
-// RoPE neox batch: grid (n_heads, n_tok)
 extern "C" __global__ void rope_neox_f32(
     float* __restrict__ x,
     int n_heads,
@@ -84,8 +84,6 @@ extern "C" __global__ void rope_neox_f32(
     }
 }
 
-// Copy n_tok KV rows into cache starting at pos0
-// src: [n_tok, stride], cache: [max_seq, stride]
 extern "C" __global__ void copy_kv_f32(
     const float* __restrict__ src,
     float* __restrict__ cache,
@@ -102,9 +100,32 @@ extern "C" __global__ void copy_kv_f32(
     }
 }
 
-// Prefill+decode attention: grid (n_head, n_q)
-// q: [n_q, n_head, hd], cache K/V: [max_seq, n_kv, hd]
-// queries at absolute positions pos0 .. pos0+n_q-1
+__device__ __forceinline__ float block_max(float v) {
+    __shared__ float buf[256];
+    int tid = (int)threadIdx.x;
+    buf[tid] = v;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) buf[tid] = fmaxf(buf[tid], buf[tid + s]);
+        __syncthreads();
+    }
+    return buf[0];
+}
+
+__device__ __forceinline__ float block_sum(float v) {
+    __shared__ float buf[256];
+    int tid = (int)threadIdx.x;
+    buf[tid] = v;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) buf[tid] += buf[tid + s];
+        __syncthreads();
+    }
+    return buf[0];
+}
+
+// Fast attention: Q in smem, parallel scores + parallel softmax, tiled V.
+// grid (n_head, n_q)  block 128
 extern "C" __global__ void attn_f32(
     const float* __restrict__ q,
     const float* __restrict__ k_cache,
@@ -120,6 +141,79 @@ extern "C" __global__ void attn_f32(
     int h = (int)blockIdx.x;
     int qi = (int)blockIdx.y;
     if (h >= n_head || qi >= n_q) return;
+    int tid = (int)threadIdx.x;
+    int nt = (int)blockDim.x;
+    int rep = n_head / n_kv;
+    int kv_h = h / rep;
+    int stride = n_kv * head_dim;
+    int pos = pos0 + qi;
+    int seq_len = pos + 1;
+
+    extern __shared__ float smem[];
+    float* qh = smem;                 // head_dim
+    float* scores = smem + head_dim;  // seq_len
+
+    const float* qsrc = q + (size_t)qi * (size_t)(n_head * head_dim) + h * head_dim;
+    for (int d = tid; d < head_dim; d += nt) qh[d] = qsrc[d];
+    __syncthreads();
+
+    // scores
+    for (int t = tid; t < seq_len; t += nt) {
+        const float* kt = k_cache + (size_t)t * (size_t)stride + kv_h * head_dim;
+        float dot = 0.f;
+        // unroll-friendly head_dim (64/128)
+        #pragma unroll 8
+        for (int d = 0; d < head_dim; d++) dot += qh[d] * kt[d];
+        scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    // parallel max
+    float local_m = -1e30f;
+    for (int t = tid; t < seq_len; t += nt) local_m = fmaxf(local_m, scores[t]);
+    float m = block_max(local_m);
+
+    // parallel sum exp
+    float local_s = 0.f;
+    for (int t = tid; t < seq_len; t += nt) {
+        float e = expf(scores[t] - m);
+        scores[t] = e;
+        local_s += e;
+    }
+    float inv = 1.f / block_sum(local_s);
+    for (int t = tid; t < seq_len; t += nt) scores[t] *= inv;
+    __syncthreads();
+
+    // V @ scores — each thread a subset of dims
+    float* oh = out + (size_t)qi * (size_t)(n_head * head_dim) + h * head_dim;
+    for (int d = tid; d < head_dim; d += nt) {
+        float acc = 0.f;
+        for (int t = 0; t < seq_len; t++) {
+            const float* vt = v_cache + (size_t)t * (size_t)stride + kv_h * head_dim;
+            acc += scores[t] * vt[d];
+        }
+        oh[d] = acc;
+    }
+}
+
+// Baseline attention: serial softmax on thread 0 (A/B vs fast).
+extern "C" __global__ void attn_basic_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out,
+    int n_head,
+    int n_kv,
+    int head_dim,
+    int pos0,
+    int n_q,
+    float scale
+) {
+    int h = (int)blockIdx.x;
+    int qi = (int)blockIdx.y;
+    if (h >= n_head || qi >= n_q) return;
+    int tid = (int)threadIdx.x;
+    int nt = (int)blockDim.x;
     int rep = n_head / n_kv;
     int kv_h = h / rep;
     int stride = n_kv * head_dim;
@@ -128,7 +222,7 @@ extern "C" __global__ void attn_f32(
     const float* qh = q + (size_t)qi * (size_t)(n_head * head_dim) + h * head_dim;
     extern __shared__ float scores[];
 
-    for (int t = (int)threadIdx.x; t < seq_len; t += (int)blockDim.x) {
+    for (int t = tid; t < seq_len; t += nt) {
         const float* kt = k_cache + (size_t)t * (size_t)stride + kv_h * head_dim;
         float dot = 0.f;
         for (int d = 0; d < head_dim; d++) dot += qh[d] * kt[d];
@@ -136,7 +230,7 @@ extern "C" __global__ void attn_f32(
     }
     __syncthreads();
 
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         float m = -1e30f;
         for (int t = 0; t < seq_len; t++) if (scores[t] > m) m = scores[t];
         float sum = 0.f;
@@ -150,7 +244,7 @@ extern "C" __global__ void attn_f32(
     __syncthreads();
 
     float* oh = out + (size_t)qi * (size_t)(n_head * head_dim) + h * head_dim;
-    for (int d = (int)threadIdx.x; d < head_dim; d += (int)blockDim.x) {
+    for (int d = tid; d < head_dim; d += nt) {
         float acc = 0.f;
         for (int t = 0; t < seq_len; t++) {
             const float* vt = v_cache + (size_t)t * (size_t)stride + kv_h * head_dim;
@@ -158,6 +252,62 @@ extern "C" __global__ void attn_f32(
         }
         oh[d] = acc;
     }
+}
+
+// Online softmax for single-query decode. grid: n_head, block: head_dim.
+// Prefill multi-token should fall back to fast in host code.
+extern "C" __global__ void attn_online_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out,
+    int n_head,
+    int n_kv,
+    int head_dim,
+    int seq_len,
+    float scale
+) {
+    int h = (int)blockIdx.x;
+    if (h >= n_head) return;
+    int tid = (int)threadIdx.x;
+    if (tid >= head_dim) return;
+
+    int rep = n_head / n_kv;
+    int kv_h = h / rep;
+    int stride = n_kv * head_dim;
+
+    extern __shared__ float sm[];
+    float* qh = sm;
+    float* red = sm + head_dim;
+
+    qh[tid] = q[h * head_dim + tid];
+    __syncthreads();
+
+    float m = -1e30f;
+    float l = 0.f;
+    float acc = 0.f;
+
+    for (int t = 0; t < seq_len; t++) {
+        const float* kt = k_cache + (size_t)t * (size_t)stride + kv_h * head_dim;
+        const float* vt = v_cache + (size_t)t * (size_t)stride + kv_h * head_dim;
+
+        red[tid] = qh[tid] * kt[tid];
+        __syncthreads();
+        for (int s = head_dim / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        float score = red[0] * scale;
+
+        float m_new = fmaxf(m, score);
+        float alpha = expf(m - m_new);
+        float beta = expf(score - m_new);
+        acc = acc * alpha + beta * vt[tid];
+        l = l * alpha + beta;
+        m = m_new;
+        __syncthreads();
+    }
+    out[h * head_dim + tid] = acc / l;
 }
 
 extern "C" __global__ void argmax_f32(
@@ -188,7 +338,6 @@ extern "C" __global__ void argmax_f32(
     if (threadIdx.x == 0) out_idx[0] = sbest_i[0];
 }
 
-// Slice last token row: src[n_tok, dim] -> dst[dim]
 extern "C" __global__ void copy_last_row(
     const float* __restrict__ src,
     float* __restrict__ dst,

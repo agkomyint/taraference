@@ -6,15 +6,15 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
-/// Warps per GEMV block (must match `GEMV_WARPS` in gemv.cu).
-const GEMV_WARPS: u32 = 4;
+/// Must match `GEMV_WARPS` in gemv.cu.
+const GEMV_WARPS: u32 = 8;
 const GEMV_THREADS: u32 = GEMV_WARPS * 32;
 
 pub(crate) fn lc_gemv(n_cols: u32, n_rows: u32) -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((n_cols + GEMV_WARPS - 1) / GEMV_WARPS, 1, 1),
         block_dim: (GEMV_THREADS, 1, 1),
-        shared_mem_bytes: n_rows * 4, // stage x[]
+        shared_mem_bytes: n_rows * 4,
     }
 }
 
@@ -26,16 +26,24 @@ pub(crate) fn lc_gemm_cols(n_cols: u32) -> LaunchConfig {
     }
 }
 
+/// `y = W x [+ bias] [+ residual]` (single-token GEMV).
 pub(crate) fn gemv(
     stream: &Arc<CudaStream>,
     k: &Kernels,
     w: &GpuMat,
     x: &CudaSlice<f32>,
     y: &mut CudaSlice<f32>,
+    bias: Option<&CudaSlice<f32>>,
+    residual: Option<&CudaSlice<f32>>,
 ) -> Result<()> {
     let n_rows = w.n_rows as i32;
     let n_cols = w.n_cols as i32;
     let col_bytes = w.col_bytes as i32;
+    let use_bias: i32 = if bias.is_some() { 1 } else { 0 };
+    let use_res: i32 = if residual.is_some() { 1 } else { 0 };
+    // Dummy pointer when unused (flags gate loads).
+    let bias_ptr: &CudaSlice<f32> = bias.unwrap_or(x);
+    let res_ptr: &CudaSlice<f32> = residual.unwrap_or(x);
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4,
         WType::Q6K => &k.gemv_q6,
@@ -50,6 +58,10 @@ pub(crate) fn gemv(
             .arg(&n_rows)
             .arg(&n_cols)
             .arg(&col_bytes)
+            .arg(&use_bias)
+            .arg(bias_ptr)
+            .arg(&use_res)
+            .arg(res_ptr)
             .launch(lc_gemv(w.n_cols as u32, w.n_rows as u32))?;
     }
     Ok(())
@@ -64,7 +76,7 @@ pub(crate) fn gemm(
     n_tok: i32,
 ) -> Result<()> {
     if n_tok == 1 {
-        return gemv(stream, k, w, x, y);
+        return gemv(stream, k, w, x, y, None, None);
     }
     let n_rows = w.n_rows as i32;
     let n_cols = w.n_cols as i32;
@@ -91,7 +103,6 @@ pub(crate) fn gemm(
 
 impl CudaModel {
     pub(crate) fn embed_batch(&mut self, tokens: &[i32]) -> Result<()> {
-        // Decode path: single token — no host→device buffer copy.
         if tokens.len() == 1 {
             return self.embed_one(tokens[0]);
         }

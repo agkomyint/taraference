@@ -21,13 +21,24 @@ Optional one-shot: `--prompt "Hello"`. Chat: type messages, `/quit`, `/reset`.
 cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile
 ```
 
-Runs a **5-turn** chat script (greeting → follow-ups → summarize) so KV/context grows like a real user. Samples CPU/GPU every ~100 ms, then prints per-turn + aggregate report.
+### A/B decode backends (`--decode`)
 
-Single-turn microbench only:
+Keep all attention paths; switch without deleting code:
+
+| Name | Meaning |
+|------|---------|
+| `fast` | Parallel softmax (default) |
+| `basic` | Serial softmax baseline |
+| `online` | Online softmax on decode tokens (prefill uses fast) |
 
 ```powershell
-cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --prompt "Hello"
+cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode basic
+cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode fast
+cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode online
 ```
+
+Add more backends in `crates/core/src/cuda/decode.rs` + a CUDA kernel + branch in `layer.rs` `launch_attn`.
+
 
 ## Layout
 

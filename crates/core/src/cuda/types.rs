@@ -53,7 +53,12 @@ pub struct Kernels {
     pub add: CudaFunction,
     pub add_bias: CudaFunction,
     pub rope: CudaFunction,
-    pub attn: CudaFunction,
+    /// Parallel softmax attention (`attn_f32`).
+    pub attn_fast: CudaFunction,
+    /// Serial softmax baseline (`attn_basic_f32`).
+    pub attn_basic: CudaFunction,
+    /// Online softmax single-query (`attn_online_f32`).
+    pub attn_online: CudaFunction,
     pub copy_kv: CudaFunction,
     pub argmax: CudaFunction,
     pub copy_last: CudaFunction,

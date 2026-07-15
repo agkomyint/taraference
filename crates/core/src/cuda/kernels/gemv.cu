@@ -1,9 +1,9 @@
 // Decode GEMV: bandwidth-first.
-// - Stage x[] in shared memory (reused by all warps in the block)
-// - 4 warps / block → 4 output columns, one weight stream each
-// - Fused Q4/Q6 dequant·dot (no full float column buffer)
+// - Stage x[] in shared memory
+// - 8 warps / block → 8 output columns
+// - Optional bias / residual via flags (no null ptr)
 
-#define GEMV_WARPS 4
+#define GEMV_WARPS 8
 #define GEMV_THREADS (GEMV_WARPS * 32)
 
 __device__ __forceinline__ float dot_q4_k_col_xs(
@@ -21,7 +21,6 @@ __device__ __forceinline__ float dot_q4_k_col_xs(
         const unsigned char* scales = base + 4;
         const unsigned char* q = base + 16;
         const float* xb = xs + bi * 256;
-        // 4×64: each lane owns one of 32 packed bytes → 2 outputs
         #pragma unroll
         for (int t = 0; t < 4; t++) {
             unsigned char sc, m;
@@ -70,64 +69,72 @@ __device__ __forceinline__ float dot_q6_k_col_xs(
     return warp_sum(acc);
 }
 
+// out[j] = (use_res ? residual[j] : 0) + dot + (use_bias ? bias[j] : 0)
 extern "C" __global__ void gemv_q4_k(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
     float* __restrict__ out,
-    int n_rows, int n_cols, int col_bytes
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
 ) {
     extern __shared__ float xs[];
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    // Stage activation vector once for the whole block.
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) {
-        xs[i] = x[i];
-    }
+    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = dot_q4_k_col_xs(col, xs, n_rows, lane);
-    if (lane == 0) out[j] = acc;
+    if (lane == 0) {
+        if (use_res) acc += residual[j];
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
 }
 
 extern "C" __global__ void gemv_q6_k(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
     float* __restrict__ out,
-    int n_rows, int n_cols, int col_bytes
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
 ) {
     extern __shared__ float xs[];
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) {
-        xs[i] = x[i];
-    }
+    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = dot_q6_k_col_xs(col, xs, n_rows, lane);
-    if (lane == 0) out[j] = acc;
+    if (lane == 0) {
+        if (use_res) acc += residual[j];
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
 }
 
 extern "C" __global__ void gemv_q8_0(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
     float* __restrict__ out,
-    int n_rows, int n_cols, int col_bytes
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
 ) {
     extern __shared__ float xs[];
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) {
-        xs[i] = x[i];
-    }
+    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
@@ -144,5 +151,9 @@ extern "C" __global__ void gemv_q8_0(
         for (int t = 0; t < 32; t++) acc += (float)qs[t] * d * xs[yo + t];
     }
     acc = warp_sum(acc);
-    if (lane == 0) out[j] = acc;
+    if (lane == 0) {
+        if (use_res) acc += residual[j];
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
 }

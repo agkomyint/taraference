@@ -1,5 +1,6 @@
 //! CudaModel shell: owns weights, workspace, stream.
 
+use super::decode::DecodeBackend;
 use super::kv::CudaKv;
 use super::types::{GpuLayer, GpuMat, Kernels};
 use crate::config::ModelConfig;
@@ -8,6 +9,8 @@ use std::sync::Arc;
 
 pub struct CudaModel {
     pub cfg: ModelConfig,
+    /// Selected decode / attention backend (`--decode`).
+    pub decode: DecodeBackend,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) _ctx: Arc<CudaContext>,
     pub(crate) _module: Arc<CudaModule>,
