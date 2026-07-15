@@ -19,8 +19,6 @@ pub struct EngineConfig {
     pub default_system: String,
     /// Attempt CUDA graph capture for single-token decode after warm-up.
     pub cuda_graph: bool,
-    /// Prompt Lookup Decoding (n-gram speculative) in sessions.
-    pub pld: bool,
 }
 
 impl Default for EngineConfig {
@@ -32,7 +30,6 @@ impl Default for EngineConfig {
             decode: DecodeBackend::default(),
             default_system: "You are a helpful assistant.".into(),
             cuda_graph: true,
-            pld: false,
         }
     }
 }
@@ -50,7 +47,6 @@ pub struct InferenceEngine {
     pub max_new: usize,
     pub default_system: String,
     pub weight_gib: f64,
-    pub pld: bool,
 }
 
 impl InferenceEngine {
@@ -70,9 +66,8 @@ impl InferenceEngine {
             .unwrap_or("taraference")
             .to_string();
         eprintln!(
-            "flags | cuda_graph={} | pld={} | decode={}",
+            "flags | cuda_graph={} | decode={}",
             cfg.cuda_graph,
-            cfg.pld,
             cfg.decode.name()
         );
 
@@ -86,7 +81,6 @@ impl InferenceEngine {
             max_new: cfg.max_new,
             default_system: cfg.default_system,
             weight_gib,
-            pld: cfg.pld,
         })
     }
 
@@ -111,7 +105,6 @@ impl InferenceEngine {
         max_seq: usize,
         max_new: usize,
         cuda_graph: bool,
-        pld: bool,
     ) -> Result<Self> {
         Self::load(EngineConfig {
             model_path: model.as_ref().to_path_buf(),
@@ -119,7 +112,6 @@ impl InferenceEngine {
             max_new,
             decode,
             cuda_graph,
-            pld,
             ..EngineConfig::default()
         })
     }
@@ -192,7 +184,6 @@ impl InferenceEngine {
             system: self.default_system.clone(),
             print_stream: false,
             print_stats: false,
-            pld: self.pld,
         };
         self.kv.clear();
         let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);

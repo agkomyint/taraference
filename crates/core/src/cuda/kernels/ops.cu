@@ -113,6 +113,76 @@ extern "C" __global__ void rope_neox_f32_d(
     }
 }
 
+// Qwen3: per-head RMS normalization is applied to Q and K before RoPE.  Fuse
+// both operations so architecture correctness costs no additional launch.
+__device__ __forceinline__ void qk_rms_norm_rope_impl(
+    float* __restrict__ base,
+    const float* __restrict__ w,
+    int head_dim,
+    int pos,
+    float theta,
+    float eps
+) {
+    __shared__ float sums[256];
+    int tid = (int)threadIdx.x;
+    float ss = 0.f;
+    for (int i = tid; i < head_dim; i += (int)blockDim.x) {
+        float v = base[i];
+        ss += v * v;
+    }
+    sums[tid] = ss;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sums[tid] += sums[tid + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sums[0] / (float)head_dim + eps);
+    int half = head_dim / 2;
+    for (int i = tid; i < half; i += (int)blockDim.x) {
+        float freq = powf(theta, -2.f * (float)i / (float)head_dim);
+        float ang = (float)pos * freq;
+        float c = cosf(ang), s = sinf(ang);
+        float x0 = base[i] * scale * w[i];
+        float x1 = base[i + half] * scale * w[i + half];
+        base[i] = x0 * c - x1 * s;
+        base[i + half] = x0 * s + x1 * c;
+    }
+}
+
+extern "C" __global__ void qk_rms_norm_rope_neox_f32(
+    float* __restrict__ x,
+    const float* __restrict__ w,
+    int n_heads,
+    int head_dim,
+    int pos0,
+    int n_tok,
+    float theta,
+    float eps
+) {
+    int h = (int)blockIdx.x;
+    int t = (int)blockIdx.y;
+    if (h >= n_heads || t >= n_tok) return;
+    float* base = x + (size_t)t * (size_t)(n_heads * head_dim) + h * head_dim;
+    qk_rms_norm_rope_impl(base, w, head_dim, pos0 + t, theta, eps);
+}
+
+extern "C" __global__ void qk_rms_norm_rope_neox_f32_d(
+    float* __restrict__ x,
+    const float* __restrict__ w,
+    int n_heads,
+    int head_dim,
+    const int* __restrict__ pos0_ptr,
+    int n_tok,
+    float theta,
+    float eps
+) {
+    int h = (int)blockIdx.x;
+    int t = (int)blockIdx.y;
+    if (h >= n_heads || t >= n_tok) return;
+    float* base = x + (size_t)t * (size_t)(n_heads * head_dim) + h * head_dim;
+    qk_rms_norm_rope_impl(base, w, head_dim, pos0_ptr[0] + t, theta, eps);
+}
+
 // Store K/V as IEEE f16 bits (unsigned short) — halves attention HBM traffic.
 extern "C" __global__ void copy_kv_f16(
     const float* __restrict__ src,

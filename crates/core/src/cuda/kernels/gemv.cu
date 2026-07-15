@@ -1,13 +1,130 @@
 // Decode GEMV: bandwidth-first.
 // - Stage x[] (or a row-slice) in shared memory
-// - 8 warps / block → 8 output columns
+// - 32 warps / block → 32 output columns
 // - Optional bias / residual via flags
 // - Split-K path: grid (col_blocks, n_split) for better SM occupancy when n_rows is large
 
-#define GEMV_WARPS 8
+#define GEMV_WARPS 32
 #define GEMV_THREADS (GEMV_WARPS * 32)
 // Must match matmul.rs GEMV_SPLIT_MAX
 #define GEMV_SPLIT_MAX 8
+
+// Quantize one f32 activation row to Q8 in shared memory. Each warp owns one
+// 32-value group at a time; scales are per group, matching MMVQ's Q8_1 dot path.
+__device__ __forceinline__ void quantize_q8_smem(
+    const float* __restrict__ x,
+    signed char* __restrict__ q8,
+    float* __restrict__ d8,
+    int n_rows,
+    int warp,
+    int lane
+) {
+    const int nb = n_rows >> 5;
+    for (int bi = warp; bi < nb; bi += GEMV_WARPS) {
+        const int i = (bi << 5) + lane;
+        const float xi = x[i];
+        float amax = fabsf(xi);
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 16));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 8));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 4));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 2));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 1));
+        amax = __shfl_sync(0xffffffffu, amax, 0);
+        const float d = amax * (1.0f / 127.0f);
+        q8[i] = amax == 0.f ? 0 : (signed char)__float2int_rn(xi / d);
+        if (lane == 0) d8[bi] = d;
+    }
+}
+
+// Quantize an activation once for all output-column blocks of a fused GEMV.
+extern "C" __global__ void quantize_q8_global(
+    const float* __restrict__ x,
+    signed char* __restrict__ q8,
+    float* __restrict__ d8,
+    int n_rows
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int bi = (int)blockIdx.x * 8 + warp;
+    if (bi >= (n_rows >> 5)) return;
+    const int i = (bi << 5) + lane;
+    const float xi = x[i];
+    float amax = fabsf(xi);
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 16));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 8));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 4));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 1));
+    amax = __shfl_sync(0xffffffffu, amax, 0);
+    const float d = amax * (1.0f / 127.0f);
+    q8[i] = amax == 0.f ? 0 : (signed char)__float2int_rn(xi / d);
+    if (lane == 0) d8[bi] = d;
+}
+
+// Q4_K block mapping follows ggml/llama.cpp's MIT-licensed CUDA MMVQ design;
+// this implementation is specialized for taraference's column-major weights.
+// Lanes 0..15 process one 256-value superblock while
+// lanes 16..31 process the next; __dp4a performs four signed int8 products.
+__device__ __forceinline__ float dot_q4_k_col_q8_range(
+    const unsigned char* __restrict__ col,
+    const signed char* __restrict__ q8,
+    const float* __restrict__ d8,
+    int bi0,
+    int bi1,
+    int lane
+) {
+    float acc = 0.f;
+    const int iqs = 2 * (lane & 15);
+    for (int bi = bi0 + (lane >> 4); bi < bi1; bi += 2) {
+        const unsigned char* base = col + bi * 144;
+        const float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const float minv = half_to_float((unsigned short)(base[2] | (base[3] << 8)));
+        const unsigned char* scales = base + 4;
+        const unsigned char* qs = base + 16;
+
+        const int q8_offset = 2 * ((iqs >> 1) >> 2); // 0, 2, 4, 6 Q8 blocks
+        const int q4_offset = 16 * q8_offset + 4 * ((iqs >> 1) & 3);
+        const int* q4 = reinterpret_cast<const int*>(qs + q4_offset);
+        const int v0 = q4[0];
+        const int v1 = q4[4];
+
+        const unsigned short* sc16 = reinterpret_cast<const unsigned short*>(scales);
+        unsigned short aux0, aux1;
+        const int j = q8_offset >> 1;
+        if (j < 2) {
+            aux0 = sc16[j] & 0x3f3f;
+            aux1 = sc16[j + 2] & 0x3f3f;
+        } else {
+            aux0 = ((sc16[j + 2] >> 0) & 0x0f0f) | ((sc16[j - 2] & 0xc0c0) >> 2);
+            aux1 = ((sc16[j + 2] >> 4) & 0x0f0f) | ((sc16[j] & 0xc0c0) >> 2);
+        }
+        const unsigned char sc0 = (unsigned char)(aux0 & 0xff);
+        const unsigned char sc1 = (unsigned char)(aux0 >> 8);
+        const unsigned char m0 = (unsigned char)(aux1 & 0xff);
+        const unsigned char m1 = (unsigned char)(aux1 >> 8);
+
+        const int local_block = bi - bi0;
+        const signed char* qb0 = q8 + (local_block * 8 + q8_offset) * 32;
+        const signed char* qb1 = qb0 + 32;
+        const int q8_word = (iqs >> 1) & 3;
+        const int* u0 = reinterpret_cast<const int*>(qb0) + q8_word;
+        const int* u1 = reinterpret_cast<const int*>(qb1) + q8_word;
+        const int ua0 = u0[0], ua1 = u0[4];
+        const int ub0 = u1[0], ub1 = u1[4];
+
+        const int dot0 = __dp4a(v0 & 0x0f0f0f0f, ua0,
+                         __dp4a(v1 & 0x0f0f0f0f, ua1, 0));
+        const int dot1 = __dp4a((v0 >> 4) & 0x0f0f0f0f, ub0,
+                         __dp4a((v1 >> 4) & 0x0f0f0f0f, ub1, 0));
+        const int sum0 = __dp4a(0x01010101, ua0, __dp4a(0x01010101, ua1, 0));
+        const int sum1 = __dp4a(0x01010101, ub0, __dp4a(0x01010101, ub1, 0));
+        acc += d * (d8[local_block * 8 + q8_offset] * (float)(dot0 * (int)sc0)
+                  + d8[local_block * 8 + q8_offset + 1] * (float)(dot1 * (int)sc1));
+        acc -= minv * (d8[local_block * 8 + q8_offset] * (float)(sum0 * (int)m0)
+                     + d8[local_block * 8 + q8_offset + 1] * (float)(sum1 * (int)m1));
+    }
+    return warp_sum(acc);
+}
 
 __device__ __forceinline__ float dot_q4_k_col_xs_range(
     const unsigned char* __restrict__ col,
@@ -91,6 +208,60 @@ __device__ __forceinline__ float dot_q6_k_col_xs(
     return dot_q6_k_col_xs_range(col, xs, 0, n_rows / 256, lane);
 }
 
+__device__ __forceinline__ float dot_q6_k_repack_q8_range(
+    const unsigned char* __restrict__ col,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    int bi0,
+    int bi1,
+    int lane
+) {
+    float acc = 0.f;
+    for (int bi = bi0; bi < bi1; bi++) {
+        const unsigned char* base = col + bi * 276;
+        const signed char* qw = reinterpret_cast<const signed char*>(base);
+        const signed char* sc = reinterpret_cast<const signed char*>(base + 256);
+        const float d = half_to_float((unsigned short)(base[272] | (base[273] << 8)));
+        const int local = (bi - bi0) * 256;
+        #pragma unroll
+        for (int g = lane; g < 64; g += 32) {
+            const int i = g * 4;
+            const int wpack = *reinterpret_cast<const int*>(qw + i);
+            const int apack = *reinterpret_cast<const int*>(xq + local + i);
+            const int dot = __dp4a(wpack, apack, 0);
+            acc += d * (float)sc[i >> 4] * xd[(local + i) >> 5] * (float)dot;
+        }
+    }
+    return warp_sum(acc);
+}
+
+__device__ __forceinline__ float dot_q6_k_repack_q8_global_range(
+    const unsigned char* __restrict__ col,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    int bi0,
+    int bi1,
+    int lane
+) {
+    float acc = 0.f;
+    for (int bi = bi0; bi < bi1; bi++) {
+        const unsigned char* base = col + bi * 276;
+        const signed char* qw = reinterpret_cast<const signed char*>(base);
+        const signed char* sc = reinterpret_cast<const signed char*>(base + 256);
+        const float d = half_to_float((unsigned short)(base[272] | (base[273] << 8)));
+        const int global = bi * 256;
+        #pragma unroll
+        for (int g = lane; g < 64; g += 32) {
+            const int i = g * 4;
+            const int wpack = *reinterpret_cast<const int*>(qw + i);
+            const int apack = *reinterpret_cast<const int*>(xq + global + i);
+            const int dot = __dp4a(wpack, apack, 0);
+            acc += d * (float)sc[i >> 4] * xd[(global + i) >> 5] * (float)dot;
+        }
+    }
+    return warp_sum(acc);
+}
+
 // use_res: 0 = none, 1 = +residual[j], 2 = +out[j] in-place (before write).
 __device__ __forceinline__ float gemv_apply_res(
     int use_res, float acc, float* out, int j, const float* residual
@@ -110,26 +281,19 @@ extern "C" __global__ void gemv_q4_k(
     int use_bias, const float* __restrict__ bias,
     int use_res, const float* __restrict__ residual
 ) {
-    extern __shared__ float xs[];
+    extern __shared__ unsigned char qsmem[];
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    // Stage x with float4 loads when rows are multiple of 4 (always true for QK blocks).
-    {
-        int n4 = n_rows >> 2;
-        for (int i = tid; i < n4; i += GEMV_THREADS) {
-            float4 v = reinterpret_cast<const float4*>(x)[i];
-            int o = i << 2;
-            xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
-        }
-        for (int i = (n4 << 2) + tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
-    }
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
-    float acc = dot_q4_k_col_xs(col, xs, n_rows, lane);
+    float acc = dot_q4_k_col_q8_range(col, xq, xd, 0, n_rows / 256, lane);
     if (lane == 0) {
         acc = gemv_apply_res(use_res, acc, out, j, residual);
         if (use_bias) acc += bias[j];
@@ -164,6 +328,78 @@ extern "C" __global__ void gemv_q6_k(
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = dot_q6_k_col_xs(col, xs, n_rows, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+extern "C" __global__ void gemv_q6_k_repack(
+    const unsigned char* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    const int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q6_k_repack_q8_range(col, xq, xd, 0, n_rows / 256, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+extern "C" __global__ void gemv_q4_k_global(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q4_k_col_q8_range(col, xq, xd, 0, n_rows / 256, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+extern "C" __global__ void gemv_q6_k_repack_global(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q6_k_repack_q8_range(col, xq, xd, 0, n_rows / 256, lane);
     if (lane == 0) {
         acc = gemv_apply_res(use_res, acc, out, j, residual);
         if (use_bias) acc += bias[j];
@@ -282,7 +518,7 @@ extern "C" __global__ void gemv_q4_k_splitk(
     float* __restrict__ partial,
     int n_rows, int n_cols, int col_bytes, int n_split
 ) {
-    extern __shared__ float xs[];
+    extern __shared__ unsigned char qsmem[];
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -294,7 +530,9 @@ extern "C" __global__ void gemv_q4_k_splitk(
     const int bi1 = (nsb * (s + 1)) / n_split;
     const int row0 = bi0 * 256;
     const int n_local = (bi1 - bi0) * 256;
-    for (int i = tid; i < n_local; i += GEMV_THREADS) xs[i] = x[row0 + i];
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_local);
+    quantize_q8_smem(x + row0, xq, xd, n_local, warp, lane);
     __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
@@ -304,7 +542,7 @@ extern "C" __global__ void gemv_q4_k_splitk(
         return;
     }
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
-    float acc = dot_q4_k_col_xs_range(col, xs, bi0, bi1, lane);
+    float acc = dot_q4_k_col_q8_range(col, xq, xd, bi0, bi1, lane);
     if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = acc;
 }
 
@@ -337,6 +575,65 @@ extern "C" __global__ void gemv_q6_k_splitk(
     }
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     float acc = dot_q6_k_col_xs_range(col, xs, bi0, bi1, lane);
+    if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = acc;
+}
+
+extern "C" __global__ void gemv_q6_k_repack_splitk(
+    const unsigned char* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ partial,
+    int n_rows, int n_cols, int col_bytes, int n_split
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int s = (int)blockIdx.y;
+    if (s >= n_split) return;
+
+    const int nsb = n_rows / 256;
+    const int bi0 = (nsb * s) / n_split;
+    const int bi1 = (nsb * (s + 1)) / n_split;
+    const int row0 = bi0 * 256;
+    const int n_local = (bi1 - bi0) * 256;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_local);
+    quantize_q8_smem(x + row0, xq, xd, n_local, warp, lane);
+    __syncthreads();
+
+    const int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    if (j >= n_cols) return;
+    if (bi0 >= bi1) {
+        if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = 0.f;
+        return;
+    }
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    const float acc = dot_q6_k_repack_q8_range(col, xq, xd, bi0, bi1, lane);
+    if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = acc;
+}
+
+extern "C" __global__ void gemv_q6_k_repack_global_splitk(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ partial,
+    int n_rows, int n_cols, int col_bytes, int n_split
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int s = (int)blockIdx.y;
+    if (s >= n_split) return;
+    const int nsb = n_rows / 256;
+    const int bi0 = (nsb * s) / n_split;
+    const int bi1 = (nsb * (s + 1)) / n_split;
+    const int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    if (j >= n_cols) return;
+    if (bi0 >= bi1) {
+        if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = 0.f;
+        return;
+    }
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    const float acc = dot_q6_k_repack_q8_global_range(col, xq, xd, bi0, bi1, lane);
     if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = acc;
 }
 
@@ -540,7 +837,8 @@ extern "C" __global__ void gemv_q5_0_qk(
 extern "C" __global__ void gemv_q4_k_pair(
     const unsigned char* __restrict__ wa,
     const unsigned char* __restrict__ wb,
-    const float* __restrict__ x,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
     float* __restrict__ out_a,
     float* __restrict__ out_b,
     int n_rows, int n_a, int n_b, int col_bytes,
@@ -548,12 +846,9 @@ extern "C" __global__ void gemv_q4_k_pair(
     const float* __restrict__ ba,
     const float* __restrict__ bb
 ) {
-    extern __shared__ float xs[];
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    for (int i = tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
-    __syncthreads();
 
     int j = (int)blockIdx.x * GEMV_WARPS + warp;
     int n_tot = n_a + n_b;
@@ -576,7 +871,54 @@ extern "C" __global__ void gemv_q4_k_pair(
         oj = jb;
     }
 
-    float acc = dot_q4_k_col_xs(wcol, xs, n_rows, lane);
+    float acc = dot_q4_k_col_q8_range(wcol, xq, xd, 0, n_rows / 256, lane);
+    if (lane == 0) {
+        if (use_bias) acc += bias[oj];
+        out[oj] = acc;
+    }
+}
+
+// Fused Q+K+V for Q4_K decode: quantize/stage the hidden state once.
+extern "C" __global__ void gemv_q4_k_qkv(
+    const unsigned char* __restrict__ wq,
+    const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wv,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int n_rows, int n_q, int n_k, int n_v, int col_bytes,
+    int use_bias,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv
+) {
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    const int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    const int n_tot = n_q + n_k + n_v;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    const float* bias;
+    int oj;
+    if (j < n_q) {
+        wcol = wq + (size_t)j * (size_t)col_bytes;
+        out = q; bias = bq; oj = j;
+    } else if (j < n_q + n_k) {
+        oj = j - n_q;
+        wcol = wk + (size_t)oj * (size_t)col_bytes;
+        out = k; bias = bk;
+    } else {
+        oj = j - n_q - n_k;
+        wcol = wv + (size_t)oj * (size_t)col_bytes;
+        out = v; bias = bv;
+    }
+    float acc = dot_q4_k_col_q8_range(wcol, xq, xd, 0, n_rows / 256, lane);
     if (lane == 0) {
         if (use_bias) acc += bias[oj];
         out[oj] = acc;

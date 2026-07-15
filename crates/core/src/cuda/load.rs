@@ -35,6 +35,38 @@ fn f32_host(gguf: &GgufFile, name: &str) -> Result<Vec<f32>> {
     Ok(v)
 }
 
+const Q6_REPACK_BLOCK_BYTES: usize = 276;
+
+fn q6_value(base: &[u8], i: usize) -> i8 {
+    let half = i >> 7;
+    let within = i & 127;
+    let segment = within >> 5;
+    let lane = within & 31;
+    let lo_byte = base[half * 64 + (segment & 1) * 32 + lane];
+    let lo = if segment < 2 { lo_byte & 0x0f } else { lo_byte >> 4 };
+    let hi = (base[128 + half * 32 + lane] >> (segment * 2)) & 3;
+    ((lo | (hi << 4)) as i8) - 32
+}
+
+/// Expand Q6_K's split 4+2-bit representation once at load time.  Decode then
+/// streams aligned signed bytes + the original per-16 scales and block scale.
+fn repack_q6_decode(raw: &[u8], n_rows: usize, n_cols: usize, col_bytes: usize) -> Vec<u8> {
+    let n_blocks = n_rows / 256;
+    let decode_col_bytes = n_blocks * Q6_REPACK_BLOCK_BYTES;
+    let mut out = vec![0u8; n_cols * decode_col_bytes];
+    for col in 0..n_cols {
+        for bi in 0..n_blocks {
+            let src = &raw[col * col_bytes + bi * 210..][..210];
+            let dst0 = col * decode_col_bytes + bi * Q6_REPACK_BLOCK_BYTES;
+            for i in 0..256 {
+                out[dst0 + i] = q6_value(src, i) as u8;
+            }
+            out[dst0 + 256..dst0 + 274].copy_from_slice(&src[192..210]);
+        }
+    }
+    out
+}
+
 impl CudaModel {
     pub fn load(gguf: &GgufFile) -> Result<Self> {
         Self::load_with(gguf, DecodeBackend::default())
@@ -94,18 +126,26 @@ impl CudaModel {
         .context("nvrtc compile")?;
         let module = ctx.load_module(ptx).context("load_module")?;
         let k = Kernels {
+            quantize_q8: module.load_function("quantize_q8_global")?,
             gemv_q4: module.load_function("gemv_q4_k")?,
+            gemv_q4_global: module.load_function("gemv_q4_k_global")?,
             gemv_q5: module.load_function("gemv_q5_0")?,
             gemv_q6: module.load_function("gemv_q6_k")?,
+            gemv_q6_repack: module.load_function("gemv_q6_k_repack")?,
+            gemv_q6_repack_global: module.load_function("gemv_q6_k_repack_global")?,
             gemv_q8: module.load_function("gemv_q8_0")?,
             gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
             gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,
             gemv_q6_splitk: module.load_function("gemv_q6_k_splitk")?,
+            gemv_q6_repack_splitk: module.load_function("gemv_q6_k_repack_splitk")?,
+            gemv_q6_repack_global_splitk: module
+                .load_function("gemv_q6_k_repack_global_splitk")?,
             gemv_q8_splitk: module.load_function("gemv_q8_0_splitk")?,
             gemv_splitk_reduce: module.load_function("gemv_splitk_reduce")?,
             gemv_q5_qk: module.load_function("gemv_q5_0_qk")?,
             gemv_q5_qkv: module.load_function("gemv_q5_0_qkv")?,
             gemv_q4_pair: module.load_function("gemv_q4_k_pair")?,
+            gemv_q4_qkv: module.load_function("gemv_q4_k_qkv")?,
             gemm_q4: module.load_function("gemm_q4_k")?,
             gemm_q5: module.load_function("gemm_q5_0")?,
             gemm_q6: module.load_function("gemm_q6_k")?,
@@ -128,6 +168,8 @@ impl CudaModel {
             add_bias: module.load_function("add_bias_f32")?,
             rope: module.load_function("rope_neox_f32")?,
             rope_d: module.load_function("rope_neox_f32_d")?,
+            qk_norm_rope: module.load_function("qk_rms_norm_rope_neox_f32")?,
+            qk_norm_rope_d: module.load_function("qk_rms_norm_rope_neox_f32_d")?,
             attn: {
                 // Load only symbols listed in decode::REGISTRY (easy add/remove).
                 let mut map = std::collections::HashMap::new();
@@ -150,12 +192,23 @@ impl CudaModel {
                 .ok_or_else(|| anyhow!("missing {name}"))?;
             let n_rows = t.dims[0] as usize;
             let n_cols = *t.dims.get(1).unwrap_or(&1) as usize;
+            let raw = gguf.tensor_data(t);
+            let wtype = wtype_of(t.ggml_type)?;
+            let (decode_data, decode_col_bytes) = if wtype == WType::Q6K {
+                let packed = repack_q6_decode(raw, n_rows, n_cols, t.ggml_type.nbytes(n_rows as u64) as usize);
+                let stride = (n_rows / 256) * Q6_REPACK_BLOCK_BYTES;
+                (Some(stream.clone_htod(&packed)?), stride)
+            } else {
+                (None, t.ggml_type.nbytes(n_rows as u64) as usize)
+            };
             Ok(GpuMat {
-                data: stream.clone_htod(gguf.tensor_data(t))?,
+                data: stream.clone_htod(raw)?,
+                decode_data,
                 n_rows,
                 n_cols,
                 col_bytes: t.ggml_type.nbytes(n_rows as u64) as usize,
-                wtype: wtype_of(t.ggml_type)?,
+                decode_col_bytes,
+                wtype,
             })
         };
         let upload_vec = |name: &str| -> Result<_> {
@@ -171,6 +224,8 @@ impl CudaModel {
             let p = format!("blk.{i}");
             layers.push(GpuLayer {
                 attn_norm: upload_vec(&format!("{p}.attn_norm.weight"))?,
+                attn_q_norm: upload_vec(&format!("{p}.attn_q_norm.weight")).ok(),
+                attn_k_norm: upload_vec(&format!("{p}.attn_k_norm.weight")).ok(),
                 wq: upload_mat(&format!("{p}.attn_q.weight"))?,
                 bq: upload_vec(&format!("{p}.attn_q.bias")).ok(),
                 wk: upload_mat(&format!("{p}.attn_k.weight"))?,
@@ -184,16 +239,53 @@ impl CudaModel {
                 down: upload_mat(&format!("{p}.ffn_down.weight"))?,
             });
         }
+        let mut type_counts = [0usize; 4];
+        let mut type_bytes = [0usize; 4];
+        let mut count_mat = |m: &GpuMat| {
+            let idx = match m.wtype {
+                WType::Q4K => 0,
+                WType::Q5_0 => 1,
+                WType::Q6K => 2,
+                WType::Q8_0 => 3,
+            };
+            type_counts[idx] += 1;
+            type_bytes[idx] += m.col_bytes * m.n_cols;
+        };
+        count_mat(&token_embd);
+        if let Some(ref m) = output {
+            count_mat(m);
+        }
+        for layer in &layers {
+            for m in [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+            ] {
+                count_mat(m);
+            }
+        }
+        eprintln!(
+            "weights | Q4_K={} ({:.2} GiB) Q5_0={} ({:.2} GiB) Q6_K={} ({:.2} GiB) Q8_0={} ({:.2} GiB)",
+            type_counts[0], type_bytes[0] as f64 / 1073741824.0,
+            type_counts[1], type_bytes[1] as f64 / 1073741824.0,
+            type_counts[2], type_bytes[2] as f64 / 1073741824.0,
+            type_counts[3], type_bytes[3] as f64 / 1073741824.0,
+        );
         // Ensure no pending default-stream work before inference/graphs.
         ctx.synchronize().context("ctx sync after load")?;
         eprintln!(
-            "ready | decode={} | fused dual GEMV | flash backend available | CUDA-graph ready",
+            "ready | decode={} | Q4_K×Q8 DP4A | fused projections | CUDA-graph ready",
             decode.name()
         );
 
         let n_embd = cfg.n_embd;
         let n_kv = cfg.n_head_kv * cfg.head_dim();
         let head_dim = cfg.head_dim();
+        let n_q = cfg.n_head * head_dim;
         let b = MAX_BATCH;
         // Split-K partials: enough for largest single-token GEMV (usually vocab).
         let gemv_partial_stride = cfg
@@ -208,9 +300,11 @@ impl CudaModel {
             cfg.n_head * FLASH_MAX_SPLIT as usize * flash_partial_stride;
         Ok(Self {
             x: stream.alloc_zeros(b * n_embd)?,
-            xb: stream.alloc_zeros(b * n_embd)?,
+            // Qwen3 can have n_head*head_dim > n_embd; xb is reused for
+            // normalized hidden state and the attention result.
+            xb: stream.alloc_zeros(b * n_embd.max(n_q))?,
             xb2: stream.alloc_zeros(b * n_embd)?,
-            q: stream.alloc_zeros(b * n_embd)?,
+            q: stream.alloc_zeros(b * n_q)?,
             k_buf: stream.alloc_zeros(b * n_kv)?,
             v_buf: stream.alloc_zeros(b * n_kv)?,
             hb: stream.alloc_zeros(b * cfg.n_ff)?,
@@ -220,12 +314,13 @@ impl CudaModel {
             logits: stream.alloc_zeros(cfg.n_vocab)?,
             argmax_buf: stream.alloc_zeros(1)?,
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,
+            q8_x: stream.alloc_zeros(cfg.n_ff.max(n_embd))?,
+            q8_d: stream.alloc_zeros((cfg.n_ff.max(n_embd) + 31) / 32)?,
             gemv_partial: stream.alloc_zeros(GEMV_SPLIT_MAX * gemv_partial_stride)?,
             gemv_partial_stride,
             d_pos0: stream.alloc_zeros(1)?,
             d_token: stream.alloc_zeros(1)?,
             flash_partial: stream.alloc_zeros(flash_partial_n)?,
-            flash_partial_stride,
             decode_graph: None,
             graph_tried: false,
             cuda_graph: true,

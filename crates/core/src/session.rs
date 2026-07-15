@@ -46,8 +46,6 @@ pub struct SessionOptions {
     pub print_stream: bool,
     /// Print the `[n tok | …]` line after a turn.
     pub print_stats: bool,
-    /// Prompt Lookup Decoding (n-gram speculative; full-draft verify only).
-    pub pld: bool,
 }
 
 impl Default for SessionOptions {
@@ -57,7 +55,6 @@ impl Default for SessionOptions {
             system: "You are a helpful assistant.".into(),
             print_stream: true,
             print_stats: true,
-            pld: false,
         }
     }
 }
@@ -91,7 +88,6 @@ pub struct Session<'a> {
     system: String,
     print_stream: bool,
     print_stats: bool,
-    pld: bool,
     primed: bool,
 }
 
@@ -112,7 +108,6 @@ impl<'a> Session<'a> {
             system: opts.system,
             print_stream: opts.print_stream,
             print_stats: opts.print_stats,
-            pld: opts.pld,
             primed,
         }
     }
@@ -195,8 +190,6 @@ impl<'a> Session<'a> {
             let _ = io::stdout().flush();
         }
 
-        // Context for prompt-lookup n-gram matching (prompt tokens + generated so far).
-        let mut ctx_ids = ids;
         let mut stop = StopReason::MaxNew;
         let t1 = Instant::now();
         let mut step = 0usize;
@@ -215,7 +208,6 @@ impl<'a> Session<'a> {
                 break;
             }
             reply_ids.push(next);
-            ctx_ids.push(next);
             reply.push_str(&piece);
             if self.print_stream {
                 print!("{piece}");
@@ -228,70 +220,7 @@ impl<'a> Session<'a> {
                 break;
             }
 
-            // Prompt Lookup Decoding (opt-in via SessionOptions.pld).
-            let draft = if self.pld {
-                pld_draft(&ctx_ids, 3, 4)
-            } else {
-                Vec::new()
-            };
-            if self.pld && draft.len() >= 2 && step + draft.len() < self.max_new {
-                let mut cand = Vec::with_capacity(1 + draft.len());
-                cand.push(next);
-                cand.extend_from_slice(&draft);
-                let kv_before = self.cache.len;
-                match self.model.forward_greedy_all(&cand, self.cache) {
-                    Ok(preds) if preds.len() == cand.len() => {
-                        let mut ok = true;
-                        for i in 0..draft.len() {
-                            if preds[i] != draft[i] {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok {
-                            for &t in &draft {
-                                let p = self.tok.decode(&[t]);
-                                if t == self.tok.eos_id
-                                    || p == "<|im_end|>"
-                                    || p == "<|endoftext|>"
-                                    || p == "<|im_start|>"
-                                {
-                                    stop = StopReason::Eos;
-                                    next = t;
-                                    step = self.max_new;
-                                    break;
-                                }
-                                reply_ids.push(t);
-                                ctx_ids.push(t);
-                                reply.push_str(&p);
-                                if self.print_stream {
-                                    print!("{p}");
-                                    let _ = io::stdout().flush();
-                                }
-                                on_token(&p);
-                                step += 1;
-                                if step >= self.max_new {
-                                    stop = StopReason::MaxNew;
-                                    break;
-                                }
-                            }
-                            if stop != StopReason::Eos && step < self.max_new {
-                                next = preds[draft.len()];
-                            }
-                        } else {
-                            // Rollback KV length and single-step.
-                            self.cache.len = kv_before;
-                            next = self.model.forward_greedy(&[next], self.cache)?;
-                        }
-                    }
-                    _ => {
-                        self.cache.len = kv_before;
-                        next = self.model.forward_greedy(&[next], self.cache)?;
-                    }
-                }
-            } else {
-                next = self.model.forward_greedy(&[next], self.cache)?;
-            }
+            next = self.model.forward_greedy(&[next], self.cache)?;
         }
 
         // Keep multi-turn KV consistent with ChatML (append end marker).
@@ -376,44 +305,5 @@ impl<'a> Session<'a> {
             }
         }
         Ok(())
-    }
-}
-
-/// Prompt Lookup Decoding: find n-gram match of the last `ngram` tokens in earlier
-/// context and return up to `max_draft` following tokens.
-fn pld_draft(ctx: &[u32], ngram: usize, max_draft: usize) -> Vec<u32> {
-    if ctx.len() < ngram + 1 || ngram == 0 || max_draft == 0 {
-        return Vec::new();
-    }
-    let needle = &ctx[ctx.len() - ngram..];
-    let search_end = ctx.len() - ngram;
-    // Scan from end so most recent match wins (often better for chat).
-    let mut i = search_end;
-    while i > 0 {
-        i -= 1;
-        if i + ngram > search_end {
-            continue;
-        }
-        if &ctx[i..i + ngram] == needle {
-            let start = i + ngram;
-            let end = (start + max_draft).min(ctx.len() - ngram);
-            if end > start {
-                return ctx[start..end].to_vec();
-            }
-        }
-    }
-    Vec::new()
-}
-
-#[cfg(test)]
-mod pld_tests {
-    use super::pld_draft;
-
-    #[test]
-    fn finds_continuation() {
-        // context: a b c d a b  → needle a b, match at start, draft c d
-        let ctx = vec![1, 2, 3, 4, 1, 2];
-        let d = pld_draft(&ctx, 2, 3);
-        assert_eq!(d, vec![3, 4]);
     }
 }

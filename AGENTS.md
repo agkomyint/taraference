@@ -9,11 +9,11 @@
 - claiming a win or regression
 - iterative improve loops
 
-**Do not use 0.5B** for any of the above (not even “quick” checks meant as tok/s signal).
+**Do not use 0.5B** for any of the above (not even a quick tok/s signal).
 
 ```text
 models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
 # download: tarafer --download 3b
 ```
 
-Policy lives in [GOAL.md](GOAL.md) and [WORKFLOW.md](WORKFLOW.md). Follow those.
+Policy details live in [GOAL.md](GOAL.md) and [WORKFLOW.md](WORKFLOW.md).

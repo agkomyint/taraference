@@ -1,16 +1,17 @@
 # taraference
 
-CUDA multi-turn inference for **Qwen2.5** GGUF (defaults for **RTX 3050 Ti 4GB**).
+CUDA multi-turn GGUF inference, optimized for single-stream decode on NVIDIA GPUs.
 
 **CLI name:** **`tarafer`** (short command). The repo/crate is still `taraference`.
 
 **Performance goal:** one user, maximum decode tokens/sec — not multi-user concurrency. See [GOAL.md](GOAL.md).
 
-**Profile / improve model (mandatory):** only **Qwen2.5-3B-Instruct-Q4_K_M** — **do not** use 0.5B for profiling, A/B, or speed work. See [GOAL.md](GOAL.md) Model policy and [WORKFLOW.md](WORKFLOW.md).
+**Performance scoreboard:** all profiling and speed claims use
+`Qwen2.5-3B-Instruct-Q4_K_M.gguf`. See [GOAL.md](GOAL.md).
 
-**Decode speed (GOAL.md):** fused Q5_0 Q+K GEMV when both projections are Q5_0 (common in Q4_K_M; stages `x` once). Dynamic NVRTC `sm_XX`. Use binary **`tarafer`** (`target/release/tarafer.exe`).
+**v0.4 decode path:** Q4_K×Q8 shared-memory activation quantization with packed DP4A dots, fused Q4/Q5 projections, eight-way flash decode, CUDA graphs, and dynamic NVRTC `sm_XX` targeting.
 
-**Day-to-day loop** (SSH GPU ↔ laptop ↔ release CI ↔ `tarafer update`): [WORKFLOW.md](WORKFLOW.md).
+**Day-to-day loop** (edit locally, sync/build/profile directly on SSH T4): [WORKFLOW.md](WORKFLOW.md).
 
 ---
 
@@ -265,7 +266,7 @@ Re-run after changes; **vs PREVIOUS** compares only the same model (`latest_<mod
 | Feature | What |
 |---------|------|
 | **f16 KV** | Keys/values stored as half precision (~½ VRAM & attention BW vs f32) |
-| **`fast` (default)** | Tiled online attention — fixed smem (`Q` + tile), no `scores[ctx]` |
+| **`flash` (default)** | Eight-way split-KV flash decode; tiled `fastv2` prefill fallback |
 | Incremental multi-turn | Append-only cache; only new tokens are prefilled |
 
 ### A/B decode backends (`--decode`)
@@ -274,14 +275,12 @@ Backends are a **registry** — add/remove without touching `layer.rs` launch co
 
 | Name | Meaning |
 |------|---------|
-| `fast` / `fastv1` | v1: parallel softmax (`scores[ctx]` smem) |
-| **`fastv2`** (default) | v2: tiled online attn (fixed smem) |
-| `basic` | serial softmax baseline |
-| `online` | online decode (1 tok); prefill → `fastv2` |
+| **`flash`** (default) | Eight-way split-KV flash decode + tiled prefill |
+| `fastv2` | Compatibility/A-B fallback: tiled online attention |
 
 ```powershell
+cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile
 cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode fastv2
-cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode fast
 ```
 
 Logs: `profile-logs/profile_<date>_<model>_<decode>.txt`.

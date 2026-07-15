@@ -49,6 +49,9 @@ pub struct CudaModel {
     pub(crate) logits: CudaSlice<f32>,
     pub(crate) argmax_buf: CudaSlice<i32>,
     pub(crate) tok_buf: CudaSlice<i32>,
+    /// Decode activation quantization arena, reused by fused Q4 projections.
+    pub(crate) q8_x: CudaSlice<i8>,
+    pub(crate) q8_d: CudaSlice<f32>,
     /// Split-K GEMV partials: layout `[GEMV_SPLIT_MAX, max_gemv_cols]`.
     pub(crate) gemv_partial: CudaSlice<f32>,
     /// Capacity of one partial row (= max n_cols among gemv mats / vocab).
@@ -59,7 +62,6 @@ pub struct CudaModel {
     pub(crate) d_token: CudaSlice<i32>,
     /// Flash-decoding partial workspace: n_head * n_split * (2 + head_dim).
     pub(crate) flash_partial: CudaSlice<f32>,
-    pub(crate) flash_partial_stride: usize, // 2 + head_dim
     /// Captured single-token decode graph (replay after updating d_pos0/d_token).
     pub(crate) decode_graph: Option<SendCudaGraph>,
     /// Graph capture attempted (success or permanent fail).

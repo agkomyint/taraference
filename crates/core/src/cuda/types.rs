@@ -16,14 +16,22 @@ pub enum WType {
 
 pub struct GpuMat {
     pub data: CudaSlice<u8>,
+    /// Optional decode-optimized representation; original GGUF data remains
+    /// available for batched prefill/GEMM.
+    pub decode_data: Option<CudaSlice<u8>>,
     pub n_rows: usize,
     pub n_cols: usize,
     pub col_bytes: usize,
+    pub decode_col_bytes: usize,
     pub wtype: WType,
 }
 
 pub struct GpuLayer {
     pub attn_norm: CudaSlice<f32>,
+    /// Qwen3 applies an RMS norm independently to every projected Q head.
+    pub attn_q_norm: Option<CudaSlice<f32>>,
+    /// Qwen3 applies an RMS norm independently to every projected K head.
+    pub attn_k_norm: Option<CudaSlice<f32>>,
     pub wq: GpuMat,
     pub bq: Option<CudaSlice<f32>>,
     pub wk: GpuMat,
@@ -38,13 +46,19 @@ pub struct GpuLayer {
 }
 
 pub struct Kernels {
+    pub quantize_q8: CudaFunction,
     pub gemv_q4: CudaFunction,
+    pub gemv_q4_global: CudaFunction,
     pub gemv_q5: CudaFunction,
     pub gemv_q6: CudaFunction,
+    pub gemv_q6_repack: CudaFunction,
+    pub gemv_q6_repack_global: CudaFunction,
     pub gemv_q8: CudaFunction,
     pub gemv_q4_splitk: CudaFunction,
     pub gemv_q5_splitk: CudaFunction,
     pub gemv_q6_splitk: CudaFunction,
+    pub gemv_q6_repack_splitk: CudaFunction,
+    pub gemv_q6_repack_global_splitk: CudaFunction,
     pub gemv_q8_splitk: CudaFunction,
     pub gemv_splitk_reduce: CudaFunction,
     /// Fused dual single-token GEMV for Q5_0 (Q+K or gate+up; stage x once).
@@ -53,6 +67,7 @@ pub struct Kernels {
     pub gemv_q5_qkv: CudaFunction,
     /// Fused dual single-token GEMV for Q4_K (gate+up / Q+K on larger Q4_K_M).
     pub gemv_q4_pair: CudaFunction,
+    pub gemv_q4_qkv: CudaFunction,
     pub gemm_q4: CudaFunction,
     pub gemm_q5: CudaFunction,
     pub gemm_q6: CudaFunction,
@@ -75,6 +90,8 @@ pub struct Kernels {
     pub add_bias: CudaFunction,
     pub rope: CudaFunction,
     pub rope_d: CudaFunction,
+    pub qk_norm_rope: CudaFunction,
+    pub qk_norm_rope_d: CudaFunction,
     /// Attention symbols from [`crate::cuda::decode::REGISTRY`] (CUDA name → fn).
     pub attn: HashMap<&'static str, CudaFunction>,
     pub copy_kv: CudaFunction,

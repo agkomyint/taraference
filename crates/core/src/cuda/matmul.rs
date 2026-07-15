@@ -7,7 +7,7 @@ use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
 /// Must match `GEMV_WARPS` in gemv.cu.
-const GEMV_WARPS: u32 = 8;
+const GEMV_WARPS: u32 = 32;
 const GEMV_THREADS: u32 = GEMV_WARPS * 32;
 /// Must match `GEMV_SPLIT_MAX` in gemv.cu / load.rs.
 pub(crate) const GEMV_SPLIT_MAX: u32 = 8;
@@ -23,6 +23,39 @@ pub(crate) fn lc_gemv(n_cols: u32, n_rows: u32) -> LaunchConfig {
         block_dim: (GEMV_THREADS, 1, 1),
         shared_mem_bytes: n_rows * 4,
     }
+}
+
+fn lc_gemv_quantized(n_cols: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((n_cols + GEMV_WARPS - 1) / GEMV_WARPS, 1, 1),
+        block_dim: (GEMV_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn quantize_q8(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    x: &CudaSlice<f32>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
+    n_rows: i32,
+) -> Result<()> {
+    let groups = (n_rows as u32 + 31) / 32;
+    unsafe {
+        stream
+            .launch_builder(&k.quantize_q8)
+            .arg(x)
+            .arg(q8_x)
+            .arg(q8_d)
+            .arg(&n_rows)
+            .launch(LaunchConfig {
+                grid_dim: ((groups + 7) / 8, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(())
 }
 
 fn lc_gemv_splitk(n_cols: u32, n_split: u32, rows_per_split: u32) -> LaunchConfig {
@@ -47,8 +80,7 @@ pub(crate) fn gemv_n_split(n_rows: usize) -> u32 {
     if n_rows < GEMV_SPLITK_MIN_ROWS && smem <= GEMV_BASELINE_SMEM_CAP {
         return 1;
     }
-    // Tall FFN down (e.g. n_rows=11008): 4-way split cuts smem ~4× and multiplies blocks.
-    // (Avoid 8-way: extra reduce traffic can erase the win on laptop GPUs.)
+    // Four-way split balances tall-matrix occupancy with reduction traffic on T4/consumer GPUs.
     4u32.min(GEMV_SPLIT_MAX)
 }
 
@@ -86,6 +118,104 @@ pub(crate) fn gemv(
     gemv_splitk(stream, k, w, x, y, bias, residual, partial, n_split)
 }
 
+/// Single-token GEMV that quantizes `x` once globally instead of once per
+/// output block. Used for wide decode heads where redundant quantization is costly.
+pub(crate) fn try_gemv_global_q8(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    w: &GpuMat,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    bias: Option<&CudaSlice<f32>>,
+    residual: GemvResidual<'_>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
+    partial: &mut CudaSlice<f32>,
+    partial_stride: usize,
+) -> Result<bool> {
+    let n_split = gemv_n_split(w.n_rows);
+    let (f, data, col_bytes) = match w.wtype {
+        WType::Q4K => (&k.gemv_q4_global, &w.data, w.col_bytes),
+        WType::Q6K if w.decode_data.is_some() => (
+            &k.gemv_q6_repack_global,
+            w.decode_data.as_ref().unwrap(),
+            w.decode_col_bytes,
+        ),
+        _ => return Ok(false),
+    };
+    let n_rows = w.n_rows as i32;
+    let n_cols = w.n_cols as i32;
+    let col_bytes = col_bytes as i32;
+    let use_bias = if bias.is_some() { 1i32 } else { 0i32 };
+    let use_res = match residual {
+        GemvResidual::None => 0i32,
+        GemvResidual::Add(_) => 1i32,
+        GemvResidual::InPlace => 2i32,
+    };
+    let bias_ptr = bias.unwrap_or(x);
+    let residual_ptr = match residual {
+        GemvResidual::Add(r) => r,
+        _ => x,
+    };
+    quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+    if n_split > 1 {
+        if w.wtype != WType::Q6K || w.decode_data.is_none() || w.n_cols > partial_stride {
+            return Ok(false);
+        }
+        let n_split_i = n_split as i32;
+        unsafe {
+            stream
+                .launch_builder(&k.gemv_q6_repack_global_splitk)
+                .arg(w.decode_data.as_ref().unwrap())
+                .arg(q8_x)
+                .arg(q8_d)
+                .arg(&mut *partial)
+                .arg(&n_rows)
+                .arg(&n_cols)
+                .arg(&col_bytes)
+                .arg(&n_split_i)
+                .launch(LaunchConfig {
+                    grid_dim: ((w.n_cols as u32 + GEMV_WARPS - 1) / GEMV_WARPS, n_split, 1),
+                    block_dim: (GEMV_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            stream
+                .launch_builder(&k.gemv_splitk_reduce)
+                .arg(&*partial)
+                .arg(y)
+                .arg(&n_cols)
+                .arg(&n_split_i)
+                .arg(&use_bias)
+                .arg(bias_ptr)
+                .arg(&use_res)
+                .arg(residual_ptr)
+                .launch(LaunchConfig {
+                    grid_dim: ((w.n_cols as u32 + 255) / 256, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        return Ok(true);
+    }
+    unsafe {
+        stream
+            .launch_builder(f)
+            .arg(data)
+            .arg(q8_x)
+            .arg(q8_d)
+            .arg(y)
+            .arg(&n_rows)
+            .arg(&n_cols)
+            .arg(&col_bytes)
+            .arg(&use_bias)
+            .arg(bias_ptr)
+            .arg(&use_res)
+            .arg(residual_ptr)
+            .launch(lc_gemv_quantized(w.n_cols as u32))?;
+    }
+    Ok(true)
+}
+
 fn gemv_baseline(
     stream: &Arc<CudaStream>,
     k: &Kernels,
@@ -97,7 +227,12 @@ fn gemv_baseline(
 ) -> Result<()> {
     let n_rows = w.n_rows as i32;
     let n_cols = w.n_cols as i32;
-    let col_bytes = w.col_bytes as i32;
+    let use_q6_repack = w.wtype == WType::Q6K && w.decode_data.is_some();
+    let col_bytes = if use_q6_repack {
+        w.decode_col_bytes as i32
+    } else {
+        w.col_bytes as i32
+    };
     let use_bias: i32 = if bias.is_some() { 1 } else { 0 };
     let use_res: i32 = match residual {
         GemvResidual::None => 0,
@@ -108,12 +243,14 @@ fn gemv_baseline(
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4,
         WType::Q5_0 => &k.gemv_q5,
+        WType::Q6K if use_q6_repack => &k.gemv_q6_repack,
         WType::Q6K => &k.gemv_q6,
         WType::Q8_0 => &k.gemv_q8,
     };
     unsafe {
         let mut lb = stream.launch_builder(f);
-        lb.arg(&w.data)
+        let data = w.decode_data.as_ref().unwrap_or(&w.data);
+        lb.arg(data)
             .arg(x)
             .arg(y)
             .arg(&n_rows)
@@ -148,7 +285,12 @@ fn gemv_splitk(
 ) -> Result<()> {
     let n_rows = w.n_rows as i32;
     let n_cols = w.n_cols as i32;
-    let col_bytes = w.col_bytes as i32;
+    let use_q6_repack = w.wtype == WType::Q6K && w.decode_data.is_some();
+    let col_bytes = if use_q6_repack {
+        w.decode_col_bytes as i32
+    } else {
+        w.col_bytes as i32
+    };
     let n_split_i = n_split as i32;
     let use_bias: i32 = if bias.is_some() { 1 } else { 0 };
     let use_res: i32 = match residual {
@@ -172,14 +314,16 @@ fn gemv_splitk(
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4_splitk,
         WType::Q5_0 => &k.gemv_q5_splitk,
+        WType::Q6K if use_q6_repack => &k.gemv_q6_repack_splitk,
         WType::Q6K => &k.gemv_q6_splitk,
         WType::Q8_0 => &k.gemv_q8_splitk,
     };
 
     unsafe {
+        let data = w.decode_data.as_ref().unwrap_or(&w.data);
         stream
             .launch_builder(f)
-            .arg(&w.data)
+            .arg(data)
             .arg(x)
             .arg(&mut *partial)
             .arg(&n_rows)
@@ -225,11 +369,13 @@ pub(crate) fn try_gemv_pair(
     out_b: &mut CudaSlice<f32>,
     ba: Option<&CudaSlice<f32>>,
     bb: Option<&CudaSlice<f32>>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
 ) -> Result<bool> {
     if try_gemv_q5_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb)? {
         return Ok(true);
     }
-    try_gemv_q4_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb)
+    try_gemv_q4_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb, q8_x, q8_d)
 }
 
 fn try_gemv_q4_pair(
@@ -242,6 +388,8 @@ fn try_gemv_q4_pair(
     out_b: &mut CudaSlice<f32>,
     ba: Option<&CudaSlice<f32>>,
     bb: Option<&CudaSlice<f32>>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
 ) -> Result<bool> {
     if wa.wtype != WType::Q4K
         || wb.wtype != WType::Q4K
@@ -263,12 +411,14 @@ fn try_gemv_q4_pair(
     let ba_p: &CudaSlice<f32> = ba.unwrap_or(x);
     let bb_p: &CudaSlice<f32> = bb.unwrap_or(x);
     let n_tot = (wa.n_cols + wb.n_cols) as u32;
+    quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
     unsafe {
         stream
             .launch_builder(&k.gemv_q4_pair)
             .arg(&wa.data)
             .arg(&wb.data)
-            .arg(x)
+            .arg(q8_x)
+            .arg(q8_d)
             .arg(out_a)
             .arg(out_b)
             .arg(&n_rows)
@@ -278,7 +428,7 @@ fn try_gemv_q4_pair(
             .arg(&use_bias)
             .arg(ba_p)
             .arg(bb_p)
-            .launch(lc_gemv(n_tot, wa.n_rows as u32))?;
+            .launch(lc_gemv_quantized(n_tot))?;
     }
     Ok(true)
 }
@@ -337,8 +487,8 @@ fn try_gemv_q5_pair(
     Ok(true)
 }
 
-/// Decode Q+K+V in one GEMV when all three are Q5_0 (stage `x` once).
-pub(crate) fn try_gemv_q5_qkv(
+/// Decode Q+K+V in one GEMV for Q4_K or Q5_0 (stage `x` once).
+pub(crate) fn try_gemv_qkv(
     stream: &Arc<CudaStream>,
     k: &Kernels,
     wq: &GpuMat,
@@ -351,7 +501,56 @@ pub(crate) fn try_gemv_q5_qkv(
     bq: Option<&CudaSlice<f32>>,
     bk: Option<&CudaSlice<f32>>,
     bv: Option<&CudaSlice<f32>>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
 ) -> Result<bool> {
+    let same_shape = wq.n_rows == wk.n_rows
+        && wq.n_rows == wv.n_rows
+        && wq.col_bytes == wk.col_bytes
+        && wq.col_bytes == wv.col_bytes;
+    let all_bias = bq.is_some() && bk.is_some() && bv.is_some();
+    let no_bias = bq.is_none() && bk.is_none() && bv.is_none();
+    if wq.wtype == WType::Q4K
+        && wk.wtype == WType::Q4K
+        && wv.wtype == WType::Q4K
+        && same_shape
+        && (all_bias || no_bias)
+    {
+        let n_rows = wq.n_rows as i32;
+        let n_q = wq.n_cols as i32;
+        let n_k = wk.n_cols as i32;
+        let n_v = wv.n_cols as i32;
+        let col_bytes = wq.col_bytes as i32;
+        let use_bias = if all_bias { 1i32 } else { 0i32 };
+        let bq_p = bq.unwrap_or(x);
+        let bk_p = bk.unwrap_or(x);
+        let bv_p = bv.unwrap_or(x);
+        let n_tot = (wq.n_cols + wk.n_cols + wv.n_cols) as u32;
+        quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+        unsafe {
+            stream
+                .launch_builder(&k.gemv_q4_qkv)
+                .arg(&wq.data)
+                .arg(&wk.data)
+                .arg(&wv.data)
+                .arg(q8_x)
+                .arg(q8_d)
+                .arg(q)
+                .arg(k_out)
+                .arg(v_out)
+                .arg(&n_rows)
+                .arg(&n_q)
+                .arg(&n_k)
+                .arg(&n_v)
+                .arg(&col_bytes)
+                .arg(&use_bias)
+                .arg(bq_p)
+                .arg(bk_p)
+                .arg(bv_p)
+                .launch(lc_gemv_quantized(n_tot))?;
+        }
+        return Ok(true);
+    }
     if wq.wtype != WType::Q5_0
         || wk.wtype != WType::Q5_0
         || wv.wtype != WType::Q5_0
@@ -362,8 +561,6 @@ pub(crate) fn try_gemv_q5_qkv(
     {
         return Ok(false);
     }
-    let all_bias = bq.is_some() && bk.is_some() && bv.is_some();
-    let no_bias = bq.is_none() && bk.is_none() && bv.is_none();
     if !all_bias && !no_bias {
         return Ok(false);
     }

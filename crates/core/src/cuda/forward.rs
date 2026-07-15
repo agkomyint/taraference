@@ -166,7 +166,8 @@ impl CudaModel {
         Ok(())
     }
 
-    /// Multi-token forward returning greedy argmax at each position (PLD verify).
+    /// Multi-token forward returning greedy argmax at each position.
+    /// Retained as the verification primitive for a future model-based speculator.
     pub fn forward_greedy_all(
         &mut self,
         tokens: &[u32],
@@ -230,9 +231,9 @@ impl CudaModel {
                     shared_mem_bytes: 0,
                 })?;
         }
-        use super::matmul::{gemv, GemvResidual};
+        use super::matmul::{gemv, try_gemv_global_q8, GemvResidual};
         if let Some(ref ow) = self.output {
-            gemv(
+            if !try_gemv_global_q8(
                 &self.stream,
                 &self.k,
                 ow,
@@ -240,11 +241,18 @@ impl CudaModel {
                 &mut self.logits,
                 None,
                 GemvResidual::None,
+                &mut self.q8_x,
+                &mut self.q8_d,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
-            )?;
+            )? {
+                gemv(
+                    &self.stream, &self.k, ow, &self.xb1, &mut self.logits, None,
+                    GemvResidual::None, &mut self.gemv_partial, self.gemv_partial_stride,
+                )?;
+            }
         } else {
-            gemv(
+            if !try_gemv_global_q8(
                 &self.stream,
                 &self.k,
                 &self.token_embd,
@@ -252,9 +260,17 @@ impl CudaModel {
                 &mut self.logits,
                 None,
                 GemvResidual::None,
+                &mut self.q8_x,
+                &mut self.q8_d,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
-            )?;
+            )? {
+                gemv(
+                    &self.stream, &self.k, &self.token_embd, &self.xb1,
+                    &mut self.logits, None, GemvResidual::None,
+                    &mut self.gemv_partial, self.gemv_partial_stride,
+                )?;
+            }
         }
         let n_vocab = self.cfg.n_vocab as i32;
         unsafe {

@@ -14,8 +14,12 @@ pub struct Tokenizer {
     pub tokens: Vec<String>,
     token_to_id: HashMap<String, u32>,
     merges: HashMap<(String, String), u32>,
+    scores: Vec<f32>,
+    sentencepiece: bool,
+    max_piece_bytes: usize,
     pub bos_id: u32,
     pub eos_id: u32,
+    pub unk_id: u32,
     pub add_bos: bool,
 }
 
@@ -38,7 +42,7 @@ impl Tokenizer {
             token_to_id.entry(t.clone()).or_insert(i as u32);
         }
 
-        let merges = match gguf.metadata.get("tokenizer.ggml.merges") {
+        let (merges, sentencepiece) = match gguf.metadata.get("tokenizer.ggml.merges") {
             Some(Value::Array { items, .. }) => {
                 let mut m = HashMap::with_capacity(items.len());
                 for (rank, v) in items.iter().enumerate() {
@@ -48,10 +52,20 @@ impl Tokenizer {
                         .ok_or_else(|| anyhow!("bad merge: {s}"))?;
                     m.insert((a.to_string(), b.to_string()), rank as u32);
                 }
-                m
+                (m, false)
             }
-            _ => bail!("missing tokenizer.ggml.merges"),
+            // Llama/SentencePiece GGUFs store vocabulary scores instead of an
+            // explicit GPT-2 merge table.
+            _ => (HashMap::new(), true),
         };
+        let scores = match gguf.metadata.get("tokenizer.ggml.scores") {
+            Some(Value::Array { items, .. }) => items
+                .iter()
+                .map(|v| v.as_f32().unwrap_or(-100.0))
+                .collect(),
+            _ => vec![0.0; tokens.len()],
+        };
+        let max_piece_bytes = tokens.iter().map(|t| t.len()).max().unwrap_or(1);
 
         let bos_id = gguf
             .meta_u32("tokenizer.ggml.bos_token_id")
@@ -60,6 +74,10 @@ impl Tokenizer {
         let eos_id = gguf
             .meta_u32("tokenizer.ggml.eos_token_id")
             .or_else(|| gguf.meta_u64("tokenizer.ggml.eos_token_id").map(|v| v as u32))
+            .unwrap_or(0);
+        let unk_id = gguf
+            .meta_u32("tokenizer.ggml.unknown_token_id")
+            .or_else(|| gguf.meta_u64("tokenizer.ggml.unknown_token_id").map(|v| v as u32))
             .unwrap_or(0);
         let add_bos = gguf
             .metadata
@@ -71,8 +89,12 @@ impl Tokenizer {
             tokens,
             token_to_id,
             merges,
+            scores,
+            sentencepiece,
+            max_piece_bytes,
             bos_id,
             eos_id,
+            unk_id,
             add_bos,
         })
     }
@@ -81,6 +103,10 @@ impl Tokenizer {
         let mut ids = Vec::new();
         if add_special && self.add_bos {
             ids.push(self.bos_id);
+        }
+        if self.sentencepiece {
+            ids.extend(self.sentencepiece_encode(text));
+            return ids;
         }
         for piece in split_special(text, &self.token_to_id) {
             if piece.starts_with("<|") && piece.ends_with("|>") {
@@ -98,7 +124,12 @@ impl Tokenizer {
         let mut s = String::new();
         for &id in ids {
             if let Some(t) = self.tokens.get(id as usize) {
-                if t.starts_with("<|") && t.ends_with("|>") {
+                if self.sentencepiece {
+                    if t.starts_with('<') && t.ends_with('>') {
+                        continue;
+                    }
+                    s.push_str(&t.replace('▁', " "));
+                } else if t.starts_with("<|") && t.ends_with("|>") {
                     s.push_str(t);
                 } else {
                     s.push_str(&bpe_chars_to_text(t));
@@ -106,6 +137,57 @@ impl Tokenizer {
             }
         }
         s
+    }
+
+    /// SentencePiece unigram Viterbi segmentation used by Llama-family GGUFs.
+    fn sentencepiece_encode(&self, text: &str) -> Vec<u32> {
+        let normalized = format!("▁{}", text.replace(' ', "▁"));
+        let n = normalized.len();
+        let mut best = vec![f32::NEG_INFINITY; n + 1];
+        let mut prev: Vec<Option<(usize, u32)>> = vec![None; n + 1];
+        best[0] = 0.0;
+
+        for start in 0..n {
+            if !normalized.is_char_boundary(start) || !best[start].is_finite() {
+                continue;
+            }
+            let limit = (start + self.max_piece_bytes).min(n);
+            for end in (start + 1)..=limit {
+                if !normalized.is_char_boundary(end) {
+                    continue;
+                }
+                if let Some(&id) = self.token_to_id.get(&normalized[start..end]) {
+                    let score = *self.scores.get(id as usize).unwrap_or(&0.0);
+                    let candidate = best[start] + score;
+                    if candidate > best[end] {
+                        best[end] = candidate;
+                        prev[end] = Some((start, id));
+                    }
+                }
+            }
+            // Ensure progress for unusual bytes not represented as pieces.
+            let next = normalized[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| start + i)
+                .unwrap_or(n);
+            if best[start] - 100.0 > best[next] {
+                best[next] = best[start] - 100.0;
+                prev[next] = Some((start, self.unk_id));
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut at = n;
+        while at > 0 {
+            let Some((p, id)) = prev[at] else {
+                return vec![self.unk_id];
+            };
+            out.push(id);
+            at = p;
+        }
+        out.reverse();
+        out
     }
 
     fn bpe_encode(&self, text: &str) -> Vec<u32> {

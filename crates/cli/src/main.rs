@@ -68,19 +68,12 @@ struct Cli {
     ctx: usize,
     #[arg(long)]
     prompt: Option<String>,
-    /// Attention / decode backend (see registry). Default = marked `is_default` (fastv2).
-    /// Use `flash` for long-context flash-decoding (split KV).
+    /// Attention backend override. Default = flash (best cross-GPU decode path).
     #[arg(long, default_value_t = DecodeBackend::default(), value_parser = parse_decode)]
     decode: DecodeBackend,
-    /// Capture CUDA graph for single-token decode after warm-up (default: on).
-    #[arg(long, default_value_t = true)]
-    cuda_graph: bool,
     /// Disable CUDA graph capture / replay.
     #[arg(long, default_value_t = false)]
     no_cuda_graph: bool,
-    /// Prompt Lookup Decoding (n-gram speculative; full-draft verify only).
-    #[arg(long, default_value_t = false)]
-    pld: bool,
     /// Benchmark: multi-turn chat + CPU/GPU sampling + rich report.
     #[arg(long, default_value_t = false)]
     profile: bool,
@@ -165,24 +158,25 @@ fn main() -> Result<()> {
         return run_serve(&cli, &model, port);
     }
 
-    let cuda_graph = cli.cuda_graph && !cli.no_cuda_graph;
+    let cuda_graph = !cli.no_cuda_graph;
     let mut engine = InferenceEngine::load_with_flags(
         &model,
         cli.decode,
         cli.ctx,
         cli.max_new,
         cuda_graph,
-        cli.pld,
     )?;
 
     if cli.profile {
         run_profile(&mut engine, &cli, &model)?;
     } else {
-        let mut opts = SessionOptions::interactive(cli.max_new);
-        opts.pld = cli.pld;
+        let opts = SessionOptions::interactive(cli.max_new);
         let mut session = engine.session(opts);
         if let Some(p) = cli.prompt {
-            session.turn(&p)?;
+            // Explicit --prompt is a raw completion prompt. Interactive input
+            // remains chat-templated; raw mode is also the reproducible path
+            // for base-model speed/quality showcases.
+            session.complete_prompt(&p)?;
         } else {
             session.run_repl()?;
         }
@@ -210,21 +204,19 @@ fn run_serve(cli: &Cli, model: &PathBuf, port: u16) -> Result<()> {
         "starting serve mode"
     );
 
-    let cuda_graph = cli.cuda_graph && !cli.no_cuda_graph;
+    let cuda_graph = !cli.no_cuda_graph;
     let engine = InferenceEngine::load_with_flags(
         model,
         cli.decode,
         cli.ctx,
         cli.max_new,
         cuda_graph,
-        cli.pld,
     )?;
     tracing::info!(
         model_id = %engine.model_id,
         weight_gib = format!("{:.2}", engine.weight_gib),
         max_seq = engine.max_seq,
         cuda_graph,
-        pld = cli.pld,
         "model loaded"
     );
 
@@ -279,8 +271,7 @@ fn run_profile(engine: &mut InferenceEngine, cli: &Cli, model: &PathBuf) -> Resu
         eprintln!("  turn {}: {u:?}", i + 1);
     }
 
-    let mut opts = SessionOptions::interactive(max_new);
-    opts.pld = engine.pld;
+    let opts = SessionOptions::interactive(max_new);
     let mut session = engine.session(opts);
     let mut prof = Profiler::start(100);
     let mut rows = Vec::with_capacity(script.len());

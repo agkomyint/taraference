@@ -11,6 +11,9 @@ pub struct ModelConfig {
     pub n_layer: usize,
     pub n_head: usize,
     pub n_head_kv: usize,
+    pub attention_head_dim: usize,
+    /// SmolLM3 omits RoPE on every fourth layer; zero means all layers use RoPE.
+    pub no_rope_layer_interval: usize,
     pub n_ff: usize,
     pub n_ctx: usize,
     pub rope_theta: f32,
@@ -36,6 +39,20 @@ impl ModelConfig {
             .meta_u32(&p("attention.head_count_kv"))
             .or_else(|| gguf.meta_u64(&p("attention.head_count_kv")).map(|v| v as u32))
             .unwrap_or(n_head as u32) as usize;
+        let attention_head_dim = gguf
+            .meta_u32(&p("attention.key_length"))
+            .or_else(|| gguf.meta_u64(&p("attention.key_length")).map(|v| v as u32))
+            .unwrap_or((n_embd / n_head) as u32) as usize;
+        let value_head_dim = gguf
+            .meta_u32(&p("attention.value_length"))
+            .or_else(|| gguf.meta_u64(&p("attention.value_length")).map(|v| v as u32))
+            .unwrap_or(attention_head_dim as u32) as usize;
+        if value_head_dim != attention_head_dim {
+            anyhow::bail!(
+                "different attention key/value lengths are unsupported: key={attention_head_dim}, value={value_head_dim}"
+            );
+        }
+        let no_rope_layer_interval = if architecture == "smollm3" { 4 } else { 0 };
         let n_ff = u(p("feed_forward_length"))? as usize;
         let n_ctx = gguf
             .meta_u32(&p("context_length"))
@@ -61,6 +78,8 @@ impl ModelConfig {
             n_layer,
             n_head,
             n_head_kv,
+            attention_head_dim,
+            no_rope_layer_interval,
             n_ff,
             n_ctx,
             rope_theta,
@@ -69,6 +88,6 @@ impl ModelConfig {
     }
 
     pub fn head_dim(&self) -> usize {
-        self.n_embd / self.n_head
+        self.attention_head_dim
     }
 }

@@ -5,7 +5,7 @@
 // Decode (n_q==1): grid (n_head, n_split) computes online-softmax partials
 // over disjoint KV ranges, then a reduce merges (m, l, O). Better SM fill when
 // n_head is small and seq_len is long (reduces first→last tok/s drop).
-// Prefill: host falls back to fastv2 via OnlineDecode-style or Causal prefill.
+// Prefill: host falls back to the tiled fastv2 causal kernel.
 
 #define ATTN_TILE 64
 #define FLASH_MAX_SPLIT 8
