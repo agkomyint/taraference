@@ -2,15 +2,16 @@
 
 ## Prebuilt binary (fastest)
 
+**Preferred path for remote GPUs** — full docs in the root [README](../README.md#fast-install-recommended--prebuilt-linux-binary).
+
 Linux x86_64 only — downloads the latest [GitHub Release](https://github.com/agkomyint/taraference/releases):
 
 ```bash
 ./scripts/get-binary.sh              # → ./taraference
-./scripts/get-binary.sh v0.1.0       # pin a tag
+./scripts/get-binary.sh v0.1.2       # pin a tag
 ```
 
 Then: `./taraference --download 0.5b` and run. Needs GPU + CUDA 13.x NVRTC (no Rust).
-
 ## Build from source
 
 **One command** after clone (no flags required):
