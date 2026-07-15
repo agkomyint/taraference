@@ -14,7 +14,7 @@ pub enum StopReason {
     Empty,
 }
 
-/// Timing / token counts from one `turn`.
+/// Timing / token counts from one generation.
 #[derive(Debug, Clone)]
 pub struct TurnStats {
     pub reply: String,
@@ -24,7 +24,7 @@ pub struct TurnStats {
     pub decode_ms: f64,
     pub decode_tps: f64,
     pub prefill_tps: f64,
-    /// Time from start of turn until first assistant token is ready (tokenize + prefill).
+    /// Time from start until first assistant token is ready (tokenize + prefill).
     pub ttft_ms: f64,
     pub tokenize_ms: f64,
     pub ctx_before: usize,
@@ -37,31 +37,79 @@ pub struct TurnStats {
     pub first: bool,
 }
 
+/// Session behaviour (CLI streams tokens; server stays quiet).
+#[derive(Debug, Clone)]
+pub struct SessionOptions {
+    pub max_new: usize,
+    pub system: String,
+    /// Print tokens to stdout as they are generated.
+    pub print_stream: bool,
+    /// Print the `[n tok | …]` line after a turn.
+    pub print_stats: bool,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            max_new: 512,
+            system: "You are a helpful assistant.".into(),
+            print_stream: true,
+            print_stats: true,
+        }
+    }
+}
+
+impl SessionOptions {
+    pub fn quiet(max_new: usize) -> Self {
+        Self {
+            max_new,
+            print_stream: false,
+            print_stats: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn interactive(max_new: usize) -> Self {
+        Self {
+            max_new,
+            print_stream: true,
+            print_stats: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Generation session over a borrowed model + KV.
 pub struct Session<'a> {
     model: &'a mut CudaModel,
     tok: &'a Tokenizer,
-    cache: CudaKv,
+    cache: &'a mut CudaKv,
     pub max_new: usize,
     system: String,
+    print_stream: bool,
+    print_stats: bool,
     primed: bool,
 }
 
 impl<'a> Session<'a> {
-    pub fn new(
+    /// Bind to an existing KV arena (engine owns allocation).
+    pub fn with_kv(
         model: &'a mut CudaModel,
         tok: &'a Tokenizer,
-        max_seq: usize,
-        max_new: usize,
-    ) -> Result<Self> {
-        let cache = model.alloc_kv(max_seq)?;
-        Ok(Self {
+        cache: &'a mut CudaKv,
+        opts: SessionOptions,
+    ) -> Self {
+        let primed = cache.len > 0;
+        Self {
             model,
             tok,
             cache,
-            max_new,
-            system: "You are a helpful assistant.".into(),
-            primed: false,
-        })
+            max_new: opts.max_new,
+            system: opts.system,
+            print_stream: opts.print_stream,
+            print_stats: opts.print_stats,
+            primed,
+        }
     }
 
     pub fn max_seq(&self) -> usize {
@@ -70,6 +118,11 @@ impl<'a> Session<'a> {
 
     pub fn ctx_len(&self) -> usize {
         self.cache.len
+    }
+
+    pub fn reset(&mut self) {
+        self.cache.clear();
+        self.primed = false;
     }
 
     fn build_user_prompt(&self, user: &str, first: bool) -> String {
@@ -86,30 +139,56 @@ impl<'a> Session<'a> {
         s
     }
 
+    /// Incremental multi-turn user message (CLI chat).
     pub fn turn(&mut self, user: &str) -> Result<TurnStats> {
-        let wall = Instant::now();
         let first = !self.primed;
+        let prompt = self.build_user_prompt(user, first);
+        self.primed = true;
+        self.generate_with(&prompt, first, |_| {})
+    }
+
+    /// One-shot: full ChatML (or other) prompt → assistant continuation.
+    /// Clears the KV cache first (stateless request).
+    pub fn complete_prompt(&mut self, prompt: &str) -> Result<TurnStats> {
+        self.complete_prompt_stream(prompt, |_| {})
+    }
+
+    /// Like [`Self::complete_prompt`], calling `on_token` for each decoded piece.
+    pub fn complete_prompt_stream<F>(&mut self, prompt: &str, on_token: F) -> Result<TurnStats>
+    where
+        F: FnMut(&str),
+    {
+        self.reset();
+        self.primed = true;
+        self.generate_with(prompt, true, on_token)
+    }
+
+    fn generate_with<F>(&mut self, prompt: &str, first: bool, mut on_token: F) -> Result<TurnStats>
+    where
+        F: FnMut(&str),
+    {
+        let wall = Instant::now();
         let ctx_before = self.cache.len;
 
         let t_tok = Instant::now();
-        let prompt = self.build_user_prompt(user, first);
-        let ids = self.tok.encode(&prompt, false);
+        let ids = self.tok.encode(prompt, false);
         let tokenize_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
         if ids.is_empty() {
             anyhow::bail!("tokenizer produced 0 tokens for prompt");
         }
         let prompt_tokens = ids.len();
-        self.primed = true;
 
         let t0 = Instant::now();
-        let mut next = self.model.forward_greedy(&ids, &mut self.cache)?;
+        let mut next = self.model.forward_greedy(&ids, self.cache)?;
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let ttft_ms = wall.elapsed().as_secs_f64() * 1000.0;
 
         let mut reply_ids = Vec::new();
         let mut reply = String::new();
-        print!("assistant: ");
-        let _ = io::stdout().flush();
+        if self.print_stream {
+            print!("assistant: ");
+            let _ = io::stdout().flush();
+        }
 
         let mut stop = StopReason::MaxNew;
         let t1 = Instant::now();
@@ -129,17 +208,21 @@ impl<'a> Session<'a> {
             }
             reply_ids.push(next);
             reply.push_str(&piece);
-            print!("{piece}");
-            let _ = io::stdout().flush();
-            next = self.model.forward_greedy(&[next], &mut self.cache)?;
+            if self.print_stream {
+                print!("{piece}");
+                let _ = io::stdout().flush();
+            }
+            on_token(&piece);
+            next = self.model.forward_greedy(&[next], self.cache)?;
             if step + 1 == self.max_new {
                 stop = StopReason::MaxNew;
             }
         }
 
+        // Keep multi-turn KV consistent with ChatML (append end marker).
         let end = self.tok.encode("<|im_end|>\n", false);
         if !end.is_empty() && self.cache.len + end.len() < self.cache.max_seq {
-            let _ = self.model.forward_greedy(&end, &mut self.cache);
+            let _ = self.model.forward_greedy(&end, self.cache);
         }
 
         let n = reply_ids.len();
@@ -160,11 +243,15 @@ impl<'a> Session<'a> {
             stop = StopReason::Empty;
         }
 
-        println!();
-        eprintln!(
-            "[{n} tok | prefill {prefill_ms:.0} ms | decode {decode_tps:.1} tok/s | ctx {} | stop={stop:?}]",
-            self.cache.len
-        );
+        if self.print_stream {
+            println!();
+        }
+        if self.print_stats {
+            eprintln!(
+                "[{n} tok | prefill {prefill_ms:.0} ms | decode {decode_tps:.1} tok/s | ctx {} | stop={stop:?}]",
+                self.cache.len
+            );
+        }
 
         Ok(TurnStats {
             reply,
@@ -205,8 +292,7 @@ impl<'a> Session<'a> {
                 break;
             }
             if line == "/reset" {
-                self.cache.clear();
-                self.primed = false;
+                self.reset();
                 println!("(reset)");
                 continue;
             }

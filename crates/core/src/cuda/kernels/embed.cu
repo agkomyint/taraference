@@ -130,3 +130,42 @@ extern "C" __global__ void embed_q8_0(
         for (int j = 0; j < 32; j++) dst[yo + j] = (float)qs[j] * d;
     }
 }
+
+extern "C" __global__ void embed_q5_0_one(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    int token,
+    int n_rows,
+    int col_bytes
+) {
+    const unsigned char* col = table + (size_t)token * (size_t)col_bytes;
+    int nb = n_rows / 32;
+    float dq[32];
+    for (int bi = (int)threadIdx.x; bi < nb; bi += (int)blockDim.x) {
+        dequant_q5_0_block(col + bi * 22, dq);
+        int yo = bi * 32;
+        for (int j = 0; j < 32; j++) out[yo + j] = dq[j];
+    }
+}
+
+extern "C" __global__ void embed_q5_0(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    const int* __restrict__ tokens,
+    int n_tok,
+    int n_rows,
+    int col_bytes
+) {
+    int t = (int)blockIdx.x;
+    if (t >= n_tok) return;
+    int token = tokens[t];
+    const unsigned char* col = table + (size_t)token * (size_t)col_bytes;
+    float* dst = out + (size_t)t * (size_t)n_rows;
+    int nb = n_rows / 32;
+    float dq[32];
+    for (int bi = (int)threadIdx.x; bi < nb; bi += (int)blockDim.x) {
+        dequant_q5_0_block(col + bi * 22, dq);
+        int yo = bi * 32;
+        for (int j = 0; j < 32; j++) dst[yo + j] = dq[j];
+    }
+}

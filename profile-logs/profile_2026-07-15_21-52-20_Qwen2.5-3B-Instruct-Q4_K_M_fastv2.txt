@@ -1,7 +1,7 @@
 
 ════════════════════════════════════════════════════════════════
   PROFILE REPORT  (multi-turn)
-  saved_at  2026-07-15_21-56-35
+  saved_at  2026-07-15_21-52-20
 ════════════════════════════════════════════════════════════════
   CONFIG
     model     models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
@@ -9,74 +9,74 @@
     weights   1.79 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
     decode    fastv2 — v2: f16 KV + tiled online attn (fixed smem) — recommended
     kv        f16 (half bandwidth vs f32)
-    sample    every 100 ms  |  19 samples over 24.95s wall (span 23659 ms)
+    sample    every 100 ms  |  16 samples over 21.92s wall (span 20620 ms)
 ────────────────────────────────────────────────────────────────
   PER-TURN
   turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
-     1   630ms  24.0t/s   632    25    26     0    53    eos    - hi, who are you?
-     2   445ms  20.6t/s   447    18    25    53    98    eos    - what can you help me with in one sen…
-     3   483ms  20.0t/s   484    19    64    98   183    eos    - ok give me 3 bullet ideas for a week…
-     4   370ms  17.1t/s   372    16   103   183   304    eos    - expand on the second idea a bit more
-     5   586ms  13.2t/s   588    17   128   304   451    max    Y summarize everything we talked about…
+     1   889ms  25.5t/s   894    25    26     0    53    eos    - hi, who are you?
+     2   425ms  22.3t/s   428    18    25    53    98    eos    - what can you help me with in one sen…
+     3   452ms  22.1t/s   456    19    64    98   183    eos    - ok give me 3 bullet ideas for a week…
+     4   353ms  19.1t/s   355    16   103   183   304    eos    - expand on the second idea a bit more
+     5   543ms  15.6t/s   545    17   128   304   451    max    Y summarize everything we talked about…
 ────────────────────────────────────────────────────────────────
   LATENCY
-    TTFT      avg 505 ms  min 372  max 632  (user→first token)
-    tokenize  total 9.0 ms  (1.81 ms/turn)
-    ms/token  prefill 26.5  decode 61.4
+    TTFT      avg 536 ms  min 355  max 894  (user→first token)
+    tokenize  total 16.4 ms  (3.29 ms/turn)
+    ms/token  prefill 28.0  decode 53.8
 ────────────────────────────────────────────────────────────────
   THROUGHPUT
-    prefill     2514 ms |    95 tok |   37.8 tok/s |  10.6% of turn-time
-    decode     21244 ms |   346 tok |   16.3 tok/s |  89.4% of turn-time
-    wall       23773 ms sum turns | wall-clock run 24.95s
-    decode   first-turn 24.0 t/s → last-turn 13.2 t/s  (drop 45%)
-    prefill  first 630 ms | later avg 471 ms
-    est weight BW  31.3 GB/s  (~16% of 192 GB/s ref)  [decode × model size]
+    prefill     2662 ms |    95 tok |   35.7 tok/s |  12.5% of turn-time
+    decode     18632 ms |   346 tok |   18.6 tok/s |  87.4% of turn-time
+    wall       21311 ms sum turns | wall-clock run 21.92s
+    decode   first-turn 25.5 t/s → last-turn 15.6 t/s  (drop 39%)
+    prefill  first 889 ms | later avg 443 ms
+    est weight BW  35.7 GB/s  (~19% of 192 GB/s ref)  [decode × model size]
 ────────────────────────────────────────────────────────────────
   CONTEXT / MEMORY
     ctx final 451 / 5000  (9.0% full)  avg growth/turn 100 tok
     VRAM   used avg 2123  min 2123  peak 2123 / 4096 MiB  (52% peak)
-    VRAM   free at peak ~1973 MiB  |  mem-controller util avg 22.0%
-    host RAM  ~12186 / 16048 MiB used (system snapshot)
+    VRAM   free at peak ~1973 MiB  |  mem-controller util avg 22.2%
+    host RAM  ~12637 / 16048 MiB used (system snapshot)
 ────────────────────────────────────────────────────────────────
   GENERATION QUALITY FLAGS
     stop: eos=4  hit_max_new=1  empty=0  / 5 turns
     ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
 ────────────────────────────────────────────────────────────────
   CPU
-    util   min   9.0%  avg  29.3%  max  46.0%
+    util   min  21.0%  avg  35.3%  max  49.0%
   GPU
-    compute  min  38.0%  avg  95.6%  max 100.0%
-    power    min  12.8 W  avg  32.4 W  max  47.7 W
-    temp     min    74 °C avg    86 °C max    87 °C
-    clocks   core avg 1037 MHz (max 1522)  mem avg 5501 MHz
-    efficiency  0.170 decode_tok/s per GPU%   (higher = more tokens for same util)
-    tok/J (rough)  0.50 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+    compute  min   0.0%  avg  93.0%  max 100.0%
+    power    min   6.4 W  avg  35.8 W  max  62.3 W
+    temp     min    70 °C avg    85 °C max    87 °C
+    clocks   core avg 1136 MHz (max 1687)  mem avg 5182 MHz
+    efficiency  0.200 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  0.52 decode tok per joule  [gen_tok / (avg_W × decode_s)]
 ────────────────────────────────────────────────────────────────
   READOUT / HINTS
     • VRAM headroom ~1973 MiB — not memory-capacity bound; speed ≠ fill VRAM.
     • GPU util high but est weight BW low vs peak → kernels busy but not streaming weights efficiently (or util metric saturated).
-    • Decode dropped 45% as ctx grew → attention/KV path dominates long chats.
+    • Decode dropped 39% as ctx grew → attention/KV path dominates long chats.
     • GPU hot (87°C) — possible thermal throttle; watch clocks.
     • Raise max_new (or profile cap) if answers look cut off.
     • High GPU util → optimize matmul/attention bandwidth next.
 ════════════════════════════════════════════════════════════════
   SUMMARY_KV
-    stamp=2026-07-15_21-56-35
+    stamp=2026-07-15_21-52-20
     model=Qwen2.5-3B-Instruct-Q4_K_M
     model_path=models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
     decode_backend=fastv2
     mode=multi-turn
-    overall_decode_tps=16.287
-    overall_prefill_tps=37.786
-    decode_tps_first=23.968
-    decode_tps_last=13.166
-    decode_drop_pct=45.07
-    total_prefill_ms=2514.15
-    total_decode_ms=21243.79
+    overall_decode_tps=18.570
+    overall_prefill_tps=35.691
+    decode_tps_first=25.460
+    decode_tps_last=15.618
+    decode_drop_pct=38.66
+    total_prefill_ms=2661.73
+    total_decode_ms=18631.79
     total_gen=346
     total_prompt=95
     final_ctx=451
-    wall_s=24.953
-    first_prefill_ms=629.54
-    later_prefill_avg_ms=471.15
+    wall_s=21.919
+    first_prefill_ms=888.50
+    later_prefill_avg_ms=443.31
 ════════════════════════════════════════════════════════════════

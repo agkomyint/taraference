@@ -493,9 +493,13 @@ impl Profiler {
         }
         line("════════════════════════════════════════════════════════════════".into());
 
+        let model_slug = model_slug(&meta.model_path);
+
         // Machine-readable SUMMARY block (easy to diff between runs).
         line("  SUMMARY_KV".into());
         line(format!("    stamp={stamp}"));
+        line(format!("    model={model_slug}"));
+        line(format!("    model_path={}", meta.model_path));
         line(format!("    decode_backend={}", meta.decode.name()));
         line(format!("    mode={mode}"));
         line(format!("    overall_decode_tps={overall_decode_tps:.3}"));
@@ -515,19 +519,51 @@ impl Profiler {
 
         print!("{report}");
 
-        let prev = read_latest_log_if_any();
-        let path = save_profile_log(&report, meta, &stamp);
+        // Compare only against the previous run of the *same* model.
+        let prev = read_latest_for_model(&model_slug);
+        let path = save_profile_log(&report, meta, &stamp, &model_slug);
         if let Some(ref p) = path {
             eprintln!("\nprofile log → {}", p.display());
+            // Global latest + per-model latest (fair A/B).
             let _ = fs::write(Path::new(PROFILE_LOG_DIR).join("latest.txt"), &report);
+            let _ = fs::write(
+                Path::new(PROFILE_LOG_DIR).join(format!("latest_{model_slug}.txt")),
+                &report,
+            );
             if let Some(prev_text) = prev {
-                print_compare(&prev_text, &report);
+                print_compare(&prev_text, &report, &model_slug);
             }
         } else {
             eprintln!("\nprofile log: failed to write under {PROFILE_LOG_DIR}/");
         }
 
         path.unwrap_or_else(|| PathBuf::from(PROFILE_LOG_DIR))
+    }
+}
+
+/// Short filesystem-safe name from a model path
+/// (`models/Qwen2.5-3B-Instruct-Q4_K_M.gguf` → `Qwen2.5-3B-Instruct-Q4_K_M`).
+fn model_slug(model_path: &str) -> String {
+    let name = Path::new(model_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "model".into()
+    } else {
+        // Keep filenames readable; trim very long stems.
+        if out.len() > 80 {
+            out.truncate(80);
+        }
+        out
     }
 }
 
@@ -558,9 +594,18 @@ fn local_timestamp() -> String {
     format!("unix_{secs}")
 }
 
-fn save_profile_log(report: &str, meta: &ProfileMeta, stamp: &str) -> Option<PathBuf> {
+fn save_profile_log(
+    report: &str,
+    meta: &ProfileMeta,
+    stamp: &str,
+    model_slug: &str,
+) -> Option<PathBuf> {
     fs::create_dir_all(PROFILE_LOG_DIR).ok()?;
-    let fname = format!("profile_{stamp}_{}.txt", meta.decode.name());
+    // profile_<stamp>_<model>_<decode>.txt
+    let fname = format!(
+        "profile_{stamp}_{model_slug}_{}.txt",
+        meta.decode.name()
+    );
     let path = Path::new(PROFILE_LOG_DIR).join(&fname);
     // Avoid clobber if two runs share the same second.
     let path = if path.exists() {
@@ -569,7 +614,7 @@ fn save_profile_log(report: &str, meta: &ProfileMeta, stamp: &str) -> Option<Pat
             .map(|d| d.as_secs())
             .unwrap_or(0);
         Path::new(PROFILE_LOG_DIR).join(format!(
-            "profile_{stamp}_{}_{}.txt",
+            "profile_{stamp}_{model_slug}_{}_{}.txt",
             meta.decode.name(),
             secs
         ))
@@ -578,21 +623,22 @@ fn save_profile_log(report: &str, meta: &ProfileMeta, stamp: &str) -> Option<Pat
     };
     let mut f = fs::File::create(&path).ok()?;
     f.write_all(report.as_bytes()).ok()?;
-    // One-line index for quick grepping.
+    // One-line index for quick grepping / filtering by model.
     let idx = Path::new(PROFILE_LOG_DIR).join("index.csv");
     let header_needed = !idx.exists();
     if let Ok(mut idxf) = fs::OpenOptions::new().create(true).append(true).open(&idx) {
         if header_needed {
             let _ = writeln!(
                 idxf,
-                "stamp,decode,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx"
+                "stamp,model,decode,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx"
             );
         }
         let (od, f1, fl, drop, ctx) = parse_summary_metrics(report);
         let _ = writeln!(
             idxf,
-            "{},{},{},{:.3},{:.3},{:.3},{:.2},{}",
+            "{},{},{},{},{:.3},{:.3},{:.3},{:.2},{}",
             stamp,
+            model_slug,
             meta.decode.name(),
             path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
             od,
@@ -605,8 +651,9 @@ fn save_profile_log(report: &str, meta: &ProfileMeta, stamp: &str) -> Option<Pat
     Some(path)
 }
 
-fn read_latest_log_if_any() -> Option<String> {
-    let p = Path::new(PROFILE_LOG_DIR).join("latest.txt");
+/// Previous run for this model only (`latest_<model>.txt`).
+fn read_latest_for_model(model_slug: &str) -> Option<String> {
+    let p = Path::new(PROFILE_LOG_DIR).join(format!("latest_{model_slug}.txt"));
     fs::read_to_string(p).ok()
 }
 
@@ -633,7 +680,7 @@ fn parse_summary_metrics(report: &str) -> (f64, f64, f64, f64, usize) {
     (od, f1, fl, drop, ctx)
 }
 
-fn print_compare(prev: &str, curr: &str) {
+fn print_compare(prev: &str, curr: &str, model_slug: &str) {
     let (pod, pf1, pfl, pdrop, pctx) = parse_summary_metrics(prev);
     let (cod, cf1, cfl, cdrop, cctx) = parse_summary_metrics(curr);
     if pod == 0.0 && pf1 == 0.0 {
@@ -649,7 +696,8 @@ fn print_compare(prev: &str, curr: &str) {
     };
     println!();
     println!("════════════════════════════════════════════════════════════════");
-    println!("  vs PREVIOUS profile-logs/latest.txt");
+    println!("  vs PREVIOUS same model  ({model_slug})");
+    println!("  (latest_{model_slug}.txt)");
     println!("────────────────────────────────────────────────────────────────");
     println!(
         "    overall decode  {pod:.1} → {cod:.1} t/s   ({:+.1}  {:+.0}%)",

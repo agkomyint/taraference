@@ -99,6 +99,27 @@ __device__ void dequant_q4_k_block_smem(
     }
 }
 
+// Q5_0: 32 vals / block, 22 bytes (fp16 d + 4B qh + 16B qs)
+__device__ __forceinline__ void dequant_q5_0_block(
+    const unsigned char* base, float* out32
+) {
+    float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+    unsigned int qh = (unsigned int)base[2]
+        | ((unsigned int)base[3] << 8)
+        | ((unsigned int)base[4] << 16)
+        | ((unsigned int)base[5] << 24);
+    const unsigned char* qs = base + 6;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        unsigned char xh0 = (unsigned char)(((qh >> j) << 4) & 0x10u);
+        unsigned char xh1 = (unsigned char)(((qh >> (j + 12)) ) & 0x10u);
+        int x0 = (int)((qs[j] & 0x0F) | xh0);
+        int x1 = (int)((qs[j] >> 4) | xh1);
+        out32[j] = (float)(x0 - 16) * d;
+        out32[j + 16] = (float)(x1 - 16) * d;
+    }
+}
+
 __device__ void dequant_q6_k_block_smem(
     const unsigned char* base, float* smem, int tid, int nthreads
 ) {

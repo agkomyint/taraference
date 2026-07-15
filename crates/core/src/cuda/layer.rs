@@ -1,11 +1,11 @@
 //! One transformer block + final logits head.
 
-use super::decode::DecodeBackend;
+use super::decode::{find_by_name, AttnLaunch, SmemRule};
 use super::kv::CudaKv;
-use super::matmul::{gemm, gemv};
+use super::matmul::{gemm, gemv, GemvResidual};
 use super::model::CudaModel;
 use anyhow::Result;
-use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 /// Dimensions for one forward chunk (prefill or decode).
 pub(crate) struct ChunkDims {
@@ -67,7 +67,7 @@ impl CudaModel {
                 &self.xb,
                 &mut self.q,
                 self.layers[li].bq.as_ref(),
-                None,
+                GemvResidual::None,
             )?;
             gemv(
                 &self.stream,
@@ -76,7 +76,7 @@ impl CudaModel {
                 &self.xb,
                 &mut self.k_buf,
                 self.layers[li].bk.as_ref(),
-                None,
+                GemvResidual::None,
             )?;
             gemv(
                 &self.stream,
@@ -85,7 +85,7 @@ impl CudaModel {
                 &self.xb,
                 &mut self.v_buf,
                 self.layers[li].bv.as_ref(),
-                None,
+                GemvResidual::None,
             )?;
         } else {
             gemm(
@@ -203,14 +203,15 @@ impl CudaModel {
         self.launch_attn(li, d, cache)?;
 
         if d.n_tok == 1 {
+            // Decode: x = x + Wo·attn  (fuse residual add into GEMV).
             gemv(
                 &self.stream,
                 &self.k,
                 &self.layers[li].wo,
                 &self.xb,
-                &mut self.xb2,
+                &mut self.x,
                 None,
-                None,
+                GemvResidual::InPlace,
             )?;
         } else {
             gemm(
@@ -221,15 +222,15 @@ impl CudaModel {
                 &mut self.xb2,
                 d.n_tok,
             )?;
-        }
-        let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.add)
-                .arg(&mut self.x)
-                .arg(&self.xb2)
-                .arg(&residual_n)
-                .launch(LaunchConfig::for_num_elems((d.n_embd_u * d.n_tok_u) as u32))?;
+            let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.add)
+                    .arg(&mut self.x)
+                    .arg(&self.xb2)
+                    .arg(&residual_n)
+                    .launch(LaunchConfig::for_num_elems((d.n_embd_u * d.n_tok_u) as u32))?;
+            }
         }
         Ok(())
     }
@@ -258,7 +259,7 @@ impl CudaModel {
                 &self.xb,
                 &mut self.hb,
                 None,
-                None,
+                GemvResidual::None,
             )?;
             gemv(
                 &self.stream,
@@ -267,7 +268,7 @@ impl CudaModel {
                 &self.xb,
                 &mut self.hb2,
                 None,
-                None,
+                GemvResidual::None,
             )?;
         } else {
             gemm(
@@ -297,14 +298,15 @@ impl CudaModel {
                 .launch(LaunchConfig::for_num_elems((d.n_ff_u * d.n_tok_u) as u32))?;
         }
         if d.n_tok == 1 {
+            // Decode: x = x + Wdown·(silu(gate)⊙up)  (fuse residual add into GEMV).
             gemv(
                 &self.stream,
                 &self.k,
                 &self.layers[li].down,
                 &self.hb,
-                &mut self.xb2,
+                &mut self.x,
                 None,
-                None,
+                GemvResidual::InPlace,
             )?;
         } else {
             gemm(
@@ -315,87 +317,101 @@ impl CudaModel {
                 &mut self.xb2,
                 d.n_tok,
             )?;
-        }
-        let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.add)
-                .arg(&mut self.x)
-                .arg(&self.xb2)
-                .arg(&residual_n)
-                .launch(LaunchConfig::for_num_elems((d.n_embd_u * d.n_tok_u) as u32))?;
+            let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.add)
+                    .arg(&mut self.x)
+                    .arg(&self.xb2)
+                    .arg(&residual_n)
+                    .launch(LaunchConfig::for_num_elems((d.n_embd_u * d.n_tok_u) as u32))?;
+            }
         }
         Ok(())
     }
 
-    /// Dispatch attention kernel based on [`DecodeBackend`].
+    /// Dispatch attention from [`DecodeBackend`] registry (no per-backend match arms).
     fn launch_attn(&mut self, li: usize, d: &ChunkDims, cache: &mut CudaKv) -> Result<()> {
+        self.launch_attn_spec(self.decode.spec(), li, d, cache)
+    }
+
+    fn launch_attn_spec(
+        &mut self,
+        spec: &super::decode::DecodeSpec,
+        li: usize,
+        d: &ChunkDims,
+        cache: &mut CudaKv,
+    ) -> Result<()> {
         let seq_len = d.pos0 + d.n_tok_u;
 
-        // Online path only for single-token decode; multi-token uses fast.
-        let use_online =
-            self.decode == DecodeBackend::Online && d.n_tok == 1 && d.head_dim <= 256;
-
-        if use_online {
-            let seq_len_i = seq_len as i32;
-            let smem = (d.head_dim * 2 * 4) as u32; // qh + red
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.attn_online)
-                    .arg(&self.q)
-                    .arg(&cache.k[li])
-                    .arg(&cache.v[li])
-                    .arg(&mut self.xb)
-                    .arg(&d.n_head)
-                    .arg(&d.n_kv)
-                    .arg(&d.hd)
-                    .arg(&seq_len_i)
-                    .arg(&d.scale)
-                    .launch(LaunchConfig {
-                        grid_dim: (d.n_head_u as u32, 1, 1),
-                        block_dim: (d.head_dim as u32, 1, 1),
-                        shared_mem_bytes: smem,
-                    })?;
-            }
-            return Ok(());
-        }
-
-        let f: &CudaFunction = match self.decode {
-            DecodeBackend::Basic => &self.k.attn_basic,
-            DecodeBackend::Fast | DecodeBackend::Online => &self.k.attn_fast,
-        };
-
-        // fast: Q[head_dim] + scores[ATTN_TILE=64] (fixed; does not grow with ctx)
-        // basic: scores[seq_len] baseline (A/B only)
-        const ATTN_TILE: usize = 64;
-        let smem = match self.decode {
-            DecodeBackend::Basic => (seq_len.max(1) * 4) as u32,
-            DecodeBackend::Fast | DecodeBackend::Online => {
-                ((d.head_dim + ATTN_TILE) * 4) as u32
-            }
-        };
-        let attn_threads = 128u32;
-
-        unsafe {
-            self.stream
-                .launch_builder(f)
-                .arg(&self.q)
-                .arg(&cache.k[li])
-                .arg(&cache.v[li])
-                .arg(&mut self.xb)
-                .arg(&d.n_head)
-                .arg(&d.n_kv)
-                .arg(&d.hd)
-                .arg(&d.pos0_i)
-                .arg(&d.n_tok)
-                .arg(&d.scale)
-                .launch(LaunchConfig {
-                    grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
-                    block_dim: (attn_threads, 1, 1),
-                    shared_mem_bytes: smem,
+        match spec.launch {
+            AttnLaunch::OnlineDecode {
+                kernel,
+                prefill_as,
+                max_head_dim,
+            } => {
+                // Decode path: single token + head_dim fits online kernel.
+                if d.n_tok == 1 && d.head_dim <= max_head_dim {
+                    let f = self.k.attn(kernel)?;
+                    let seq_len_i = seq_len as i32;
+                    let smem = SmemRule::HeadTimes2.bytes(d.head_dim, seq_len);
+                    unsafe {
+                        self.stream
+                            .launch_builder(f)
+                            .arg(&self.q)
+                            .arg(&cache.k[li])
+                            .arg(&cache.v[li])
+                            .arg(&mut self.xb)
+                            .arg(&d.n_head)
+                            .arg(&d.n_kv)
+                            .arg(&d.hd)
+                            .arg(&seq_len_i)
+                            .arg(&d.scale)
+                            .launch(LaunchConfig {
+                                grid_dim: (d.n_head_u as u32, 1, 1),
+                                block_dim: (d.head_dim as u32, 1, 1),
+                                shared_mem_bytes: smem,
+                            })?;
+                    }
+                    return Ok(());
+                }
+                // Prefill: use named fallback from registry.
+                let fb = find_by_name(prefill_as).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "online prefill_as={prefill_as:?} missing from REGISTRY"
+                    )
                 })?;
+                return self.launch_attn_spec(fb, li, d, cache);
+            }
+            AttnLaunch::Causal {
+                kernel,
+                smem,
+                block_threads,
+            } => {
+                let f = self.k.attn(kernel)?;
+                let smem_bytes = smem.bytes(d.head_dim, seq_len);
+                unsafe {
+                    self.stream
+                        .launch_builder(f)
+                        .arg(&self.q)
+                        .arg(&cache.k[li])
+                        .arg(&cache.v[li])
+                        .arg(&mut self.xb)
+                        .arg(&d.n_head)
+                        .arg(&d.n_kv)
+                        .arg(&d.hd)
+                        .arg(&d.pos0_i)
+                        .arg(&d.n_tok)
+                        .arg(&d.scale)
+                        .launch(LaunchConfig {
+                            grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
+                            block_dim: (block_threads, 1, 1),
+                            shared_mem_bytes: smem_bytes,
+                        })?;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub(crate) fn logits_from_last(&mut self, d: &ChunkDims) -> Result<()> {
@@ -423,7 +439,15 @@ impl CudaModel {
                 })?;
         }
         if let Some(ref ow) = self.output {
-            gemv(&self.stream, &self.k, ow, &self.xb1, &mut self.logits, None, None)?;
+            gemv(
+                &self.stream,
+                &self.k,
+                ow,
+                &self.xb1,
+                &mut self.logits,
+                None,
+                GemvResidual::None,
+            )?;
         } else {
             gemv(
                 &self.stream,
@@ -432,7 +456,7 @@ impl CudaModel {
                 &self.xb1,
                 &mut self.logits,
                 None,
-                None,
+                GemvResidual::None,
             )?;
         }
         let n_vocab = self.cfg.n_vocab as i32;

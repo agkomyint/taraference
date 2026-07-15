@@ -10,6 +10,6 @@ mod matmul;
 mod model;
 mod types;
 
-pub use decode::DecodeBackend;
+pub use decode::{AttnLaunch, DecodeBackend, DecodeSpec, SmemRule, REGISTRY};
 pub use kv::CudaKv;
 pub use model::CudaModel;

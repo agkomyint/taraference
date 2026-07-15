@@ -26,6 +26,18 @@ pub(crate) fn lc_gemm_cols(n_cols: u32) -> LaunchConfig {
     }
 }
 
+/// Residual stream handling for single-token GEMV.
+#[derive(Clone, Copy)]
+pub(crate) enum GemvResidual<'a> {
+    None,
+    /// `out = W x + residual` (separate buffer).
+    #[allow(dead_code)] // ready for other fused paths
+    Add(&'a CudaSlice<f32>),
+    /// `y = W x + y` — fuse residual add into the matvec (decode residual stream).
+    /// Kernel only touches index `j` as read-then-write; safe alias of out/residual.
+    InPlace,
+}
+
 /// `y = W x [+ bias] [+ residual]` (single-token GEMV).
 pub(crate) fn gemv(
     stream: &Arc<CudaStream>,
@@ -34,25 +46,29 @@ pub(crate) fn gemv(
     x: &CudaSlice<f32>,
     y: &mut CudaSlice<f32>,
     bias: Option<&CudaSlice<f32>>,
-    residual: Option<&CudaSlice<f32>>,
+    residual: GemvResidual<'_>,
 ) -> Result<()> {
     let n_rows = w.n_rows as i32;
     let n_cols = w.n_cols as i32;
     let col_bytes = w.col_bytes as i32;
     let use_bias: i32 = if bias.is_some() { 1 } else { 0 };
-    let use_res: i32 = if residual.is_some() { 1 } else { 0 };
+    // 0 = none, 1 = separate residual buf, 2 = in-place out[j] += (see gemv.cu).
+    let use_res: i32 = match residual {
+        GemvResidual::None => 0,
+        GemvResidual::Add(_) => 1,
+        GemvResidual::InPlace => 2,
+    };
     // Dummy pointer when unused (flags gate loads).
     let bias_ptr: &CudaSlice<f32> = bias.unwrap_or(x);
-    let res_ptr: &CudaSlice<f32> = residual.unwrap_or(x);
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4,
+        WType::Q5_0 => &k.gemv_q5,
         WType::Q6K => &k.gemv_q6,
         WType::Q8_0 => &k.gemv_q8,
     };
     unsafe {
-        stream
-            .launch_builder(f)
-            .arg(&w.data)
+        let mut lb = stream.launch_builder(f);
+        lb.arg(&w.data)
             .arg(x)
             .arg(y)
             .arg(&n_rows)
@@ -60,9 +76,17 @@ pub(crate) fn gemv(
             .arg(&col_bytes)
             .arg(&use_bias)
             .arg(bias_ptr)
-            .arg(&use_res)
-            .arg(res_ptr)
-            .launch(lc_gemv(w.n_cols as u32, w.n_rows as u32))?;
+            .arg(&use_res);
+        match residual {
+            GemvResidual::None | GemvResidual::InPlace => {
+                // Mode 2 reads residual from `out`; pointer unused but required.
+                lb.arg(x);
+            }
+            GemvResidual::Add(r) => {
+                lb.arg(r);
+            }
+        }
+        lb.launch(lc_gemv(w.n_cols as u32, w.n_rows as u32))?;
     }
     Ok(())
 }
@@ -76,13 +100,14 @@ pub(crate) fn gemm(
     n_tok: i32,
 ) -> Result<()> {
     if n_tok == 1 {
-        return gemv(stream, k, w, x, y, None, None);
+        return gemv(stream, k, w, x, y, None, GemvResidual::None);
     }
     let n_rows = w.n_rows as i32;
     let n_cols = w.n_cols as i32;
     let col_bytes = w.col_bytes as i32;
     let f = match w.wtype {
         WType::Q4K => &k.gemm_q4,
+        WType::Q5_0 => &k.gemm_q5,
         WType::Q6K => &k.gemm_q6,
         WType::Q8_0 => &k.gemm_q8,
     };
@@ -112,6 +137,7 @@ impl CudaModel {
         let col_bytes = self.token_embd.col_bytes as i32;
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4,
+            WType::Q5_0 => &self.k.embed_q5,
             WType::Q6K => &self.k.embed_q6,
             WType::Q8_0 => &self.k.embed_q8,
         };
@@ -138,6 +164,7 @@ impl CudaModel {
         let col_bytes = self.token_embd.col_bytes as i32;
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4_one,
+            WType::Q5_0 => &self.k.embed_q5_one,
             WType::Q6K => &self.k.embed_q6_one,
             WType::Q8_0 => &self.k.embed_q8_one,
         };

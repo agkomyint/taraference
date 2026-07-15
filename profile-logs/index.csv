@@ -1,3 +1,10 @@
 stamp,decode,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx
 2026-07-15_20-57-38,fast,profile_2026-07-15_20-57-38_fast.txt,13.844,20.362,11.576,43.15,451
 2026-07-15_20-59-13,fast,profile_2026-07-15_20-59-13_fast.txt,13.909,22.321,11.364,49.09,451
+2026-07-15_21-05-01,fastv2,profile_2026-07-15_21-05-01_fastv2.txt,14.640,22.978,11.685,49.15,451
+2026-07-15_21-09-42,Qwen2.5-0.5B-Instruct-Q4_K_M,fastv2,profile_2026-07-15_21-09-42_Qwen2.5-0.5B-Instruct-Q4_K_M_fastv2.txt,88.132,106.735,73.694,30.96,449
+2026-07-15_21-10-22,Qwen2.5-0.5B-Instruct-Q4_K_M,fastv2,profile_2026-07-15_21-10-22_Qwen2.5-0.5B-Instruct-Q4_K_M_fastv2.txt,89.563,120.249,72.193,39.96,449
+2026-07-15_21-44-55,Qwen2.5-3B-Instruct-Q4_K_M,fastv2,profile_2026-07-15_21-44-55_Qwen2.5-3B-Instruct-Q4_K_M_fastv2.txt,19.181,25.419,16.365,35.62,451
+2026-07-15_21-52-20,Qwen2.5-3B-Instruct-Q4_K_M,fastv2,profile_2026-07-15_21-52-20_Qwen2.5-3B-Instruct-Q4_K_M_fastv2.txt,18.570,25.460,15.618,38.66,451
+2026-07-15_21-53-36,Qwen2.5-3B-Instruct-Q4_K_M,fastv2,profile_2026-07-15_21-53-36_Qwen2.5-3B-Instruct-Q4_K_M_fastv2.txt,14.831,22.273,11.793,47.05,451
+2026-07-15_21-56-35,Qwen2.5-3B-Instruct-Q4_K_M,fastv2,profile_2026-07-15_21-56-35_Qwen2.5-3B-Instruct-Q4_K_M_fastv2.txt,16.287,23.968,13.166,45.07,451

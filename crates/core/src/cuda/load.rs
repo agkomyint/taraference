@@ -13,9 +13,13 @@ use taraference_gguf::{GgmlType, GgufFile};
 fn wtype_of(t: GgmlType) -> Result<WType> {
     Ok(match t {
         GgmlType::Q4_K => WType::Q4K,
+        GgmlType::Q5_0 => WType::Q5_0,
         GgmlType::Q6_K => WType::Q6K,
         GgmlType::Q8_0 => WType::Q8_0,
-        other => bail!("unsupported weight type {}", other.name()),
+        other => bail!(
+            "unsupported weight type {} (supported: Q4_K, Q5_0, Q6_K, Q8_0)",
+            other.name()
+        ),
     })
 }
 
@@ -71,15 +75,19 @@ impl CudaModel {
         let module = ctx.load_module(ptx).context("load_module")?;
         let k = Kernels {
             gemv_q4: module.load_function("gemv_q4_k")?,
+            gemv_q5: module.load_function("gemv_q5_0")?,
             gemv_q6: module.load_function("gemv_q6_k")?,
             gemv_q8: module.load_function("gemv_q8_0")?,
             gemm_q4: module.load_function("gemm_q4_k")?,
+            gemm_q5: module.load_function("gemm_q5_0")?,
             gemm_q6: module.load_function("gemm_q6_k")?,
             gemm_q8: module.load_function("gemm_q8_0")?,
             embed_q4: module.load_function("embed_q4_k")?,
+            embed_q5: module.load_function("embed_q5_0")?,
             embed_q6: module.load_function("embed_q6_k")?,
             embed_q8: module.load_function("embed_q8_0")?,
             embed_q4_one: module.load_function("embed_q4_k_one")?,
+            embed_q5_one: module.load_function("embed_q5_0_one")?,
             embed_q6_one: module.load_function("embed_q6_k_one")?,
             embed_q8_one: module.load_function("embed_q8_0_one")?,
             rms_norm: module.load_function("rms_norm_f32")?,
@@ -87,9 +95,16 @@ impl CudaModel {
             add: module.load_function("add_f32")?,
             add_bias: module.load_function("add_bias_f32")?,
             rope: module.load_function("rope_neox_f32")?,
-            attn_fast: module.load_function("attn_f32")?,
-            attn_basic: module.load_function("attn_basic_f32")?,
-            attn_online: module.load_function("attn_online_f32")?,
+            attn: {
+                // Load only symbols listed in decode::REGISTRY (easy add/remove).
+                let mut map = std::collections::HashMap::new();
+                for sym in DecodeBackend::required_kernel_symbols() {
+                    map.insert(sym, module.load_function(sym).with_context(|| {
+                        format!("load attn kernel {sym} (missing from CUDA source?)")
+                    })?);
+                }
+                map
+            },
             copy_kv: module.load_function("copy_kv_f16")?,
             argmax: module.load_function("argmax_f32")?,
             copy_last: module.load_function("copy_last_row")?,
