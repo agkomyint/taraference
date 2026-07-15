@@ -56,10 +56,18 @@ impl CudaModel {
 
         let ctx = CudaContext::new(0).context("CudaContext")?;
         let stream = ctx.default_stream();
+        // Match the live GPU (e.g. sm_86 laptop 3050 Ti, sm_75 Tesla T4).
+        // Hardcoding sm_86 breaks PTX load on other arches.
+        let (cc_major, cc_minor) = ctx
+            .compute_capability()
+            .context("device compute capability")?;
+        let arch = format!("sm_{cc_major}{cc_minor}");
+        eprintln!("NVRTC arch={arch}");
+        // `CompileOptions::arch` is `&'static str`; pass dynamic target via `options`.
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(
             SOURCE,
             cudarc::nvrtc::CompileOptions {
-                arch: Some("sm_86"),
+                arch: None,
                 include_paths: vec![],
                 ftz: Some(true),
                 prec_div: Some(false),
@@ -67,7 +75,7 @@ impl CudaModel {
                 fmad: Some(true),
                 use_fast_math: Some(true),
                 maxrregcount: None,
-                options: vec![],
+                options: vec![format!("--gpu-architecture={arch}")],
                 name: None,
             },
         )
