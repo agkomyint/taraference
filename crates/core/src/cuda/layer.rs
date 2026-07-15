@@ -365,14 +365,16 @@ impl CudaModel {
             DecodeBackend::Fast | DecodeBackend::Online => &self.k.attn_fast,
         };
 
-        // smem: Q[head_dim] + scores[seq_len]  (fast) or scores only (basic)
+        // fast: Q[head_dim] + scores[ATTN_TILE=64] (fixed; does not grow with ctx)
+        // basic: scores[seq_len] baseline (A/B only)
+        const ATTN_TILE: usize = 64;
         let smem = match self.decode {
             DecodeBackend::Basic => (seq_len.max(1) * 4) as u32,
             DecodeBackend::Fast | DecodeBackend::Online => {
-                ((d.head_dim + seq_len.max(1)) * 4) as u32
+                ((d.head_dim + ATTN_TILE) * 4) as u32
             }
         };
-        let attn_threads = 128u32.min(256);
+        let attn_threads = 128u32;
 
         unsafe {
             self.stream

@@ -1,14 +1,21 @@
-//! Runtime profiler: sample CPU/GPU while multi-turn chat runs, print a rich report.
+//! Runtime profiler: sample CPU/GPU while multi-turn chat runs, print a rich report,
+//! and save timestamped logs under `profile-logs/` for before/after comparison.
 
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use taraference_core::{DecodeBackend, ModelConfig, StopReason, TurnStats};
 
 /// Cap generated tokens per turn during profile (comparable runs).
 pub const PROFILE_MAX_NEW: usize = 128;
+
+/// Directory (cwd-relative) for saved profile reports.
+pub const PROFILE_LOG_DIR: &str = "profile-logs";
 
 /// Realistic multi-turn script (context grows like a real chat).
 pub const MULTI_TURN_SCRIPT: &[&str] = &[
@@ -102,7 +109,13 @@ impl Profiler {
         }
     }
 
-    pub fn stop_and_report(&mut self, turns: &[TurnRow], mode: &str, meta: &ProfileMeta) {
+    /// Build report, print it, save under `profile-logs/`, return log path.
+    pub fn stop_and_report(
+        &mut self,
+        turns: &[TurnRow],
+        mode: &str,
+        meta: &ProfileMeta,
+    ) -> PathBuf {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -206,10 +219,8 @@ impl Profiler {
             0.0
         };
 
-        // Rough weight-stream bandwidth if every decode token rereads all Q-weights.
         let weight_bytes = meta.weight_gib * (1024.0 * 1024.0 * 1024.0);
         let est_gbps = overall_decode_tps * weight_bytes / 1e9;
-        // 3050 Ti laptop ~192 GB/s theoretical; report as % of that reference.
         let ref_bw = 192.0;
         let bw_pct = 100.0 * est_gbps / ref_bw;
 
@@ -225,7 +236,6 @@ impl Profiler {
             0.0
         };
 
-        // Decode tps vs context (slope of degradation).
         let (decode_tps_first, decode_tps_last) = (
             turns.first().map(|t| t.stats.decode_tps).unwrap_or(0.0),
             turns.last().map(|t| t.stats.decode_tps).unwrap_or(0.0),
@@ -247,7 +257,6 @@ impl Profiler {
             0.0
         };
 
-        // Inter-turn ctx growth
         let ctx_growth: Vec<usize> = turns
             .windows(2)
             .map(|w| w[1].stats.ctx_len.saturating_sub(w[0].stats.ctx_len))
@@ -259,14 +268,27 @@ impl Profiler {
         };
 
         let host = sample_host_mem();
+        let sample_span = samples
+            .last()
+            .map(|s| s.t_ms)
+            .unwrap_or(0.0)
+            .max(0.0);
 
-        println!();
-        println!("════════════════════════════════════════════════════════════════");
-        println!("  PROFILE REPORT  ({mode})");
-        println!("════════════════════════════════════════════════════════════════");
-        println!("  CONFIG");
-        println!("    model     {}", meta.model_path);
-        println!(
+        let stamp = local_timestamp();
+        let mut report = String::with_capacity(8 * 1024);
+        let mut line = |s: String| {
+            report.push_str(&s);
+            report.push('\n');
+        };
+
+        line(String::new());
+        line("════════════════════════════════════════════════════════════════".into());
+        line(format!("  PROFILE REPORT  ({mode})"));
+        line(format!("  saved_at  {stamp}"));
+        line("════════════════════════════════════════════════════════════════".into());
+        line("  CONFIG".into());
+        line(format!("    model     {}", meta.model_path));
+        line(format!(
             "    arch      {}  L={}  d={}  heads={}/{}  ff={}  vocab={}",
             meta.cfg.architecture,
             meta.cfg.n_layer,
@@ -275,34 +297,30 @@ impl Profiler {
             meta.cfg.n_head_kv,
             meta.cfg.n_ff,
             meta.cfg.n_vocab
-        );
-        println!(
+        ));
+        line(format!(
             "    weights   {:.2} GiB Q  |  model n_ctx={}  session max_seq={}  max_new={}",
             meta.weight_gib, meta.cfg.n_ctx, meta.max_seq, meta.max_new
-        );
-        println!(
+        ));
+        line(format!(
             "    decode    {} — {}",
             meta.decode.name(),
             meta.decode.description()
-        );
-        let sample_span = samples
-            .last()
-            .map(|s| s.t_ms)
-            .unwrap_or(0.0)
-            .max(0.0);
-        println!(
+        ));
+        line("    kv        f16 (half bandwidth vs f32)".into());
+        line(format!(
             "    sample    every {} ms  |  {} samples over {:.2}s wall (span {:.0} ms)",
             meta.sample_interval_ms,
             samples.len(),
             elapsed,
             sample_span
-        );
-        println!("────────────────────────────────────────────────────────────────");
-        println!("  PER-TURN");
-        println!(
+        ));
+        line("────────────────────────────────────────────────────────────────".into());
+        line("  PER-TURN".into());
+        line(format!(
             "  {:>4} {:>7} {:>7} {:>6} {:>5} {:>5} {:>5} {:>5} {:>6} {:>4} {}",
             "turn", "prefill", "decode", "ttft", "pTok", "gTok", "ctx0", "ctx", "stop", "cap", "user"
-        );
+        ));
         for t in turns {
             let user_short = if t.user.chars().count() > 36 {
                 let s: String = t.user.chars().take(36).collect();
@@ -316,7 +334,7 @@ impl Profiler {
                 StopReason::Empty => "empty",
             };
             let cap = if t.stats.hit_max_new { "Y" } else { "-" };
-            println!(
+            line(format!(
                 "  {:>4} {:>5.0}ms {:>5.1}t/s {:>5.0} {:>5} {:>5} {:>5} {:>5} {:>6} {:>4} {}",
                 t.index + 1,
                 t.stats.prefill_ms,
@@ -329,138 +347,331 @@ impl Profiler {
                 stop,
                 cap,
                 user_short
-            );
+            ));
         }
-        println!("────────────────────────────────────────────────────────────────");
-        println!("  LATENCY");
-        println!(
+        line("────────────────────────────────────────────────────────────────".into());
+        line("  LATENCY".into());
+        line(format!(
             "    TTFT      avg {avg_ttft:.0} ms  min {min_ttft:.0}  max {max_ttft:.0}  (user→first token)"
-        );
-        println!(
+        ));
+        line(format!(
             "    tokenize  total {total_tokenize_ms:.1} ms  ({:.2} ms/turn)",
             total_tokenize_ms / turns.len().max(1) as f64
-        );
-        println!(
+        ));
+        line(format!(
             "    ms/token  prefill {ms_per_tok_prefill:.1}  decode {ms_per_tok_decode:.1}"
-        );
-        println!("────────────────────────────────────────────────────────────────");
-        println!("  THROUGHPUT");
-        println!(
+        ));
+        line("────────────────────────────────────────────────────────────────".into());
+        line("  THROUGHPUT".into());
+        line(format!(
             "    prefill  {total_prefill_ms:>7.0} ms | {total_prompt:>5} tok | {overall_prefill_tps:>6.1} tok/s | {prefill_share:>5.1}% of turn-time"
-        );
-        println!(
+        ));
+        line(format!(
             "    decode   {total_decode_ms:>7.0} ms | {total_gen:>5} tok | {overall_decode_tps:>6.1} tok/s | {decode_share:>5.1}% of turn-time"
-        );
-        println!(
+        ));
+        line(format!(
             "    wall     {total_wall_ms:>7.0} ms sum turns | wall-clock run {:.2}s",
             elapsed
-        );
-        println!(
+        ));
+        line(format!(
             "    decode   first-turn {decode_tps_first:.1} t/s → last-turn {decode_tps_last:.1} t/s  (drop {decode_drop_pct:.0}%)"
-        );
+        ));
         if turns.len() > 1 {
-            println!(
+            line(format!(
                 "    prefill  first {first_prefill:.0} ms | later avg {later_prefill_avg:.0} ms"
-            );
+            ));
         }
-        println!(
+        line(format!(
             "    est weight BW  {est_gbps:.1} GB/s  (~{bw_pct:.0}% of 192 GB/s ref)  [decode × model size]"
-        );
-        println!("────────────────────────────────────────────────────────────────");
-        println!("  CONTEXT / MEMORY");
-        println!(
+        ));
+        line("────────────────────────────────────────────────────────────────".into());
+        line("  CONTEXT / MEMORY".into());
+        line(format!(
             "    ctx final {final_ctx} / {}  ({ctx_pct:.1}% full)  avg growth/turn {avg_ctx_growth:.0} tok",
             meta.max_seq
-        );
+        ));
         if samples.iter().any(|s| s.gpu_mem_total_mb > 0.0) {
-            println!(
+            line(format!(
                 "    VRAM   used avg {gmem_avg:.0}  min {gmem_min:.0}  peak {gmem_max:.0} / {gmem_tot:.0} MiB  ({vram_pct:.0}% peak)"
-            );
-            println!(
+            ));
+            line(format!(
                 "    VRAM   free at peak ~{vram_free:.0} MiB  |  mem-controller util avg {gmem_util_avg:.1}%"
-            );
+            ));
         }
         if let Some((used, total)) = host {
-            println!(
+            line(format!(
                 "    host RAM  ~{used:.0} / {total:.0} MiB used (system snapshot)"
-            );
+            ));
         }
-        println!("────────────────────────────────────────────────────────────────");
-        println!("  GENERATION QUALITY FLAGS");
-        println!(
+        line("────────────────────────────────────────────────────────────────".into());
+        line("  GENERATION QUALITY FLAGS".into());
+        line(format!(
             "    stop: eos={eos_stops}  hit_max_new={hit_cap}  empty={empty_stops}  / {} turns",
             turns.len()
-        );
+        ));
         if hit_cap > 0 {
-            println!(
+            line(format!(
                 "    ⚠ {hit_cap} turn(s) hit max_new={} — reply may be truncated mid-sentence",
                 meta.max_new
-            );
+            ));
         }
-        println!("────────────────────────────────────────────────────────────────");
-        println!("  CPU");
-        println!("    util   min {cpu_min:5.1}%  avg {cpu_avg:5.1}%  max {cpu_max:5.1}%");
-        println!("  GPU");
+        line("────────────────────────────────────────────────────────────────".into());
+        line("  CPU".into());
+        line(format!(
+            "    util   min {cpu_min:5.1}%  avg {cpu_avg:5.1}%  max {cpu_max:5.1}%"
+        ));
+        line("  GPU".into());
         if samples.iter().any(|s| s.gpu_mem_total_mb > 0.0) {
-            println!("    compute  min {gpu_min:5.1}%  avg {gpu_avg:5.1}%  max {gpu_max:5.1}%");
-            println!("    power    min {pwr_min:5.1} W  avg {pwr_avg:5.1} W  max {pwr_max:5.1} W");
-            println!("    temp     min {tmp_min:5.0} °C avg {tmp_avg:5.0} °C max {tmp_max:5.0} °C");
-            println!(
+            line(format!(
+                "    compute  min {gpu_min:5.1}%  avg {gpu_avg:5.1}%  max {gpu_max:5.1}%"
+            ));
+            line(format!(
+                "    power    min {pwr_min:5.1} W  avg {pwr_avg:5.1} W  max {pwr_max:5.1} W"
+            ));
+            line(format!(
+                "    temp     min {tmp_min:5.0} °C avg {tmp_avg:5.0} °C max {tmp_max:5.0} °C"
+            ));
+            line(format!(
                 "    clocks   core avg {clk_avg:.0} MHz (max {clk_max:.0})  mem avg {mclk_avg:.0} MHz"
-            );
-            println!(
+            ));
+            line(format!(
                 "    efficiency  {util_eff:.3} decode_tok/s per GPU%   (higher = more tokens for same util)"
-            );
+            ));
             if pwr_max > 0.0 {
-                println!(
+                line(format!(
                     "    tok/J (rough)  {:.2} decode tok per joule  [gen_tok / (avg_W × decode_s)]",
                     total_gen as f64 / (pwr_avg as f64 * (total_decode_ms / 1000.0)).max(1e-6)
-                );
+                ));
             }
         } else {
-            println!("    (nvidia-smi unavailable — check PATH / driver)");
+            line("    (nvidia-smi unavailable — check PATH / driver)".into());
         }
-        println!("────────────────────────────────────────────────────────────────");
-        println!("  READOUT / HINTS");
+        line("────────────────────────────────────────────────────────────────".into());
+        line("  READOUT / HINTS".into());
         if vram_pct < 70.0 && gmem_tot > 0.0 {
-            println!(
+            line(format!(
                 "    • VRAM headroom ~{vram_free:.0} MiB — not memory-capacity bound; speed ≠ fill VRAM."
-            );
+            ));
         }
         if gpu_avg > 85.0 && est_gbps < ref_bw * 0.25 {
-            println!(
+            line(
                 "    • GPU util high but est weight BW low vs peak → kernels busy but not streaming weights efficiently (or util metric saturated)."
+                    .into(),
             );
         }
         if decode_drop_pct > 30.0 {
-            println!(
+            line(format!(
                 "    • Decode dropped {decode_drop_pct:.0}% as ctx grew → attention/KV path dominates long chats."
-            );
+            ));
         }
         if turns.len() > 1 && later_prefill_avg > first_prefill * 0.85 {
-            println!(
+            line(
                 "    • Later-turn prefill still heavy → each new token pays attention over long KV (expected) or rework batching."
+                    .into(),
             );
         }
         if cpu_avg > 45.0 {
-            println!("    • CPU elevated → host launch/sync/copy may steal decode tok/s.");
+            line("    • CPU elevated → host launch/sync/copy may steal decode tok/s.".into());
         }
         if tmp_max > 85.0 {
-            println!("    • GPU hot ({tmp_max:.0}°C) — possible thermal throttle; watch clocks.");
+            line(format!(
+                "    • GPU hot ({tmp_max:.0}°C) — possible thermal throttle; watch clocks."
+            ));
         }
         if hit_cap > 0 {
-            println!("    • Raise max_new (or profile cap) if answers look cut off.");
+            line("    • Raise max_new (or profile cap) if answers look cut off.".into());
         }
         if ctx_pct > 80.0 {
-            println!("    • Context nearly full ({ctx_pct:.0}%) — risk of failures / need /reset.");
+            line(format!(
+                "    • Context nearly full ({ctx_pct:.0}%) — risk of failures / need /reset."
+            ));
         }
         if gpu_avg < 40.0 && overall_decode_tps > 0.0 {
-            println!("    • Low GPU util → launch-bound or CPU-bound; fuse kernels / less sync.");
+            line("    • Low GPU util → launch-bound or CPU-bound; fuse kernels / less sync.".into());
         } else if gpu_avg > 85.0 {
-            println!("    • High GPU util → optimize matmul/attention bandwidth next.");
+            line("    • High GPU util → optimize matmul/attention bandwidth next.".into());
         }
-        println!("════════════════════════════════════════════════════════════════");
+        line("════════════════════════════════════════════════════════════════".into());
+
+        // Machine-readable SUMMARY block (easy to diff between runs).
+        line("  SUMMARY_KV".into());
+        line(format!("    stamp={stamp}"));
+        line(format!("    decode_backend={}", meta.decode.name()));
+        line(format!("    mode={mode}"));
+        line(format!("    overall_decode_tps={overall_decode_tps:.3}"));
+        line(format!("    overall_prefill_tps={overall_prefill_tps:.3}"));
+        line(format!("    decode_tps_first={decode_tps_first:.3}"));
+        line(format!("    decode_tps_last={decode_tps_last:.3}"));
+        line(format!("    decode_drop_pct={decode_drop_pct:.2}"));
+        line(format!("    total_prefill_ms={total_prefill_ms:.2}"));
+        line(format!("    total_decode_ms={total_decode_ms:.2}"));
+        line(format!("    total_gen={total_gen}"));
+        line(format!("    total_prompt={total_prompt}"));
+        line(format!("    final_ctx={final_ctx}"));
+        line(format!("    wall_s={elapsed:.3}"));
+        line(format!("    first_prefill_ms={first_prefill:.2}"));
+        line(format!("    later_prefill_avg_ms={later_prefill_avg:.2}"));
+        line("════════════════════════════════════════════════════════════════".into());
+
+        print!("{report}");
+
+        let prev = read_latest_log_if_any();
+        let path = save_profile_log(&report, meta, &stamp);
+        if let Some(ref p) = path {
+            eprintln!("\nprofile log → {}", p.display());
+            let _ = fs::write(Path::new(PROFILE_LOG_DIR).join("latest.txt"), &report);
+            if let Some(prev_text) = prev {
+                print_compare(&prev_text, &report);
+            }
+        } else {
+            eprintln!("\nprofile log: failed to write under {PROFILE_LOG_DIR}/");
+        }
+
+        path.unwrap_or_else(|| PathBuf::from(PROFILE_LOG_DIR))
     }
+}
+
+fn local_timestamp() -> String {
+    // Prefer local wall clock via PowerShell (Windows); fall back to unix seconds.
+    #[cfg(windows)]
+    {
+        if let Ok(out) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'",
+            ])
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
+    }
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix_{secs}")
+}
+
+fn save_profile_log(report: &str, meta: &ProfileMeta, stamp: &str) -> Option<PathBuf> {
+    fs::create_dir_all(PROFILE_LOG_DIR).ok()?;
+    let fname = format!("profile_{stamp}_{}.txt", meta.decode.name());
+    let path = Path::new(PROFILE_LOG_DIR).join(&fname);
+    // Avoid clobber if two runs share the same second.
+    let path = if path.exists() {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Path::new(PROFILE_LOG_DIR).join(format!(
+            "profile_{stamp}_{}_{}.txt",
+            meta.decode.name(),
+            secs
+        ))
+    } else {
+        path
+    };
+    let mut f = fs::File::create(&path).ok()?;
+    f.write_all(report.as_bytes()).ok()?;
+    // One-line index for quick grepping.
+    let idx = Path::new(PROFILE_LOG_DIR).join("index.csv");
+    let header_needed = !idx.exists();
+    if let Ok(mut idxf) = fs::OpenOptions::new().create(true).append(true).open(&idx) {
+        if header_needed {
+            let _ = writeln!(
+                idxf,
+                "stamp,decode,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx"
+            );
+        }
+        let (od, f1, fl, drop, ctx) = parse_summary_metrics(report);
+        let _ = writeln!(
+            idxf,
+            "{},{},{},{:.3},{:.3},{:.3},{:.2},{}",
+            stamp,
+            meta.decode.name(),
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+            od,
+            f1,
+            fl,
+            drop,
+            ctx
+        );
+    }
+    Some(path)
+}
+
+fn read_latest_log_if_any() -> Option<String> {
+    let p = Path::new(PROFILE_LOG_DIR).join("latest.txt");
+    fs::read_to_string(p).ok()
+}
+
+fn parse_summary_metrics(report: &str) -> (f64, f64, f64, f64, usize) {
+    let mut od = 0.0;
+    let mut f1 = 0.0;
+    let mut fl = 0.0;
+    let mut drop = 0.0;
+    let mut ctx = 0usize;
+    for line in report.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("overall_decode_tps=") {
+            od = v.parse().unwrap_or(0.0);
+        } else if let Some(v) = t.strip_prefix("decode_tps_first=") {
+            f1 = v.parse().unwrap_or(0.0);
+        } else if let Some(v) = t.strip_prefix("decode_tps_last=") {
+            fl = v.parse().unwrap_or(0.0);
+        } else if let Some(v) = t.strip_prefix("decode_drop_pct=") {
+            drop = v.parse().unwrap_or(0.0);
+        } else if let Some(v) = t.strip_prefix("final_ctx=") {
+            ctx = v.parse().unwrap_or(0);
+        }
+    }
+    (od, f1, fl, drop, ctx)
+}
+
+fn print_compare(prev: &str, curr: &str) {
+    let (pod, pf1, pfl, pdrop, pctx) = parse_summary_metrics(prev);
+    let (cod, cf1, cfl, cdrop, cctx) = parse_summary_metrics(curr);
+    if pod == 0.0 && pf1 == 0.0 {
+        return;
+    }
+    let d = |a: f64, b: f64| b - a;
+    let pct = |a: f64, b: f64| {
+        if a.abs() < 1e-9 {
+            0.0
+        } else {
+            100.0 * (b - a) / a
+        }
+    };
+    println!();
+    println!("════════════════════════════════════════════════════════════════");
+    println!("  vs PREVIOUS profile-logs/latest.txt");
+    println!("────────────────────────────────────────────────────────────────");
+    println!(
+        "    overall decode  {pod:.1} → {cod:.1} t/s   ({:+.1}  {:+.0}%)",
+        d(pod, cod),
+        pct(pod, cod)
+    );
+    println!(
+        "    first-turn      {pf1:.1} → {cf1:.1} t/s   ({:+.1}  {:+.0}%)",
+        d(pf1, cf1),
+        pct(pf1, cf1)
+    );
+    println!(
+        "    last-turn       {pfl:.1} → {cfl:.1} t/s   ({:+.1}  {:+.0}%)",
+        d(pfl, cfl),
+        pct(pfl, cfl)
+    );
+    println!(
+        "    decode drop %   {pdrop:.0} → {cdrop:.0}     ({:+.1})",
+        d(pdrop, cdrop)
+    );
+    println!("    final ctx       {pctx} → {cctx}");
+    println!("════════════════════════════════════════════════════════════════");
 }
 
 /// util, mem_util, mem_used, mem_total, power, temp, sm_clock, mem_clock

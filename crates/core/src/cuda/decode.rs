@@ -37,13 +37,13 @@ impl DecodeBackend {
     pub fn description(self) -> &'static str {
         match self {
             DecodeBackend::Fast => {
-                "parallel softmax attention (Q in smem, block reduce) — default"
+                "f16 KV + tiled online attn (fixed smem, no scores[ctx]) — default"
             }
             DecodeBackend::Basic => {
-                "serial softmax on thread 0 — baseline for A/B"
+                "f16 KV + serial softmax scores[ctx] — baseline for A/B"
             }
             DecodeBackend::Online => {
-                "online softmax decode (1 tok); prefill falls back to fast"
+                "f16 KV + online decode (1 tok); prefill uses tiled fast"
             }
         }
     }

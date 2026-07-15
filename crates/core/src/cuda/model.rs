@@ -41,10 +41,15 @@ impl CudaModel {
         let slot = max_seq * stride;
         let mut k = Vec::with_capacity(self.cfg.n_layer);
         let mut v = Vec::with_capacity(self.cfg.n_layer);
+        // f16 KV: half the VRAM/BW of f32 (stored as u16 bit patterns).
         for _ in 0..self.cfg.n_layer {
-            k.push(self.stream.alloc_zeros(slot)?);
-            v.push(self.stream.alloc_zeros(slot)?);
+            k.push(self.stream.alloc_zeros::<u16>(slot)?);
+            v.push(self.stream.alloc_zeros::<u16>(slot)?);
         }
+        let kv_mib = (self.cfg.n_layer * slot * 2 * 2) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "KV    | f16  max_seq={max_seq}  ~{kv_mib:.1} MiB (all layers K+V)"
+        );
         Ok(CudaKv {
             k,
             v,

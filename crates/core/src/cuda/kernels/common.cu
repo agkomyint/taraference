@@ -21,6 +21,38 @@ __device__ __forceinline__ float half_to_float(unsigned short h) {
     return __int_as_float(f);
 }
 
+// Round-to-nearest-even-ish f32→f16 for KV store (2× less attention bandwidth).
+__device__ __forceinline__ unsigned short float_to_half_bits(float f) {
+    unsigned int x = __float_as_uint(f);
+    unsigned int sign = (x >> 16) & 0x8000u;
+    unsigned int absx = x & 0x7fffffffu;
+    if (absx == 0u) return (unsigned short)sign;
+    // NaN / Inf
+    if (absx >= 0x7f800000u) {
+        if (absx == 0x7f800000u) return (unsigned short)(sign | 0x7c00u);
+        return (unsigned short)(sign | 0x7e00u);
+    }
+    // Too small → 0; too large → Inf
+    if (absx < 0x33000000u) return (unsigned short)sign;
+    if (absx >= 0x47800000u) return (unsigned short)(sign | 0x7c00u);
+    int exp = (int)((absx >> 23) & 0xff) - 127 + 15;
+    unsigned int mant = absx & 0x7fffffu;
+    if (exp <= 0) {
+        // denormal
+        if (exp < -10) return (unsigned short)sign;
+        mant |= 0x800000u;
+        unsigned int shift = (unsigned int)(14 - exp);
+        unsigned int half_mant = mant >> shift;
+        // round
+        if ((mant >> (shift - 1)) & 1u) half_mant += 1u;
+        return (unsigned short)(sign | half_mant);
+    }
+    unsigned int half = ((unsigned int)exp << 10) | (mant >> 13);
+    // round bit
+    if (mant & 0x1000u) half += 1u;
+    return (unsigned short)(sign | half);
+}
+
 __device__ __forceinline__ void get_scale_min_k4(
     int j, const unsigned char* q, unsigned char* d, unsigned char* m
 ) {

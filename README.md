@@ -21,15 +21,31 @@ Optional one-shot: `--prompt "Hello"`. Chat: type messages, `/quit`, `/reset`.
 cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile
 ```
 
-### A/B decode backends (`--decode`)
+Each `--profile` run prints the report **and** saves it under **`profile-logs/`**:
 
-Keep all attention paths; switch without deleting code:
+| File | Purpose |
+|------|---------|
+| `profile_YYYY-MM-DD_HH-mm-ss_<decode>.txt` | Full report + `SUMMARY_KV` block |
+| `latest.txt` | Copy of the most recent run |
+| `index.csv` | One row per run (decode t/s, drop %, ctx) for quick compare |
+
+Re-run after changes; the CLI prints **vs PREVIOUS** deltas from `latest.txt`.
+
+### KV + attention (long multi-turn)
+
+| Feature | What |
+|---------|------|
+| **f16 KV** | Keys/values stored as half precision (~½ VRAM & attention BW vs f32) |
+| **`fast` (default)** | Tiled online attention — fixed smem (`Q` + tile), no `scores[ctx]` |
+| Incremental multi-turn | Append-only cache; only new tokens are prefilled |
+
+### A/B decode backends (`--decode`)
 
 | Name | Meaning |
 |------|---------|
-| `fast` | Parallel softmax (default) |
-| `basic` | Serial softmax baseline |
-| `online` | Online softmax on decode tokens (prefill uses fast) |
+| `fast` | f16 KV + tiled online attn (default) |
+| `basic` | f16 KV + serial softmax baseline |
+| `online` | f16 KV + online softmax on decode (prefill uses fast) |
 
 ```powershell
 cargo run --release -- models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode basic

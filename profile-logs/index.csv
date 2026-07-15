@@ -1,0 +1,3 @@
+stamp,decode,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx
+2026-07-15_20-57-38,fast,profile_2026-07-15_20-57-38_fast.txt,13.844,20.362,11.576,43.15,451
+2026-07-15_20-59-13,fast,profile_2026-07-15_20-59-13_fast.txt,13.909,22.321,11.364,49.09,451

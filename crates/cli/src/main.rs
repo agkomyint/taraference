@@ -108,6 +108,6 @@ fn run_profile(
         });
     }
 
-    prof.stop_and_report(&rows, mode, &meta);
+    let _log = prof.stop_and_report(&rows, mode, &meta);
     Ok(())
 }

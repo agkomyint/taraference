@@ -90,7 +90,7 @@ impl CudaModel {
             attn_fast: module.load_function("attn_f32")?,
             attn_basic: module.load_function("attn_basic_f32")?,
             attn_online: module.load_function("attn_online_f32")?,
-            copy_kv: module.load_function("copy_kv_f32")?,
+            copy_kv: module.load_function("copy_kv_f16")?,
             argmax: module.load_function("argmax_f32")?,
             copy_last: module.load_function("copy_last_row")?,
         };
