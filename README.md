@@ -2,28 +2,112 @@
 
 CUDA multi-turn inference for **Qwen2.5** GGUF (defaults for **RTX 3050 Ti 4GB**).
 
-## Quick start (prebuilt Linux binary)
+**Performance goal:** one user, maximum decode tokens/sec — not multi-user concurrency. See [GOAL.md](GOAL.md).
 
-Fastest path on a remote GPU box (Lightning, SSH, etc.) — **no Rust compile**:
+---
+
+## Fast install (recommended) — prebuilt Linux binary
+
+**Use this if you want first inference ASAP** (Lightning Studio, cloud SSH, Ubuntu GPU box, etc.).
+
+You **do not** need Rust, Cargo, or a local compile. CI ships a ready Linux binary on every version tag.
+
+### What you need (runtime only)
+
+| Requirement | Notes |
+|-------------|--------|
+| **OS** | Linux **x86_64** (Ubuntu 22.04-class is what we build on) |
+| **GPU** | NVIDIA (T4, 3050 Ti, A10, …). Arch is detected at load (`sm_75`, `sm_86`, …) |
+| **Driver** | `nvidia-smi` works |
+| **CUDA toolkit 13.x** | Must include **NVRTC** (runtime kernel compile). Many cloud images already have this |
+| **Disk** | ~10 MB binary + ~380 MB for the 0.5B model (or ~2 GB for 3B) |
+
+Windows / macOS: use [Install from source](#install-from-source) for now (no prebuilt yet).
+
+### One-liner install + chat
 
 ```bash
-# download latest release binary
+# 1) binary (~seconds)
 curl -fsSL -o taraference-linux-x86_64.tar.gz \
   https://github.com/agkomyint/taraference/releases/latest/download/taraference-linux-x86_64.tar.gz
 tar -xzf taraference-linux-x86_64.tar.gz
 chmod +x taraference
 
+# 2) small model (~1 min depending on network)
+./taraference --download 0.5b
+
+# 3) run (first load compiles CUDA kernels via NVRTC — a few seconds)
+./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+```
+
+Interactive chat: type messages, `/reset`, `/quit`.  
+One-shot prompt:
+
+```bash
+./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+  --prompt "Say hi in one short sentence." -n 64
+```
+
+### After cloning the repo
+
+```bash
+git clone https://github.com/agkomyint/taraference.git
+cd taraference
+chmod +x scripts/get-binary.sh
+./scripts/get-binary.sh              # → ./taraference from latest release
 ./taraference --download 0.5b
 ./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
 ```
 
-Or after cloning: `./scripts/get-binary.sh`
+Pin a version: `./scripts/get-binary.sh v0.1.2`
 
-**Runtime:** NVIDIA GPU + driver, CUDA **13.x** toolkit (NVRTC). Releases are built on Ubuntu 22.04 + CUDA 13.
+### OpenAI-compatible server (same binary)
 
-See [Releases](https://github.com/agkomyint/taraference/releases) for versioned assets (`taraference`, `.tar.gz`, `.sha256`).
+```bash
+./taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf --serve
+# default http://127.0.0.1:8787  — use --serve 3000 for another port
+```
+
+### Larger model (3B)
+
+```bash
+./taraference --download 3b
+./taraference models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+```
+
+Fits comfortably on **16 GB** GPUs (e.g. Tesla T4). On **4 GB** laptops prefer **0.5B** or lower context (`--ctx`).
+
+### Why this is “fast”
+
+| Path | Typical time to first chat |
+|------|----------------------------|
+| **Prebuilt release** (above) | Download binary + model only (no compile) |
+| **Build from source** | Rust install + `cargo build --release` (minutes) |
+
+Release assets (see [Releases](https://github.com/agkomyint/taraference/releases)):
+
+| Asset | Purpose |
+|-------|---------|
+| `taraference-linux-x86_64.tar.gz` | Packed binary (use this) |
+| `taraference` | Same binary, unpacked |
+| `*.sha256` | Checksums |
+
+Example on a cloud T4: binary download **&lt;1 s**, 0.5B model **~1–2 s** on a good link, first process load **~few seconds** (NVRTC), then interactive decode.
+
+### Troubleshooting (prebuilt)
+
+| Symptom | Fix |
+|---------|-----|
+| `nvidia-smi` missing | Install NVIDIA driver / use a GPU machine |
+| NVRTC / CUDA load errors | Install **CUDA 13.x toolkit** (not only the driver) |
+| `CUDA_ERROR_INVALID_PTX` on old binaries | Upgrade to **v0.1.2+** (runtime GPU arch detection) |
+| HF download slow / rate-limited | Set `HF_TOKEN` and re-run `--download` |
+
+---
 
 ## Install from source
+
+Use this to **develop** kernels, change code, or run on **Windows**.
 
 ```powershell
 # Windows
@@ -47,7 +131,9 @@ Then:
 ./target/release/taraference models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
 ```
 
-**To build/run from source** you also need: NVIDIA GPU + driver, CUDA toolkit (~13.x with NVRTC), and a C++ linker (MSVC on Windows / build-essential on Linux).
+**Extra needs vs prebuilt:** Rust stable + Cargo, C++ linker (MSVC / `build-essential`). Same GPU + CUDA 13.x NVRTC at **run** time.
+
+Optional flags for the install scripts: `--skip-models`, `--force` (see [`scripts/README.md`](scripts/README.md)).
 
 Try “clone from zero” in a plain Linux container (git only, no GPU): [`test/`](test/).
 
