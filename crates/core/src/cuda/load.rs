@@ -62,7 +62,10 @@ impl CudaModel {
             .compute_capability()
             .context("device compute capability")?;
         let arch = format!("sm_{cc_major}{cc_minor}");
-        eprintln!("NVRTC arch={arch}");
+        let gpu_name = ctx
+            .name()
+            .unwrap_or_else(|_| format!("CUDA device 0 (sm_{cc_major}{cc_minor})"));
+        eprintln!("GPU device | {gpu_name} | compute {cc_major}.{cc_minor} | NVRTC arch={arch}");
         // `CompileOptions::arch` is `&'static str`; pass dynamic target via `options`.
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(
             SOURCE,
@@ -193,6 +196,10 @@ impl CudaModel {
             gemv_partial_stride,
             cfg,
             decode,
+            gpu_name,
+            compute_major: cc_major,
+            compute_minor: cc_minor,
+            nvrtc_arch: arch,
             stream,
             _ctx: ctx,
             _module: module,

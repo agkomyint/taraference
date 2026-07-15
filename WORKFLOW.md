@@ -137,18 +137,24 @@ tarafer ~/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile --decode fastv2
 
 ### What to capture
 
-From the printed report / `profile-logs/latest_<model>.txt`:
+From the printed report / `profile-logs/latest_<model>.txt` (`SUMMARY_KV`):
 
 ```text
+gpu_name=Tesla T4
+gpu_compute_cap=7.5
+gpu_nvrtc_arch=sm_75
+gpu_driver=...
+gpu_vram_total_mib=15360
 overall_decode_tps=...
 decode_tps_first=...
 decode_tps_last=...
 decode_drop_pct=...
 overall_prefill_tps=...
 wall_s=...
-VRAM peak=...
-NVRTC arch=sm_XX   # must match this box
 ```
+
+`index.csv` also has `gpu_name`, `gpu_compute_cap`, `gpu_nvrtc_arch` so you can filter laptop vs SSH runs.  
+If “vs PREVIOUS” shows a **different GPU/arch**, the tok/s delta is **not** a fair code A/B.
 
 Also keep:
 

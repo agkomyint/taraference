@@ -95,6 +95,7 @@ Compare same model only (`latest_<model>.txt` / `index.csv`). Do not mix 0.5B an
 
 Report at least:
 
+- **GPU identity** — `gpu_name`, `gpu_compute_cap`, `gpu_nvrtc_arch` (logs always include these; do not A/B tok/s across different GPUs without labeling)
 - `overall_decode_tps`
 - `decode_tps_first` / `decode_tps_last` / `decode_drop_pct`
 - optional: prefill tok/s, TTFT, est. weight BW, GPU clocks/thermal notes

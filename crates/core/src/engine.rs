@@ -98,6 +98,21 @@ impl InferenceEngine {
         self.model.decode
     }
 
+    /// GPU name from CUDA (for profile logs across multi-GPU setups).
+    pub fn gpu_name(&self) -> &str {
+        &self.model.gpu_name
+    }
+
+    /// Compute capability `(major, minor)` of the loaded device.
+    pub fn compute_capability(&self) -> (i32, i32) {
+        (self.model.compute_major, self.model.compute_minor)
+    }
+
+    /// NVRTC `--gpu-architecture` used when compiling kernels (e.g. `sm_75`).
+    pub fn nvrtc_arch(&self) -> &str {
+        &self.model.nvrtc_arch
+    }
+
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tok
     }

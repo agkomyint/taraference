@@ -15,7 +15,10 @@ mod serve;
 use anyhow::{bail, Result};
 use clap::Parser;
 use download::download_models;
-use profile::{Profiler, ProfileMeta, TurnRow, MULTI_TURN_SCRIPT, PROFILE_MAX_NEW};
+use profile::{
+    enrich_gpu_info_from_smi, GpuProfileInfo, Profiler, ProfileMeta, TurnRow, MULTI_TURN_SCRIPT,
+    PROFILE_MAX_NEW,
+};
 use std::path::PathBuf;
 use taraference_core::{DecodeBackend, InferenceEngine, SessionOptions};
 
@@ -206,6 +209,15 @@ fn run_profile(engine: &mut InferenceEngine, cli: &Cli, model: &PathBuf) -> Resu
         "multi-turn"
     };
 
+    let (cc_maj, cc_min) = engine.compute_capability();
+    let mut gpu = GpuProfileInfo {
+        name: engine.gpu_name().to_string(),
+        compute_cap: format!("{cc_maj}.{cc_min}"),
+        nvrtc_arch: engine.nvrtc_arch().to_string(),
+        ..Default::default()
+    };
+    enrich_gpu_info_from_smi(&mut gpu);
+
     let meta = ProfileMeta {
         model_path: model.display().to_string(),
         cfg: engine.cfg().clone(),
@@ -214,12 +226,15 @@ fn run_profile(engine: &mut InferenceEngine, cli: &Cli, model: &PathBuf) -> Resu
         max_new,
         sample_interval_ms: 100,
         decode: engine.decode(),
+        gpu: gpu.clone(),
     };
 
     eprintln!(
-        "profile mode ({mode}) | decode={} | max_new={max_new} | turns={}",
+        "profile mode ({mode}) | decode={} | max_new={max_new} | turns={} | gpu={} ({})",
         engine.decode().name(),
-        script.len()
+        script.len(),
+        gpu.name,
+        gpu.nvrtc_arch
     );
     for (i, u) in script.iter().enumerate() {
         eprintln!("  turn {}: {u:?}", i + 1);

@@ -11,6 +11,14 @@ pub struct CudaModel {
     pub cfg: ModelConfig,
     /// Selected decode / attention backend (`--decode`).
     pub decode: DecodeBackend,
+    /// Device name from CUDA (e.g. `Tesla T4`, `NVIDIA GeForce RTX 3050 Ti …`).
+    pub gpu_name: String,
+    /// Compute capability major (e.g. 7 for T4, 8 for 3050 Ti).
+    pub compute_major: i32,
+    /// Compute capability minor (e.g. 5 → sm_75 with major 7).
+    pub compute_minor: i32,
+    /// NVRTC target used for this process (e.g. `sm_75`).
+    pub nvrtc_arch: String,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) _ctx: Arc<CudaContext>,
     pub(crate) _module: Arc<CudaModule>,

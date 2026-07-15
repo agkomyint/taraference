@@ -52,6 +52,25 @@ pub struct TurnRow {
     pub stats: TurnStats,
 }
 
+/// Static GPU identity for multi-GPU / multi-machine profile comparison.
+#[derive(Debug, Clone, Default)]
+pub struct GpuProfileInfo {
+    /// CUDA device name (authoritative for which chip ran the kernels).
+    pub name: String,
+    /// e.g. `7.5`
+    pub compute_cap: String,
+    /// e.g. `sm_75` — NVRTC target used at model load.
+    pub nvrtc_arch: String,
+    /// From nvidia-smi when available (e.g. `580.159.03`).
+    pub driver_version: String,
+    /// PCI bus id from nvidia-smi when available.
+    pub pci_bus_id: String,
+    /// UUID from nvidia-smi when available.
+    pub uuid: String,
+    /// Total VRAM MiB from nvidia-smi (static); 0 if unknown.
+    pub vram_total_mib: f32,
+}
+
 /// Static context for the report header.
 pub struct ProfileMeta {
     pub model_path: String,
@@ -61,6 +80,8 @@ pub struct ProfileMeta {
     pub max_new: usize,
     pub sample_interval_ms: u64,
     pub decode: DecodeBackend,
+    /// Which GPU this run used (name + sm_XX + driver).
+    pub gpu: GpuProfileInfo,
 }
 
 pub struct Profiler {
@@ -307,6 +328,51 @@ impl Profiler {
             meta.decode.name(),
             meta.decode.description()
         ));
+        // Always log GPU identity (multi-GPU / laptop vs cloud SSH).
+        {
+            let g = &meta.gpu;
+            let name = if g.name.is_empty() {
+                "(unknown GPU)"
+            } else {
+                g.name.as_str()
+            };
+            line(format!(
+                "    gpu       {name}  |  compute {}  |  NVRTC {}",
+                if g.compute_cap.is_empty() {
+                    "?"
+                } else {
+                    g.compute_cap.as_str()
+                },
+                if g.nvrtc_arch.is_empty() {
+                    "?"
+                } else {
+                    g.nvrtc_arch.as_str()
+                }
+            ));
+            let mut extra = Vec::new();
+            if !g.driver_version.is_empty() {
+                extra.push(format!("driver {}", g.driver_version));
+            }
+            if g.vram_total_mib > 0.0 {
+                extra.push(format!("VRAM {:.0} MiB", g.vram_total_mib));
+            } else if gmem_tot > 0.0 {
+                extra.push(format!("VRAM {:.0} MiB (smi peak total)", gmem_tot));
+            }
+            if !g.pci_bus_id.is_empty() {
+                extra.push(format!("pci {}", g.pci_bus_id));
+            }
+            if !g.uuid.is_empty() {
+                let short = if g.uuid.len() > 20 {
+                    format!("{}…", &g.uuid[..20])
+                } else {
+                    g.uuid.clone()
+                };
+                extra.push(format!("uuid {short}"));
+            }
+            if !extra.is_empty() {
+                line(format!("    gpu+      {}", extra.join("  |  ")));
+            }
+        }
         line("    kv        f16 (half bandwidth vs f32)".into());
         line(format!(
             "    sample    every {} ms  |  {} samples over {:.2}s wall (span {:.0} ms)",
@@ -421,6 +487,25 @@ impl Profiler {
             "    util   min {cpu_min:5.1}%  avg {cpu_avg:5.1}%  max {cpu_max:5.1}%"
         ));
         line("  GPU".into());
+        {
+            let g = &meta.gpu;
+            if !g.name.is_empty() || !g.nvrtc_arch.is_empty() {
+                line(format!(
+                    "    identity  {}  |  cc {}  |  {}",
+                    if g.name.is_empty() { "?" } else { g.name.as_str() },
+                    if g.compute_cap.is_empty() {
+                        "?"
+                    } else {
+                        g.compute_cap.as_str()
+                    },
+                    if g.nvrtc_arch.is_empty() {
+                        "?"
+                    } else {
+                        g.nvrtc_arch.as_str()
+                    }
+                ));
+            }
+        }
         if samples.iter().any(|s| s.gpu_mem_total_mb > 0.0) {
             line(format!(
                 "    compute  min {gpu_min:5.1}%  avg {gpu_avg:5.1}%  max {gpu_max:5.1}%"
@@ -444,7 +529,7 @@ impl Profiler {
                 ));
             }
         } else {
-            line("    (nvidia-smi unavailable — check PATH / driver)".into());
+            line("    (nvidia-smi util samples unavailable — check PATH / driver)".into());
         }
         line("────────────────────────────────────────────────────────────────".into());
         line("  READOUT / HINTS".into());
@@ -502,6 +587,28 @@ impl Profiler {
         line(format!("    model_path={}", meta.model_path));
         line(format!("    decode_backend={}", meta.decode.name()));
         line(format!("    mode={mode}"));
+        // GPU keys first-class for multi-machine A/B (T4 vs 3050 Ti, etc.)
+        line(format!(
+            "    gpu_name={}",
+            sanitize_kv_value(&meta.gpu.name)
+        ));
+        line(format!("    gpu_compute_cap={}", meta.gpu.compute_cap));
+        line(format!("    gpu_nvrtc_arch={}", meta.gpu.nvrtc_arch));
+        if !meta.gpu.driver_version.is_empty() {
+            line(format!("    gpu_driver={}", meta.gpu.driver_version));
+        }
+        if meta.gpu.vram_total_mib > 0.0 {
+            line(format!(
+                "    gpu_vram_total_mib={:.0}",
+                meta.gpu.vram_total_mib
+            ));
+        }
+        if !meta.gpu.uuid.is_empty() {
+            line(format!("    gpu_uuid={}", meta.gpu.uuid));
+        }
+        if !meta.gpu.pci_bus_id.is_empty() {
+            line(format!("    gpu_pci={}", meta.gpu.pci_bus_id));
+        }
         line(format!("    overall_decode_tps={overall_decode_tps:.3}"));
         line(format!("    overall_prefill_tps={overall_prefill_tps:.3}"));
         line(format!("    decode_tps_first={decode_tps_first:.3}"));
@@ -630,16 +737,20 @@ fn save_profile_log(
         if header_needed {
             let _ = writeln!(
                 idxf,
-                "stamp,model,decode,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx"
+                "stamp,model,decode,gpu_name,gpu_compute_cap,gpu_nvrtc_arch,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx"
             );
         }
         let (od, f1, fl, drop, ctx) = parse_summary_metrics(report);
+        let gpu_csv = sanitize_csv_field(&meta.gpu.name);
         let _ = writeln!(
             idxf,
-            "{},{},{},{},{:.3},{:.3},{:.3},{:.2},{}",
+            "{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.2},{}",
             stamp,
             model_slug,
             meta.decode.name(),
+            gpu_csv,
+            meta.gpu.compute_cap,
+            meta.gpu.nvrtc_arch,
             path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
             od,
             f1,
@@ -649,6 +760,76 @@ fn save_profile_log(
         );
     }
     Some(path)
+}
+
+/// Strip commas/newlines for SUMMARY_KV single-line values.
+fn sanitize_kv_value(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn sanitize_csv_field(s: &str) -> String {
+    let t = s.replace(',', ";").replace('\n', " ").replace('\r', " ");
+    if t.contains('"') {
+        format!("\"{}\"", t.replace('"', "\"\""))
+    } else if t.contains(' ') {
+        format!("\"{t}\"")
+    } else {
+        t
+    }
+}
+
+/// Fill driver / uuid / PCI / VRAM from nvidia-smi; name/cc/arch usually come from CUDA load.
+pub fn enrich_gpu_info_from_smi(gpu: &mut GpuProfileInfo) {
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,compute_cap,driver_version,memory.total,uuid,pci.bus_id",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    let Ok(out) = out else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return;
+    }
+    // CSV: name may contain commas rarely — nvidia usually avoids that.
+    let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+    if parts.len() < 6 {
+        return;
+    }
+    if gpu.name.is_empty() {
+        gpu.name = parts[0].to_string();
+    }
+    if gpu.compute_cap.is_empty() {
+        gpu.compute_cap = parts[1].to_string();
+        if gpu.nvrtc_arch.is_empty() {
+            if let Some((maj, min)) = parse_compute_cap(parts[1]) {
+                gpu.nvrtc_arch = format!("sm_{maj}{min}");
+            }
+        }
+    }
+    gpu.driver_version = parts[2].to_string();
+    if let Ok(mib) = parts[3].parse::<f32>() {
+        gpu.vram_total_mib = mib;
+    }
+    gpu.uuid = parts[4].to_string();
+    gpu.pci_bus_id = parts[5].to_string();
+}
+
+fn parse_compute_cap(s: &str) -> Option<(i32, i32)> {
+    let mut it = s.split('.');
+    let maj = it.next()?.parse().ok()?;
+    let min = it.next().unwrap_or("0").parse().ok()?;
+    Some((maj, min))
 }
 
 /// Previous run for this model only (`latest_<model>.txt`).
@@ -680,6 +861,17 @@ fn parse_summary_metrics(report: &str) -> (f64, f64, f64, f64, usize) {
     (od, f1, fl, drop, ctx)
 }
 
+fn parse_summary_field<'a>(report: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    for line in report.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix(&prefix) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 fn print_compare(prev: &str, curr: &str, model_slug: &str) {
     let (pod, pf1, pfl, pdrop, pctx) = parse_summary_metrics(prev);
     let (cod, cf1, cfl, cdrop, cctx) = parse_summary_metrics(curr);
@@ -694,11 +886,21 @@ fn print_compare(prev: &str, curr: &str, model_slug: &str) {
             100.0 * (b - a) / a
         }
     };
+    let prev_gpu = parse_summary_field(prev, "gpu_name").unwrap_or("?");
+    let curr_gpu = parse_summary_field(curr, "gpu_name").unwrap_or("?");
+    let prev_sm = parse_summary_field(prev, "gpu_nvrtc_arch").unwrap_or("?");
+    let curr_sm = parse_summary_field(curr, "gpu_nvrtc_arch").unwrap_or("?");
     println!();
     println!("════════════════════════════════════════════════════════════════");
     println!("  vs PREVIOUS same model  ({model_slug})");
     println!("  (latest_{model_slug}.txt)");
     println!("────────────────────────────────────────────────────────────────");
+    println!("    gpu        {prev_gpu} ({prev_sm}) → {curr_gpu} ({curr_sm})");
+    if prev_gpu != curr_gpu || prev_sm != curr_sm {
+        println!(
+            "    ⚠ different GPU/arch — tok/s delta is NOT a fair code A/B"
+        );
+    }
     println!(
         "    overall decode  {pod:.1} → {cod:.1} t/s   ({:+.1}  {:+.0}%)",
         d(pod, cod),
