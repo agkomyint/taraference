@@ -3,12 +3,42 @@
 use super::decode::{find_by_name, AttnLaunch};
 use super::kv::CudaKv;
 use super::matmul::{
-    gemm, gemv, try_gemv_global_q8, try_gemv_pair, try_gemv_q4_dual, try_gemv_qkv,
+    gemm, gemv, try_gemv_global_q8, try_gemv_pair, try_gemv_q4_dual, try_gemv_q4_ffn, try_gemv_qkv,
     GemvResidual,
 };
 use super::model::CudaModel;
 use anyhow::Result;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+fn layer_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TARAFER_LAYER_TIMING").is_some())
+}
+
+fn decode_should_skip_ffn(layer: usize, n_layer: usize) -> bool {
+    static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(spec) = SPEC.get_or_init(|| std::env::var("TARAFER_FFN_SKIP").ok()) else {
+        return false;
+    };
+    if let Ok(stride) = spec.parse::<usize>() {
+        return stride >= 2 && (layer + 1) % stride == 0;
+    }
+    if let Some(count) = spec
+        .strip_prefix("middle:")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        let count = count.min(n_layer);
+        let start = (n_layer - count) / 2;
+        return layer >= start && layer < start + count;
+    }
+    if let Some(mask) = spec.strip_prefix("mask:") {
+        return mask
+            .split(',')
+            .filter_map(|s| s.parse::<usize>().ok())
+            .any(|one_based| one_based == layer + 1);
+    }
+    false
+}
 
 /// Dimensions for one forward chunk (prefill or decode).
 pub(crate) struct ChunkDims {
@@ -35,14 +65,39 @@ pub(crate) struct ChunkDims {
 }
 
 impl CudaModel {
-    pub(crate) fn run_layer(
-        &mut self,
-        li: usize,
-        d: &ChunkDims,
-        cache: &mut CudaKv,
-    ) -> Result<()> {
+    pub(crate) fn run_layer(&mut self, li: usize, d: &ChunkDims, cache: &mut CudaKv) -> Result<()> {
+        let timing = layer_timing_enabled() && d.n_tok == 1;
+        let start = if timing {
+            Some(
+                self.stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+            )
+        } else {
+            None
+        };
         self.attn_block(li, d, cache)?;
-        self.ffn_block(li, d)?;
+        let middle = if timing {
+            Some(
+                self.stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+            )
+        } else {
+            None
+        };
+        let skip_ffn = d.n_tok == 1 && decode_should_skip_ffn(li, self.layers.len());
+        if !skip_ffn {
+            self.ffn_block(li, d)?;
+        }
+        if let (Some(start), Some(middle)) = (start, middle) {
+            let end = self
+                .stream
+                .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            eprintln!(
+                "layer_timing | layer={li} attn_ms={:.4} ffn_ms={:.4}",
+                start.elapsed_ms(&middle)?,
+                middle.elapsed_ms(&end)?
+            );
+        }
         Ok(())
     }
 
@@ -396,9 +451,15 @@ impl CudaModel {
                 self.gemv_partial_stride,
             )? {
                 gemv(
-                    &self.stream, &self.k, &self.layers[li].wo, &self.xb,
-                    &mut self.x, None, GemvResidual::InPlace,
-                    &mut self.gemv_partial, self.gemv_partial_stride,
+                    &self.stream,
+                    &self.k,
+                    &self.layers[li].wo,
+                    &self.xb,
+                    &mut self.x,
+                    None,
+                    GemvResidual::InPlace,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
                 )?;
             }
         } else {
@@ -426,6 +487,15 @@ impl CudaModel {
     }
 
     fn ffn_block(&mut self, li: usize, d: &ChunkDims) -> Result<()> {
+        let timing = layer_timing_enabled() && d.n_tok == 1;
+        let t0 = if timing {
+            Some(
+                self.stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+            )
+        } else {
+            None
+        };
         unsafe {
             self.stream
                 .launch_builder(&self.k.rms_norm)
@@ -441,31 +511,53 @@ impl CudaModel {
                     shared_mem_bytes: 0,
                 })?;
         }
+        let t1 = if timing {
+            Some(
+                self.stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+            )
+        } else {
+            None
+        };
+        let mut fused_ffn = false;
         if d.n_tok == 1 {
+            fused_ffn = try_gemv_q4_ffn(
+                &self.stream,
+                &self.k,
+                &self.layers[li].gate,
+                &self.layers[li].up,
+                &self.xb,
+                &mut self.hb,
+                &mut self.q8_x,
+                &mut self.q8_d,
+            )?;
             // gate+up often same quant (Q5_0 or Q4_K) → stage xb once.
-            if !try_gemv_q4_dual(
-                &self.stream,
-                &self.k,
-                &self.layers[li].gate,
-                &self.layers[li].up,
-                &self.xb,
-                &mut self.hb,
-                &mut self.hb2,
-                &mut self.q8_x,
-                &mut self.q8_d,
-            )? && !try_gemv_pair(
-                &self.stream,
-                &self.k,
-                &self.layers[li].gate,
-                &self.layers[li].up,
-                &self.xb,
-                &mut self.hb,
-                &mut self.hb2,
-                None,
-                None,
-                &mut self.q8_x,
-                &mut self.q8_d,
-            )? {
+            if !fused_ffn
+                && !try_gemv_q4_dual(
+                    &self.stream,
+                    &self.k,
+                    &self.layers[li].gate,
+                    &self.layers[li].up,
+                    &self.xb,
+                    &mut self.hb,
+                    &mut self.hb2,
+                    &mut self.q8_x,
+                    &mut self.q8_d,
+                )?
+                && !try_gemv_pair(
+                    &self.stream,
+                    &self.k,
+                    &self.layers[li].gate,
+                    &self.layers[li].up,
+                    &self.xb,
+                    &mut self.hb,
+                    &mut self.hb2,
+                    None,
+                    None,
+                    &mut self.q8_x,
+                    &mut self.q8_d,
+                )?
+            {
                 gemv(
                     &self.stream,
                     &self.k,
@@ -511,15 +603,33 @@ impl CudaModel {
                 self.gemv_partial_stride,
             )?;
         }
-        let ff_n = (d.n_ff_u * d.n_tok_u) as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.silu_mul)
-                .arg(&mut self.hb)
-                .arg(&self.hb2)
-                .arg(&ff_n)
-                .launch(LaunchConfig::for_num_elems((d.n_ff_u * d.n_tok_u) as u32))?;
+        let t2 = if timing {
+            Some(
+                self.stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+            )
+        } else {
+            None
+        };
+        if !fused_ffn {
+            let ff_n = (d.n_ff_u * d.n_tok_u) as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.silu_mul)
+                    .arg(&mut self.hb)
+                    .arg(&self.hb2)
+                    .arg(&ff_n)
+                    .launch(LaunchConfig::for_num_elems((d.n_ff_u * d.n_tok_u) as u32))?;
+            }
         }
+        let t3 = if timing {
+            Some(
+                self.stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+            )
+        } else {
+            None
+        };
         if d.n_tok == 1 {
             // Decode: x = x + Wdown·(silu(gate)⊙up)  (fuse residual add into GEMV).
             if !try_gemv_global_q8(
@@ -536,9 +646,15 @@ impl CudaModel {
                 self.gemv_partial_stride,
             )? {
                 gemv(
-                    &self.stream, &self.k, &self.layers[li].down, &self.hb,
-                    &mut self.x, None, GemvResidual::InPlace,
-                    &mut self.gemv_partial, self.gemv_partial_stride,
+                    &self.stream,
+                    &self.k,
+                    &self.layers[li].down,
+                    &self.hb,
+                    &mut self.x,
+                    None,
+                    GemvResidual::InPlace,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
                 )?;
             }
         } else {
@@ -561,6 +677,18 @@ impl CudaModel {
                     .arg(&residual_n)
                     .launch(LaunchConfig::for_num_elems((d.n_embd_u * d.n_tok_u) as u32))?;
             }
+        }
+        if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
+            let t4 = self
+                .stream
+                .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            eprintln!(
+                "ffn_timing | layer={li} norm_ms={:.4} gate_up_ms={:.4} act_ms={:.4} down_ms={:.4}",
+                t0.elapsed_ms(&t1)?,
+                t1.elapsed_ms(&t2)?,
+                t2.elapsed_ms(&t3)?,
+                t3.elapsed_ms(&t4)?
+            );
         }
         Ok(())
     }
@@ -747,31 +875,96 @@ impl CudaModel {
         use super::matmul::try_gemv_global_q8;
         if let Some(ref ow) = self.output {
             if !try_gemv_global_q8(
-                &self.stream, &self.k, ow, &self.xb1, &mut self.logits,
-                None, GemvResidual::None, &mut self.q8_x, &mut self.q8_d,
-                &mut self.gemv_partial, self.gemv_partial_stride,
+                &self.stream,
+                &self.k,
+                ow,
+                &self.xb1,
+                &mut self.logits,
+                None,
+                GemvResidual::None,
+                &mut self.q8_x,
+                &mut self.q8_d,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
             )? {
                 gemv(
-                    &self.stream, &self.k, ow, &self.xb1, &mut self.logits,
-                    None, GemvResidual::None, &mut self.gemv_partial,
+                    &self.stream,
+                    &self.k,
+                    ow,
+                    &self.xb1,
+                    &mut self.logits,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
                     self.gemv_partial_stride,
                 )?;
             }
         } else {
             if !try_gemv_global_q8(
-                &self.stream, &self.k, &self.token_embd, &self.xb1,
-                &mut self.logits, None, GemvResidual::None, &mut self.q8_x,
-                &mut self.q8_d, &mut self.gemv_partial,
+                &self.stream,
+                &self.k,
+                &self.token_embd,
+                &self.xb1,
+                &mut self.logits,
+                None,
+                GemvResidual::None,
+                &mut self.q8_x,
+                &mut self.q8_d,
+                &mut self.gemv_partial,
                 self.gemv_partial_stride,
             )? {
                 gemv(
-                    &self.stream, &self.k, &self.token_embd, &self.xb1,
-                    &mut self.logits, None, GemvResidual::None,
-                    &mut self.gemv_partial, self.gemv_partial_stride,
+                    &self.stream,
+                    &self.k,
+                    &self.token_embd,
+                    &self.xb1,
+                    &mut self.logits,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
                 )?;
             }
         }
-        let n_vocab = self.cfg.n_vocab as i32;
+        if let Some(ref special) = self.output_special {
+            let active = self
+                .output
+                .as_ref()
+                .map_or(self.token_embd.n_cols, |m| m.n_cols);
+            if !try_gemv_global_q8(
+                &self.stream,
+                &self.k,
+                special,
+                &self.xb1,
+                &mut self.special_logit,
+                None,
+                GemvResidual::None,
+                &mut self.q8_x,
+                &mut self.q8_d,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )? {
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    special,
+                    &self.xb1,
+                    &mut self.special_logit,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+            }
+            let mut destination = self.logits.slice_mut(active..active + 1);
+            self.stream
+                .memcpy_dtod(&self.special_logit, &mut destination)?;
+        }
+        let n_vocab = (self
+            .output
+            .as_ref()
+            .map_or(self.token_embd.n_cols, |m| m.n_cols)
+            + usize::from(self.output_special.is_some())) as i32;
         unsafe {
             self.stream
                 .launch_builder(&self.k.argmax)

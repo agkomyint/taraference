@@ -1,4 +1,5 @@
 /target
+/target-*/
 /models/**
 !/models/.gitkeep
 **/*.gguf

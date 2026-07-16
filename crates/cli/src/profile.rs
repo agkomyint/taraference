@@ -142,20 +142,18 @@ impl Profiler {
             let _ = h.join();
         }
         let elapsed = self.t0.elapsed().as_secs_f64();
-        let samples = self
-            .buf
-            .lock()
-            .map(|b| b.items.clone())
-            .unwrap_or_default();
+        let samples = self.buf.lock().map(|b| b.items.clone()).unwrap_or_default();
 
         let n_s = samples.len().max(1) as f32;
         let avg = |f: fn(&Sample) -> f32| samples.iter().map(f).sum::<f32>() / n_s;
         let maxf = |f: fn(&Sample) -> f32| {
-            samples.iter().map(f).fold(f32::NEG_INFINITY, |a, b| a.max(b))
+            samples
+                .iter()
+                .map(f)
+                .fold(f32::NEG_INFINITY, |a, b| a.max(b))
         };
-        let minf = |f: fn(&Sample) -> f32| {
-            samples.iter().map(f).fold(f32::INFINITY, |a, b| a.min(b))
-        };
+        let minf =
+            |f: fn(&Sample) -> f32| samples.iter().map(f).fold(f32::INFINITY, |a, b| a.min(b));
 
         let cpu_avg = avg(|s| s.cpu_pct);
         let cpu_max = maxf(|s| s.cpu_pct);
@@ -205,12 +203,12 @@ impl Profiler {
         let final_ctx = turns.last().map(|t| t.stats.ctx_len).unwrap_or(0);
         let first_prefill = turns.first().map(|t| t.stats.prefill_ms).unwrap_or(0.0);
         let later_prefill_avg = if turns.len() > 1 {
-            turns[1..].iter().map(|t| t.stats.prefill_ms).sum::<f64>()
-                / (turns.len() - 1) as f64
+            turns[1..].iter().map(|t| t.stats.prefill_ms).sum::<f64>() / (turns.len() - 1) as f64
         } else {
             0.0
         };
-        let avg_ttft = turns.iter().map(|t| t.stats.ttft_ms).sum::<f64>() / turns.len().max(1) as f64;
+        let avg_ttft =
+            turns.iter().map(|t| t.stats.ttft_ms).sum::<f64>() / turns.len().max(1) as f64;
         let max_ttft = turns
             .iter()
             .map(|t| t.stats.ttft_ms)
@@ -289,11 +287,7 @@ impl Profiler {
         };
 
         let host = sample_host_mem();
-        let sample_span = samples
-            .last()
-            .map(|s| s.t_ms)
-            .unwrap_or(0.0)
-            .max(0.0);
+        let sample_span = samples.last().map(|s| s.t_ms).unwrap_or(0.0).max(0.0);
 
         let stamp = local_timestamp();
         let mut report = String::with_capacity(8 * 1024);
@@ -385,7 +379,17 @@ impl Profiler {
         line("  PER-TURN".into());
         line(format!(
             "  {:>4} {:>7} {:>7} {:>6} {:>5} {:>5} {:>5} {:>5} {:>6} {:>4} {}",
-            "turn", "prefill", "decode", "ttft", "pTok", "gTok", "ctx0", "ctx", "stop", "cap", "user"
+            "turn",
+            "prefill",
+            "decode",
+            "ttft",
+            "pTok",
+            "gTok",
+            "ctx0",
+            "ctx",
+            "stop",
+            "cap",
+            "user"
         ));
         for t in turns {
             let user_short = if t.user.chars().count() > 36 {
@@ -492,7 +496,11 @@ impl Profiler {
             if !g.name.is_empty() || !g.nvrtc_arch.is_empty() {
                 line(format!(
                     "    identity  {}  |  cc {}  |  {}",
-                    if g.name.is_empty() { "?" } else { g.name.as_str() },
+                    if g.name.is_empty() {
+                        "?"
+                    } else {
+                        g.name.as_str()
+                    },
                     if g.compute_cap.is_empty() {
                         "?"
                     } else {
@@ -572,7 +580,9 @@ impl Profiler {
             ));
         }
         if gpu_avg < 40.0 && overall_decode_tps > 0.0 {
-            line("    • Low GPU util → launch-bound or CPU-bound; fuse kernels / less sync.".into());
+            line(
+                "    • Low GPU util → launch-bound or CPU-bound; fuse kernels / less sync.".into(),
+            );
         } else if gpu_avg > 85.0 {
             line("    • High GPU util → optimize matmul/attention bandwidth next.".into());
         }
@@ -709,10 +719,7 @@ fn save_profile_log(
 ) -> Option<PathBuf> {
     fs::create_dir_all(PROFILE_LOG_DIR).ok()?;
     // profile_<stamp>_<model>_<decode>.txt
-    let fname = format!(
-        "profile_{stamp}_{model_slug}_{}.txt",
-        meta.decode.name()
-    );
+    let fname = format!("profile_{stamp}_{model_slug}_{}.txt", meta.decode.name());
     let path = Path::new(PROFILE_LOG_DIR).join(&fname);
     // Avoid clobber if two runs share the same second.
     let path = if path.exists() {
@@ -897,9 +904,7 @@ fn print_compare(prev: &str, curr: &str, model_slug: &str) {
     println!("────────────────────────────────────────────────────────────────");
     println!("    gpu        {prev_gpu} ({prev_sm}) → {curr_gpu} ({curr_sm})");
     if prev_gpu != curr_gpu || prev_sm != curr_sm {
-        println!(
-            "    ⚠ different GPU/arch — tok/s delta is NOT a fair code A/B"
-        );
+        println!("    ⚠ different GPU/arch — tok/s delta is NOT a fair code A/B");
     }
     println!(
         "    overall decode  {pod:.1} → {cod:.1} t/s   ({:+.1}  {:+.0}%)",

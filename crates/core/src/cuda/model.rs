@@ -34,6 +34,11 @@ pub struct CudaModel {
     pub(crate) token_embd: GpuMat,
     pub(crate) output_norm: CudaSlice<f32>,
     pub(crate) output: Option<GpuMat>,
+    /// One full-vocabulary special-token column retained when an approximate
+    /// active-vocabulary prefix is enabled. This keeps ChatML termination
+    /// reachable without paying for the entire output head.
+    pub(crate) output_special: Option<GpuMat>,
+    pub(crate) output_special_id: Option<u32>,
     pub(crate) layers: Vec<GpuLayer>,
     // batch workspace [MAX_BATCH, …]
     pub(crate) x: CudaSlice<f32>,
@@ -47,7 +52,10 @@ pub struct CudaModel {
     pub(crate) x1: CudaSlice<f32>,
     pub(crate) xb1: CudaSlice<f32>,
     pub(crate) logits: CudaSlice<f32>,
+    pub(crate) special_logit: CudaSlice<f32>,
+    pub(crate) logits_batch: CudaSlice<f32>,
     pub(crate) argmax_buf: CudaSlice<i32>,
+    pub(crate) argmax_batch: CudaSlice<i32>,
     pub(crate) tok_buf: CudaSlice<i32>,
     /// Decode activation quantization arena, reused by fused Q4 projections.
     pub(crate) q8_x: CudaSlice<i8>,

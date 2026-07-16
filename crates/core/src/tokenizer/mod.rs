@@ -47,9 +47,7 @@ impl Tokenizer {
                 let mut m = HashMap::with_capacity(items.len());
                 for (rank, v) in items.iter().enumerate() {
                     let s = v.as_str().ok_or_else(|| anyhow!("merge not string"))?;
-                    let (a, b) = s
-                        .split_once(' ')
-                        .ok_or_else(|| anyhow!("bad merge: {s}"))?;
+                    let (a, b) = s.split_once(' ').ok_or_else(|| anyhow!("bad merge: {s}"))?;
                     m.insert((a.to_string(), b.to_string()), rank as u32);
                 }
                 (m, false)
@@ -59,25 +57,33 @@ impl Tokenizer {
             _ => (HashMap::new(), true),
         };
         let scores = match gguf.metadata.get("tokenizer.ggml.scores") {
-            Some(Value::Array { items, .. }) => items
-                .iter()
-                .map(|v| v.as_f32().unwrap_or(-100.0))
-                .collect(),
+            Some(Value::Array { items, .. }) => {
+                items.iter().map(|v| v.as_f32().unwrap_or(-100.0)).collect()
+            }
             _ => vec![0.0; tokens.len()],
         };
         let max_piece_bytes = tokens.iter().map(|t| t.len()).max().unwrap_or(1);
 
         let bos_id = gguf
             .meta_u32("tokenizer.ggml.bos_token_id")
-            .or_else(|| gguf.meta_u64("tokenizer.ggml.bos_token_id").map(|v| v as u32))
+            .or_else(|| {
+                gguf.meta_u64("tokenizer.ggml.bos_token_id")
+                    .map(|v| v as u32)
+            })
             .unwrap_or(0);
         let eos_id = gguf
             .meta_u32("tokenizer.ggml.eos_token_id")
-            .or_else(|| gguf.meta_u64("tokenizer.ggml.eos_token_id").map(|v| v as u32))
+            .or_else(|| {
+                gguf.meta_u64("tokenizer.ggml.eos_token_id")
+                    .map(|v| v as u32)
+            })
             .unwrap_or(0);
         let unk_id = gguf
             .meta_u32("tokenizer.ggml.unknown_token_id")
-            .or_else(|| gguf.meta_u64("tokenizer.ggml.unknown_token_id").map(|v| v as u32))
+            .or_else(|| {
+                gguf.meta_u64("tokenizer.ggml.unknown_token_id")
+                    .map(|v| v as u32)
+            })
             .unwrap_or(0);
         let add_bos = gguf
             .metadata

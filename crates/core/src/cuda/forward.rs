@@ -3,7 +3,7 @@
 use super::kv::CudaKv;
 use super::layer::ChunkDims;
 use super::model::CudaModel;
-use super::types::MAX_BATCH;
+use super::types::{MAX_BATCH, MAX_VERIFY_TOKENS};
 use anyhow::{bail, Context, Result};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::PushKernelArg;
@@ -41,7 +41,7 @@ impl CudaModel {
 
         self.stream.synchronize().context("cuda sync")?;
         let idx = self.stream.clone_dtoh(&self.argmax_buf)?;
-        Ok(idx[0] as u32)
+        Ok(self.map_output_id(idx[0] as u32))
     }
 
     /// Single-token decode with optional CUDA graph replay.
@@ -76,7 +76,19 @@ impl CudaModel {
         cache.len += 1;
         self.stream.synchronize().context("cuda sync")?;
         let idx = self.stream.clone_dtoh(&self.argmax_buf)?;
-        Ok(idx[0] as u32)
+        Ok(self.map_output_id(idx[0] as u32))
+    }
+
+    fn map_output_id(&self, id: u32) -> u32 {
+        let active = self
+            .output
+            .as_ref()
+            .map_or(self.token_embd.n_cols, |m| m.n_cols) as u32;
+        if id == active {
+            self.output_special_id.unwrap_or(id)
+        } else {
+            id
+        }
     }
 
     /// Capture a single-token decode graph. Call after at least one eager decode.
@@ -178,11 +190,7 @@ impl CudaModel {
 
     /// Multi-token forward returning greedy argmax at each position.
     /// Retained as the verification primitive for a future model-based speculator.
-    pub fn forward_greedy_all(
-        &mut self,
-        tokens: &[u32],
-        cache: &mut CudaKv,
-    ) -> Result<Vec<u32>> {
+    pub fn forward_greedy_all(&mut self, tokens: &[u32], cache: &mut CudaKv) -> Result<Vec<u32>> {
         if tokens.is_empty() {
             bail!("empty tokens");
         }
@@ -195,107 +203,83 @@ impl CudaModel {
         let mut out = Vec::with_capacity(tokens.len());
         let mut offset = 0usize;
         while offset < tokens.len() {
-            let n = (tokens.len() - offset).min(MAX_BATCH);
+            let n = (tokens.len() - offset).min(MAX_VERIFY_TOKENS);
             let chunk = &tokens[offset..offset + n];
             let pos0 = cache.len + offset;
             self.forward_chunk(chunk, pos0, false, false, cache)?;
-            for t in 0..n {
-                self.logits_at_row(t, n)?;
-                self.stream.synchronize()?;
-                let idx = self.stream.clone_dtoh(&self.argmax_buf)?;
-                out.push(idx[0] as u32);
-            }
+            out.extend(self.logits_for_rows(n)?);
             offset += n;
         }
         cache.len += tokens.len();
         Ok(out)
     }
 
-    fn logits_at_row(&mut self, row: usize, n_tok: usize) -> Result<()> {
+    fn logits_for_rows(&mut self, n_tok: usize) -> Result<Vec<u32>> {
+        if n_tok == 0 || n_tok > MAX_VERIFY_TOKENS {
+            bail!("verification batch {n_tok} exceeds {MAX_VERIFY_TOKENS}");
+        }
         let n_embd = self.cfg.n_embd as i32;
-        let n_embd_u = self.cfg.n_embd;
-        let row_i = row as i32;
-        let _ = n_tok;
+        let n_tok_i = n_tok as i32;
+        let eps = self.cfg.rms_eps;
         unsafe {
-            // copy_last with n_tok = row+1 copies x[row] into x1.
-            self.stream
-                .launch_builder(&self.k.copy_last)
-                .arg(&self.x)
-                .arg(&mut self.x1)
-                .arg(&(row_i + 1))
-                .arg(&n_embd)
-                .launch(cudarc::driver::LaunchConfig::for_num_elems(n_embd_u as u32))?;
-            let one = 1i32;
-            let eps = self.cfg.rms_eps;
             self.stream
                 .launch_builder(&self.k.rms_norm)
-                .arg(&self.x1)
+                .arg(&self.x)
                 .arg(&self.output_norm)
-                .arg(&mut self.xb1)
+                .arg(&mut self.xb)
                 .arg(&n_embd)
-                .arg(&one)
+                .arg(&n_tok_i)
                 .arg(&eps)
                 .launch(cudarc::driver::LaunchConfig {
-                    grid_dim: (1, 1, 1),
+                    grid_dim: (n_tok as u32, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
         }
-        use super::matmul::{gemv, try_gemv_global_q8, GemvResidual};
+        use super::matmul::gemm;
         if let Some(ref ow) = self.output {
-            if !try_gemv_global_q8(
+            gemm(
                 &self.stream,
                 &self.k,
                 ow,
-                &self.xb1,
-                &mut self.logits,
-                None,
-                GemvResidual::None,
-                &mut self.q8_x,
-                &mut self.q8_d,
+                &self.xb,
+                &mut self.logits_batch,
+                n_tok_i,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
-            )? {
-                gemv(
-                    &self.stream, &self.k, ow, &self.xb1, &mut self.logits, None,
-                    GemvResidual::None, &mut self.gemv_partial, self.gemv_partial_stride,
-                )?;
-            }
+            )?;
         } else {
-            if !try_gemv_global_q8(
+            gemm(
                 &self.stream,
                 &self.k,
                 &self.token_embd,
-                &self.xb1,
-                &mut self.logits,
-                None,
-                GemvResidual::None,
-                &mut self.q8_x,
-                &mut self.q8_d,
+                &self.xb,
+                &mut self.logits_batch,
+                n_tok_i,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
-            )? {
-                gemv(
-                    &self.stream, &self.k, &self.token_embd, &self.xb1,
-                    &mut self.logits, None, GemvResidual::None,
-                    &mut self.gemv_partial, self.gemv_partial_stride,
-                )?;
-            }
+            )?;
         }
-        let n_vocab = self.cfg.n_vocab as i32;
+        let n_vocab = self
+            .output
+            .as_ref()
+            .map_or(self.token_embd.n_cols, |m| m.n_cols) as i32;
         unsafe {
             self.stream
-                .launch_builder(&self.k.argmax)
-                .arg(&self.logits)
+                .launch_builder(&self.k.argmax_rows)
+                .arg(&self.logits_batch)
                 .arg(&n_vocab)
-                .arg(&mut self.argmax_buf)
+                .arg(&n_tok_i)
+                .arg(&mut self.argmax_batch)
                 .launch(cudarc::driver::LaunchConfig {
-                    grid_dim: (1, 1, 1),
+                    grid_dim: (n_tok as u32, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(())
+        self.stream.synchronize()?;
+        let ids = self.stream.clone_dtoh(&self.argmax_batch)?;
+        Ok(ids[..n_tok].iter().map(|&id| id as u32).collect())
     }
 
     fn forward_chunk(

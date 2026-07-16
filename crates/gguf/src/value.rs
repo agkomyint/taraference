@@ -129,7 +129,11 @@ impl Value {
                 }
             }
             Value::Array { item_type, items } => {
-                format!("array[{}; {} items]", format_value_type(*item_type), items.len())
+                format!(
+                    "array[{}; {} items]",
+                    format_value_type(*item_type),
+                    items.len()
+                )
             }
             Value::U64(v) => v.to_string(),
             Value::I64(v) => v.to_string(),
@@ -185,31 +189,46 @@ pub fn read_value<R: Read>(r: &mut R, ty: ValueType) -> Result<Value> {
         ValueType::I8 => Value::I8(r.read_i8().map_err(|_| GgufError::UnexpectedEof {
             context: "i8 value",
         })?),
-        ValueType::U16 => Value::U16(r.read_u16::<LittleEndian>().map_err(|_| {
-            GgufError::UnexpectedEof {
-                context: "u16 value",
-            }
-        })?),
-        ValueType::I16 => Value::I16(r.read_i16::<LittleEndian>().map_err(|_| {
-            GgufError::UnexpectedEof {
-                context: "i16 value",
-            }
-        })?),
-        ValueType::U32 => Value::U32(r.read_u32::<LittleEndian>().map_err(|_| {
-            GgufError::UnexpectedEof {
-                context: "u32 value",
-            }
-        })?),
-        ValueType::I32 => Value::I32(r.read_i32::<LittleEndian>().map_err(|_| {
-            GgufError::UnexpectedEof {
-                context: "i32 value",
-            }
-        })?),
-        ValueType::F32 => Value::F32(r.read_f32::<LittleEndian>().map_err(|_| {
-            GgufError::UnexpectedEof {
-                context: "f32 value",
-            }
-        })?),
+        ValueType::U16 => {
+            Value::U16(
+                r.read_u16::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "u16 value",
+                    })?,
+            )
+        }
+        ValueType::I16 => {
+            Value::I16(
+                r.read_i16::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "i16 value",
+                    })?,
+            )
+        }
+        ValueType::U32 => {
+            Value::U32(
+                r.read_u32::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "u32 value",
+                    })?,
+            )
+        }
+        ValueType::I32 => {
+            Value::I32(
+                r.read_i32::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "i32 value",
+                    })?,
+            )
+        }
+        ValueType::F32 => {
+            Value::F32(
+                r.read_f32::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "f32 value",
+                    })?,
+            )
+        }
         ValueType::Bool => {
             let b = r.read_u8().map_err(|_| GgufError::UnexpectedEof {
                 context: "bool value",
@@ -218,17 +237,17 @@ pub fn read_value<R: Read>(r: &mut R, ty: ValueType) -> Result<Value> {
         }
         ValueType::String => Value::String(read_string(r)?),
         ValueType::Array => {
-            let item_ty_id = r.read_u32::<LittleEndian>().map_err(|_| {
-                GgufError::UnexpectedEof {
-                    context: "array item type",
-                }
-            })?;
+            let item_ty_id =
+                r.read_u32::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "array item type",
+                    })?;
             let item_type = ValueType::from_u32(item_ty_id)?;
-            let n = r.read_u64::<LittleEndian>().map_err(|_| {
-                GgufError::UnexpectedEof {
+            let n = r
+                .read_u64::<LittleEndian>()
+                .map_err(|_| GgufError::UnexpectedEof {
                     context: "array length",
-                }
-            })?;
+                })?;
             if n > 10_000_000 {
                 return Err(GgufError::Malformed(format!(
                     "array length {n} is unreasonably large"
@@ -240,20 +259,29 @@ pub fn read_value<R: Read>(r: &mut R, ty: ValueType) -> Result<Value> {
             }
             Value::Array { item_type, items }
         }
-        ValueType::U64 => Value::U64(r.read_u64::<LittleEndian>().map_err(|_| {
-            GgufError::UnexpectedEof {
-                context: "u64 value",
-            }
-        })?),
-        ValueType::I64 => Value::I64(r.read_i64::<LittleEndian>().map_err(|_| {
-            GgufError::UnexpectedEof {
-                context: "i64 value",
-            }
-        })?),
-        ValueType::F64 => Value::F64(r.read_f64::<LittleEndian>().map_err(|_| {
-            GgufError::UnexpectedEof {
-                context: "f64 value",
-            }
-        })?),
+        ValueType::U64 => {
+            Value::U64(
+                r.read_u64::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "u64 value",
+                    })?,
+            )
+        }
+        ValueType::I64 => {
+            Value::I64(
+                r.read_i64::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "i64 value",
+                    })?,
+            )
+        }
+        ValueType::F64 => {
+            Value::F64(
+                r.read_f64::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "f64 value",
+                    })?,
+            )
+        }
     })
 }

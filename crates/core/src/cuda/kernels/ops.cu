@@ -280,6 +280,36 @@ extern "C" __global__ void argmax_f32(
     if (threadIdx.x == 0) out_idx[0] = sbest_i[0];
 }
 
+extern "C" __global__ void argmax_rows_f32(
+    const float* __restrict__ x,
+    int n_cols,
+    int n_rows,
+    int* __restrict__ out_idx
+) {
+    int row = (int)blockIdx.x;
+    if (row >= n_rows) return;
+    x += (size_t)row * (size_t)n_cols;
+    __shared__ float sbest_v[256];
+    __shared__ int sbest_i[256];
+    float best_v = -1e30f;
+    int best_i = 0;
+    for (int i = (int)threadIdx.x; i < n_cols; i += (int)blockDim.x) {
+        float v = x[i];
+        if (v > best_v) { best_v = v; best_i = i; }
+    }
+    sbest_v[threadIdx.x] = best_v;
+    sbest_i[threadIdx.x] = best_i;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s && sbest_v[threadIdx.x + s] > sbest_v[threadIdx.x]) {
+            sbest_v[threadIdx.x] = sbest_v[threadIdx.x + s];
+            sbest_i[threadIdx.x] = sbest_i[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out_idx[row] = sbest_i[0];
+}
+
 extern "C" __global__ void copy_last_row(
     const float* __restrict__ src,
     float* __restrict__ dst,

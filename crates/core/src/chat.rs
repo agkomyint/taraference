@@ -53,10 +53,7 @@ impl ChatMessage {
 ///
 /// Ends with `<|im_start|>assistant\n` so the model continues as assistant.
 /// If there is no system message, a default is injected when `default_system` is set.
-pub fn format_chatml(
-    messages: &[ChatMessage],
-    default_system: Option<&str>,
-) -> String {
+pub fn format_chatml(messages: &[ChatMessage], default_system: Option<&str>) -> String {
     let has_system = messages.iter().any(|m| m.role == ChatRole::System);
     let mut out = String::new();
 

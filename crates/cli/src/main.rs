@@ -16,7 +16,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use download::download_models;
 use profile::{
-    enrich_gpu_info_from_smi, GpuProfileInfo, Profiler, ProfileMeta, TurnRow, MULTI_TURN_SCRIPT,
+    enrich_gpu_info_from_smi, GpuProfileInfo, ProfileMeta, Profiler, TurnRow, MULTI_TURN_SCRIPT,
     PROFILE_MAX_NEW,
 };
 use std::path::PathBuf;
@@ -92,7 +92,10 @@ fn main() -> Result<()> {
     if argv.len() >= 2 {
         match argv[1].as_str() {
             "update" | "--update" => {
-                let tag = argv.get(2).map(|s| s.as_str()).filter(|s| !s.starts_with('-'));
+                let tag = argv
+                    .get(2)
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.starts_with('-'));
                 // Optional: tarafer update --install  → also land in ~/.local/bin
                 let also_install = argv.iter().any(|a| a == "--install" || a == "install");
                 if also_install {
@@ -159,13 +162,8 @@ fn main() -> Result<()> {
     }
 
     let cuda_graph = !cli.no_cuda_graph;
-    let mut engine = InferenceEngine::load_with_flags(
-        &model,
-        cli.decode,
-        cli.ctx,
-        cli.max_new,
-        cuda_graph,
-    )?;
+    let mut engine =
+        InferenceEngine::load_with_flags(&model, cli.decode, cli.ctx, cli.max_new, cuda_graph)?;
 
     if cli.profile {
         run_profile(&mut engine, &cli, &model)?;
@@ -205,13 +203,8 @@ fn run_serve(cli: &Cli, model: &PathBuf, port: u16) -> Result<()> {
     );
 
     let cuda_graph = !cli.no_cuda_graph;
-    let engine = InferenceEngine::load_with_flags(
-        model,
-        cli.decode,
-        cli.ctx,
-        cli.max_new,
-        cuda_graph,
-    )?;
+    let engine =
+        InferenceEngine::load_with_flags(model, cli.decode, cli.ctx, cli.max_new, cuda_graph)?;
     tracing::info!(
         model_id = %engine.model_id,
         weight_gib = format!("{:.2}", engine.weight_gib),

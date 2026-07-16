@@ -37,7 +37,10 @@ impl ModelConfig {
         let n_head = u(p("attention.head_count"))? as usize;
         let n_head_kv = gguf
             .meta_u32(&p("attention.head_count_kv"))
-            .or_else(|| gguf.meta_u64(&p("attention.head_count_kv")).map(|v| v as u32))
+            .or_else(|| {
+                gguf.meta_u64(&p("attention.head_count_kv"))
+                    .map(|v| v as u32)
+            })
             .unwrap_or(n_head as u32) as usize;
         let attention_head_dim = gguf
             .meta_u32(&p("attention.key_length"))
@@ -45,7 +48,10 @@ impl ModelConfig {
             .unwrap_or((n_embd / n_head) as u32) as usize;
         let value_head_dim = gguf
             .meta_u32(&p("attention.value_length"))
-            .or_else(|| gguf.meta_u64(&p("attention.value_length")).map(|v| v as u32))
+            .or_else(|| {
+                gguf.meta_u64(&p("attention.value_length"))
+                    .map(|v| v as u32)
+            })
             .unwrap_or(attention_head_dim as u32) as usize;
         if value_head_dim != attention_head_dim {
             anyhow::bail!(

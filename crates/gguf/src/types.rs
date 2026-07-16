@@ -109,7 +109,13 @@ impl GgmlType {
     /// Block size (number of elements) for block-quantized types.
     pub fn block_size(self) -> usize {
         match self {
-            Self::F32 | Self::F16 | Self::Bf16 | Self::I8 | Self::I16 | Self::I32 | Self::I64
+            Self::F32
+            | Self::F16
+            | Self::Bf16
+            | Self::I8
+            | Self::I16
+            | Self::I32
+            | Self::I64
             | Self::F64 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::Q2_K
@@ -137,12 +143,12 @@ impl GgmlType {
             Self::F16 | Self::Bf16 | Self::I16 => 2,
             Self::F64 | Self::I64 => 8,
             Self::I8 => 1,
-            Self::Q4_0 => 18,  // 2 + 16
-            Self::Q4_1 => 20,  // 2 + 2 + 16
-            Self::Q5_0 => 22,  // 2 + 4 + 16
-            Self::Q5_1 => 24,  // 2 + 2 + 4 + 16
-            Self::Q8_0 => 34,  // 2 + 32
-            Self::Q8_1 => 36,  // 4 + 32? (ggml: 32 + 4 scale/min)
+            Self::Q4_0 => 18, // 2 + 16
+            Self::Q4_1 => 20, // 2 + 2 + 16
+            Self::Q5_0 => 22, // 2 + 4 + 16
+            Self::Q5_1 => 24, // 2 + 2 + 4 + 16
+            Self::Q8_0 => 34, // 2 + 32
+            Self::Q8_1 => 36, // 4 + 32? (ggml: 32 + 4 scale/min)
             Self::Q2_K => 84,
             Self::Q3_K => 110,
             Self::Q4_K => 144,
@@ -193,4 +199,3 @@ impl GgufTensorInfo {
         self.ggml_type.nbytes(self.n_elements())
     }
 }
-

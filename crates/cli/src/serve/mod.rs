@@ -361,7 +361,8 @@ fn stream_chat(
         }
     });
 
-    let stream = ReceiverStream::new(rx).map(|data| Ok::<_, Infallible>(Event::default().data(data)));
+    let stream =
+        ReceiverStream::new(rx).map(|data| Ok::<_, Infallible>(Event::default().data(data)));
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 

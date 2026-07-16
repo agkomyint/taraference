@@ -1,24 +1,8 @@
 
 __device__ __forceinline__ float half_to_float(unsigned short h) {
-    unsigned int sign = ((unsigned int)h >> 15) & 1u;
-    unsigned int exp  = ((unsigned int)h >> 10) & 0x1fu;
-    unsigned int mant = (unsigned int)h & 0x3ffu;
-    unsigned int f;
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign << 31;
-        } else {
-            exp = 127 - 15 + 1;
-            while ((mant & 0x400u) == 0u) { mant <<= 1; exp--; }
-            mant &= 0x3ffu;
-            f = (sign << 31) | (exp << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        f = (sign << 31) | 0x7f800000u | (mant << 13);
-    } else {
-        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-    return __int_as_float(f);
+    float out;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(out) : "h"(h));
+    return out;
 }
 
 // Round-to-nearest-even-ish f32→f16 for KV store (2× less attention bandwidth).
@@ -118,6 +102,63 @@ __device__ __forceinline__ void dequant_q5_0_block(
         out32[j] = (float)(x0 - 16) * d;
         out32[j + 16] = (float)(x1 - 16) * d;
     }
+}
+
+// Q5_K: 256 vals / block, 176 bytes (fp16 d/dmin + 12B scales + 32B qh + 128B qs)
+__device__ void dequant_q5_k_block_smem(
+    const unsigned char* base, float* smem, int tid, int nthreads
+) {
+    float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+    float minv = half_to_float((unsigned short)(base[2] | (base[3] << 8)));
+    const unsigned char* scales = base + 4;
+    const unsigned char* qh = base + 16;
+    const unsigned char* qs = base + 48;
+    for (int g = 0; g < 4; g++) {
+        unsigned char sc0, m0, sc1, m1;
+        get_scale_min_k4(2 * g, scales, &sc0, &m0);
+        get_scale_min_k4(2 * g + 1, scales, &sc1, &m1);
+        float d0 = d * (float)sc0, dm0 = minv * (float)m0;
+        float d1 = d * (float)sc1, dm1 = minv * (float)m1;
+        unsigned char hm0 = (unsigned char)(1u << (2 * g));
+        unsigned char hm1 = (unsigned char)(2u << (2 * g));
+        for (int l = tid; l < 32; l += nthreads) {
+            unsigned char q = qs[g * 32 + l];
+            int v0 = (int)(q & 0x0f) + ((qh[l] & hm0) ? 16 : 0);
+            int v1 = (int)(q >> 4) + ((qh[l] & hm1) ? 16 : 0);
+            smem[g * 64 + l] = d0 * (float)v0 - dm0;
+            smem[g * 64 + 32 + l] = d1 * (float)v1 - dm1;
+        }
+    }
+}
+
+__device__ __forceinline__ float dot_q5_k_block_f32(
+    const unsigned char* base, const float* x
+) {
+    float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+    float minv = half_to_float((unsigned short)(base[2] | (base[3] << 8)));
+    const unsigned char* scales = base + 4;
+    const unsigned char* qh = base + 16;
+    const unsigned char* qs = base + 48;
+    float acc = 0.f;
+    #pragma unroll
+    for (int g = 0; g < 4; g++) {
+        unsigned char sc0, m0, sc1, m1;
+        get_scale_min_k4(2 * g, scales, &sc0, &m0);
+        get_scale_min_k4(2 * g + 1, scales, &sc1, &m1);
+        float d0 = d * (float)sc0, dm0 = minv * (float)m0;
+        float d1 = d * (float)sc1, dm1 = minv * (float)m1;
+        unsigned char hm0 = (unsigned char)(1u << (2 * g));
+        unsigned char hm1 = (unsigned char)(2u << (2 * g));
+        #pragma unroll
+        for (int l = 0; l < 32; l++) {
+            unsigned char q = qs[g * 32 + l];
+            int v0 = (int)(q & 0x0f) + ((qh[l] & hm0) ? 16 : 0);
+            int v1 = (int)(q >> 4) + ((qh[l] & hm1) ? 16 : 0);
+            acc += (d0 * (float)v0 - dm0) * x[g * 64 + l];
+            acc += (d1 * (float)v1 - dm1) * x[g * 64 + 32 + l];
+        }
+    }
+    return acc;
 }
 
 __device__ void dequant_q6_k_block_smem(

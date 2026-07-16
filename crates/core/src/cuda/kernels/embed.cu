@@ -155,6 +155,47 @@ extern "C" __global__ void embed_q5_0_one_d(
     }
 }
 
+extern "C" __global__ void embed_q5_k_one(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    int token,
+    int n_rows,
+    int col_bytes
+) {
+    const unsigned char* col = table + (size_t)token * (size_t)col_bytes;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    __shared__ float dq[256];
+    int nb = n_rows / 256;
+    for (int bi = 0; bi < nb; bi++) {
+        dequant_q5_k_block_smem(col + bi * 176, dq, tid, nt);
+        __syncthreads();
+        for (int i = tid; i < 256; i += nt) out[bi * 256 + i] = dq[i];
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void embed_q5_k_one_d(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    const int* __restrict__ token_ptr,
+    int n_rows,
+    int col_bytes
+) {
+    int token = token_ptr[0];
+    const unsigned char* col = table + (size_t)token * (size_t)col_bytes;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    __shared__ float dq[256];
+    int nb = n_rows / 256;
+    for (int bi = 0; bi < nb; bi++) {
+        dequant_q5_k_block_smem(col + bi * 176, dq, tid, nt);
+        __syncthreads();
+        for (int i = tid; i < 256; i += nt) out[bi * 256 + i] = dq[i];
+        __syncthreads();
+    }
+}
+
 // Prefill embed: one block per token, warp dequants column into out[t*n_rows]
 extern "C" __global__ void embed_q4_k(
     const unsigned char* __restrict__ table,
@@ -248,5 +289,30 @@ extern "C" __global__ void embed_q5_0(
         dequant_q5_0_block(col + bi * 22, dq);
         int yo = bi * 32;
         for (int j = 0; j < 32; j++) dst[yo + j] = dq[j];
+    }
+}
+
+extern "C" __global__ void embed_q5_k(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    const int* __restrict__ tokens,
+    int n_tok,
+    int n_rows,
+    int col_bytes
+) {
+    int t = (int)blockIdx.x;
+    if (t >= n_tok) return;
+    int token = tokens[t];
+    const unsigned char* col = table + (size_t)token * (size_t)col_bytes;
+    float* dst = out + (size_t)t * (size_t)n_rows;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    __shared__ float dq[256];
+    int nb = n_rows / 256;
+    for (int bi = 0; bi < nb; bi++) {
+        dequant_q5_k_block_smem(col + bi * 176, dq, tid, nt);
+        __syncthreads();
+        for (int i = tid; i < 256; i += nt) dst[bi * 256 + i] = dq[i];
+        __syncthreads();
     }
 }

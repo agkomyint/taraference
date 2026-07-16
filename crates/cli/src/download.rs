@@ -90,10 +90,7 @@ fn hf_url(repo: &str, remote_file: &str) -> String {
 /// Print catalog to stderr (for `--download list`).
 pub fn print_model_catalog() {
     eprintln!("Supported GGUF downloads (Qwen2.5 Instruct Q4_K_M via bartowski):\n");
-    eprintln!(
-        "  {:6}  {:6}  {:40}  {}",
-        "tag", "class", "file", "note"
-    );
+    eprintln!("  {:6}  {:6}  {:40}  {}", "tag", "class", "file", "note");
     eprintln!("  {}", "-".repeat(90));
     for m in SUPPORTED_MODELS {
         let class = match m.size {
@@ -166,9 +163,7 @@ pub fn select_models(which: &str) -> Result<Vec<&'static ModelSpec>> {
         "large" | "big" | "larger" => Some(
             SUPPORTED_MODELS
                 .iter()
-                .filter(|m| {
-                    m.size == ModelSizeClass::Medium || m.size == ModelSizeClass::Large
-                })
+                .filter(|m| m.size == ModelSizeClass::Medium || m.size == ModelSizeClass::Large)
                 .collect(),
         ),
         "profile" | "ladder" => Some(
@@ -202,10 +197,7 @@ pub fn select_models(which: &str) -> Result<Vec<&'static ModelSpec>> {
                     out.push(spec);
                 }
             }
-            None => bail!(
-                "unknown download target {part:?}; {}",
-                known_tags_hint()
-            ),
+            None => bail!("unknown download target {part:?}; {}", known_tags_hint()),
         }
     }
     if out.is_empty() {
@@ -264,16 +256,15 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
 
     // Optional HF token for rate limits / private repos.
     let mut req = agent.get(url);
-    if let Ok(token) = std::env::var("HF_TOKEN").or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+    if let Ok(token) =
+        std::env::var("HF_TOKEN").or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
     {
         if !token.is_empty() {
             req = req.set("Authorization", &format!("Bearer {token}"));
         }
     }
 
-    let resp = req
-        .call()
-        .with_context(|| format!("HTTP GET {url}"))?;
+    let resp = req.call().with_context(|| format!("HTTP GET {url}"))?;
     if !(200..300).contains(&resp.status()) {
         bail!("download failed HTTP {} for {url}", resp.status());
     }
@@ -283,7 +274,8 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
         .and_then(|s| s.parse::<u64>().ok());
 
     let mut reader = resp.into_reader();
-    let mut file = File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
+    let mut file =
+        File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
 
     let mut buf = vec![0u8; 1024 * 256];
     let mut done: u64 = 0;

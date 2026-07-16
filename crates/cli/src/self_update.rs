@@ -111,10 +111,7 @@ fn self_update_linux(tag: Option<&str>, dest: Option<PathBuf>) -> Result<PathBuf
 
     eprintln!("==> downloading {url}");
     let bytes = http_get_bytes(&url).with_context(|| format!("download {url}"))?;
-    eprintln!(
-        "    {:.1} MiB",
-        bytes.len() as f64 / (1024.0 * 1024.0)
-    );
+    eprintln!("    {:.1} MiB", bytes.len() as f64 / (1024.0 * 1024.0));
 
     let tmp_dir = env::temp_dir().join(format!("tarafer-update-{}", std::process::id()));
     fs::create_dir_all(&tmp_dir)?;

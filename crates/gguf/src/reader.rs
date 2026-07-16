@@ -42,27 +42,24 @@ impl GgufFile {
 
         let magic = cursor
             .read_u32::<LittleEndian>()
-            .map_err(|_| GgufError::UnexpectedEof {
-                context: "magic",
-            })?;
+            .map_err(|_| GgufError::UnexpectedEof { context: "magic" })?;
         if magic != GGUF_MAGIC {
             return Err(GgufError::BadMagic(magic));
         }
 
         let version = cursor
             .read_u32::<LittleEndian>()
-            .map_err(|_| GgufError::UnexpectedEof {
-                context: "version",
-            })?;
+            .map_err(|_| GgufError::UnexpectedEof { context: "version" })?;
         if version != 2 && version != 3 {
             return Err(GgufError::UnsupportedVersion(version));
         }
 
-        let n_tensors = cursor
-            .read_u64::<LittleEndian>()
-            .map_err(|_| GgufError::UnexpectedEof {
-                context: "tensor count",
-            })?;
+        let n_tensors =
+            cursor
+                .read_u64::<LittleEndian>()
+                .map_err(|_| GgufError::UnexpectedEof {
+                    context: "tensor count",
+                })?;
         let n_kv = cursor
             .read_u64::<LittleEndian>()
             .map_err(|_| GgufError::UnexpectedEof {
@@ -78,11 +75,12 @@ impl GgufFile {
         let mut metadata = HashMap::with_capacity(n_kv as usize);
         for _ in 0..n_kv {
             let key = read_string(&mut cursor)?;
-            let ty_id = cursor
-                .read_u32::<LittleEndian>()
-                .map_err(|_| GgufError::UnexpectedEof {
-                    context: "metadata value type",
-                })?;
+            let ty_id =
+                cursor
+                    .read_u32::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "metadata value type",
+                    })?;
             let ty = ValueType::from_u32(ty_id)?;
             let value = read_value(&mut cursor, ty)?;
             metadata.insert(key, value);
@@ -93,11 +91,12 @@ impl GgufFile {
 
         for i in 0..n_tensors {
             let name = read_string(&mut cursor)?;
-            let n_dims = cursor
-                .read_u32::<LittleEndian>()
-                .map_err(|_| GgufError::UnexpectedEof {
-                    context: "tensor n_dims",
-                })?;
+            let n_dims =
+                cursor
+                    .read_u32::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "tensor n_dims",
+                    })?;
             if n_dims > 4 {
                 return Err(GgufError::Malformed(format!(
                     "tensor {name}: n_dims={n_dims} > 4"
@@ -105,25 +104,28 @@ impl GgufFile {
             }
             let mut dims = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
-                let d = cursor
-                    .read_u64::<LittleEndian>()
-                    .map_err(|_| GgufError::UnexpectedEof {
-                        context: "tensor dim",
-                    })?;
+                let d =
+                    cursor
+                        .read_u64::<LittleEndian>()
+                        .map_err(|_| GgufError::UnexpectedEof {
+                            context: "tensor dim",
+                        })?;
                 dims.push(d);
             }
-            let type_id = cursor
-                .read_u32::<LittleEndian>()
-                .map_err(|_| GgufError::UnexpectedEof {
-                    context: "tensor type",
-                })?;
-            let ggml_type = GgmlType::from_u32(type_id)
-                .ok_or(GgufError::UnknownTensorType(type_id))?;
-            let offset = cursor
-                .read_u64::<LittleEndian>()
-                .map_err(|_| GgufError::UnexpectedEof {
-                    context: "tensor offset",
-                })?;
+            let type_id =
+                cursor
+                    .read_u32::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "tensor type",
+                    })?;
+            let ggml_type =
+                GgmlType::from_u32(type_id).ok_or(GgufError::UnknownTensorType(type_id))?;
+            let offset =
+                cursor
+                    .read_u64::<LittleEndian>()
+                    .map_err(|_| GgufError::UnexpectedEof {
+                        context: "tensor offset",
+                    })?;
 
             tensor_index.insert(name.clone(), i as usize);
             tensors.push(GgufTensorInfo {
@@ -173,9 +175,7 @@ impl GgufFile {
     }
 
     pub fn name(&self) -> Option<&str> {
-        self.metadata
-            .get("general.name")
-            .and_then(|v| v.as_str())
+        self.metadata.get("general.name").and_then(|v| v.as_str())
     }
 
     pub fn meta_u64(&self, key: &str) -> Option<u64> {

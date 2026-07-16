@@ -89,6 +89,9 @@ pub struct Session<'a> {
     print_stream: bool,
     print_stats: bool,
     primed: bool,
+    /// Tokens whose KV entries are committed. Used as the draft source for
+    /// prompt-lookup decoding; it never changes model acceptance semantics.
+    history: Vec<u32>,
 }
 
 impl<'a> Session<'a> {
@@ -109,6 +112,7 @@ impl<'a> Session<'a> {
             print_stream: opts.print_stream,
             print_stats: opts.print_stats,
             primed,
+            history: Vec::new(),
         }
     }
 
@@ -122,7 +126,46 @@ impl<'a> Session<'a> {
 
     pub fn reset(&mut self) {
         self.cache.clear();
+        self.history.clear();
         self.primed = false;
+    }
+
+    /// Find a continuation that followed the longest recent token suffix at an
+    /// earlier position. The model still verifies every proposed token.
+    fn prompt_lookup_draft(&self, current: u32, limit: usize) -> Vec<u32> {
+        const MAX_NGRAM: usize = 8;
+        const MAX_DRAFT: usize = 8;
+        if limit < 2 || self.history.len() < 4 {
+            return Vec::new();
+        }
+        let mut context = Vec::with_capacity(self.history.len() + 1);
+        context.extend_from_slice(&self.history);
+        context.push(current);
+        for n in (2..=MAX_NGRAM.min(context.len())).rev() {
+            let suffix_start = context.len() - n;
+            let suffix = &context[suffix_start..];
+            if self.history.len() <= n {
+                continue;
+            }
+            for pos in (0..=self.history.len() - n).rev() {
+                if &self.history[pos..pos + n] != suffix || pos + n >= self.history.len() {
+                    continue;
+                }
+                let end = (pos + n + MAX_DRAFT.min(limit)).min(self.history.len());
+                let mut draft = Vec::new();
+                for &id in &self.history[pos + n..end] {
+                    let piece = self.tok.decode(&[id]);
+                    if id == self.tok.eos_id || piece.starts_with("<|") {
+                        break;
+                    }
+                    draft.push(id);
+                }
+                if draft.len() >= 2 {
+                    return draft;
+                }
+            }
+        }
+        Vec::new()
     }
 
     fn build_user_prompt(&self, user: &str, first: bool) -> String {
@@ -180,6 +223,7 @@ impl<'a> Session<'a> {
 
         let t0 = Instant::now();
         let mut next = self.model.forward_greedy(&ids, self.cache)?;
+        self.history.extend_from_slice(&ids);
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let ttft_ms = wall.elapsed().as_secs_f64() * 1000.0;
 
@@ -193,6 +237,9 @@ impl<'a> Session<'a> {
         let mut stop = StopReason::MaxNew;
         let t1 = Instant::now();
         let mut step = 0usize;
+        let mut pld_proposed = 0usize;
+        let mut pld_accepted = 0usize;
+        let mut pld_passes = 0usize;
         while step < self.max_new {
             let piece = self.tok.decode(&[next]);
             if next == self.tok.eos_id
@@ -220,17 +267,67 @@ impl<'a> Session<'a> {
                 break;
             }
 
-            next = self.model.forward_greedy(&[next], self.cache)?;
+            let draft = if std::env::var_os("TARAFER_PLD").is_some() {
+                self.prompt_lookup_draft(next, self.max_new - step)
+            } else {
+                Vec::new()
+            };
+            if draft.is_empty() {
+                next = self.model.forward_greedy(&[next], self.cache)?;
+                self.history.push(reply_ids[reply_ids.len() - 1]);
+                continue;
+            }
+
+            let old_len = self.cache.len;
+            let mut verify = Vec::with_capacity(draft.len() + 1);
+            verify.push(next);
+            verify.extend_from_slice(&draft);
+            let predictions = self.model.forward_greedy_all(&verify, self.cache)?;
+            pld_passes += 1;
+            pld_proposed += draft.len();
+            let mut accepted = 0usize;
+            while accepted < draft.len() && predictions[accepted] == draft[accepted] {
+                accepted += 1;
+            }
+            pld_accepted += accepted;
+            self.cache.len = old_len + 1 + accepted;
+            self.history.push(next);
+            self.history.extend_from_slice(&draft[..accepted]);
+
+            for &id in &draft[..accepted] {
+                if step >= self.max_new {
+                    break;
+                }
+                let piece = self.tok.decode(&[id]);
+                reply_ids.push(id);
+                reply.push_str(&piece);
+                if self.print_stream {
+                    print!("{piece}");
+                    let _ = io::stdout().flush();
+                }
+                on_token(&piece);
+                step += 1;
+            }
+            if step >= self.max_new {
+                stop = StopReason::MaxNew;
+                break;
+            }
+            next = predictions[accepted];
         }
+
+        // Decode throughput covers accepted/generated tokens only. The ChatML
+        // end marker below is a post-generation KV maintenance pass and must
+        // not be charged to decode_ms when its tokens are not counted in `n`.
+        let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         // Keep multi-turn KV consistent with ChatML (append end marker).
         let end = self.tok.encode("<|im_end|>\n", false);
         if !end.is_empty() && self.cache.len + end.len() < self.cache.max_seq {
             let _ = self.model.forward_greedy(&end, self.cache);
+            self.history.extend_from_slice(&end);
         }
 
         let n = reply_ids.len();
-        let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let gen_s = decode_ms / 1000.0;
         let decode_tps = if n > 0 {
             n as f64 / gen_s.max(1e-6)
@@ -251,6 +348,12 @@ impl<'a> Session<'a> {
             println!();
         }
         if self.print_stats {
+            if pld_passes != 0 {
+                eprintln!(
+                    "PLD | passes={pld_passes} proposed={pld_proposed} accepted={pld_accepted} rate={:.0}%",
+                    100.0 * pld_accepted as f64 / pld_proposed.max(1) as f64
+                );
+            }
             eprintln!(
                 "[{n} tok | prefill {prefill_ms:.0} ms | decode {decode_tps:.1} tok/s | ctx {} | stop={stop:?}]",
                 self.cache.len

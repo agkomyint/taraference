@@ -36,10 +36,10 @@ fn lc_q5_gemv(n_cols: u32, n_rows: u32) -> LaunchConfig {
     }
 }
 
-fn lc_gemv_quantized(n_cols: u32) -> LaunchConfig {
+fn lc_gemv_quantized(n_cols: u32, warps: u32) -> LaunchConfig {
     LaunchConfig {
-        grid_dim: ((n_cols + GEMV_WARPS - 1) / GEMV_WARPS, 1, 1),
-        block_dim: (GEMV_THREADS, 1, 1),
+        grid_dim: ((n_cols + warps - 1) / warps, 1, 1),
+        block_dim: (warps * 32, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -79,11 +79,7 @@ fn lc_gemv_splitk(n_cols: u32, n_split: u32, rows_per_split: u32) -> LaunchConfi
 
 fn lc_q5_gemv_splitk(n_cols: u32, n_split: u32, rows_per_split: u32) -> LaunchConfig {
     LaunchConfig {
-        grid_dim: (
-            (n_cols + Q5_GEMV_WARPS - 1) / Q5_GEMV_WARPS,
-            n_split,
-            1,
-        ),
+        grid_dim: ((n_cols + Q5_GEMV_WARPS - 1) / Q5_GEMV_WARPS, n_split, 1),
         block_dim: (Q5_GEMV_THREADS, 1, 1),
         shared_mem_bytes: rows_per_split * 4,
     }
@@ -280,7 +276,7 @@ pub(crate) fn try_gemv_global_q8(
             .arg(bias_ptr)
             .arg(&use_res)
             .arg(residual_ptr)
-            .launch(lc_gemv_quantized(w.n_cols as u32))?;
+            .launch(lc_gemv_quantized(w.n_cols as u32, k.gemv_quantized_warps))?;
     }
     Ok(true)
 }
@@ -311,6 +307,7 @@ fn gemv_baseline(
     let bias_ptr: &CudaSlice<f32> = bias.unwrap_or(x);
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4,
+        WType::Q5K => &k.gemv_q5k,
         WType::Q5_0 => &k.gemv_q5,
         WType::Q6K if use_q6_repack => &k.gemv_q6_repack,
         WType::Q6K => &k.gemv_q6,
@@ -336,7 +333,7 @@ fn gemv_baseline(
                 lb.arg(r);
             }
         }
-        let lc = if matches!(w.wtype, WType::Q5_0 | WType::Q6K) {
+        let lc = if matches!(w.wtype, WType::Q5K | WType::Q5_0 | WType::Q6K) {
             lc_q5_gemv(w.n_cols as u32, w.n_rows as u32)
         } else {
             lc_gemv(w.n_cols as u32, w.n_rows as u32)
@@ -376,7 +373,7 @@ fn gemv_splitk(
 
     // Max rows any split owns (ceil). Superblock-aligned types use 256; group types 32 —
     // host smem is an upper bound; over-allocating smem is OK, under-alloc is not.
-    let block = if matches!(w.wtype, WType::Q4K | WType::Q6K) {
+    let block = if matches!(w.wtype, WType::Q4K | WType::Q5K | WType::Q6K) {
         256usize
     } else {
         32usize
@@ -387,6 +384,7 @@ fn gemv_splitk(
 
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4_splitk,
+        WType::Q5K => &k.gemv_q5k_splitk,
         WType::Q5_0 => &k.gemv_q5_splitk,
         WType::Q6K if use_q6_repack => &k.gemv_q6_repack_splitk,
         WType::Q6K => &k.gemv_q6_splitk,
@@ -404,7 +402,7 @@ fn gemv_splitk(
             .arg(&n_cols)
             .arg(&col_bytes)
             .arg(&n_split_i)
-            .launch(if w.wtype == WType::Q5_0 {
+            .launch(if matches!(w.wtype, WType::Q5K | WType::Q5_0) {
                 lc_q5_gemv_splitk(w.n_cols as u32, n_split, rows_per_split)
             } else {
                 lc_gemv_splitk(w.n_cols as u32, n_split, rows_per_split)
@@ -458,13 +456,22 @@ pub(crate) fn try_gemv_pair(
 
 /// Equal-width Q4_K pair with both matrices evaluated by the same block.
 pub(crate) fn try_gemv_q4_dual(
-    stream: &Arc<CudaStream>, k: &Kernels, wa: &GpuMat, wb: &GpuMat,
-    x: &CudaSlice<f32>, out_a: &mut CudaSlice<f32>, out_b: &mut CudaSlice<f32>,
-    q8_x: &mut CudaSlice<i8>, q8_d: &mut CudaSlice<f32>,
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    wa: &GpuMat,
+    wb: &GpuMat,
+    x: &CudaSlice<f32>,
+    out_a: &mut CudaSlice<f32>,
+    out_b: &mut CudaSlice<f32>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
 ) -> Result<bool> {
-    if wa.wtype != WType::Q4K || wb.wtype != WType::Q4K
-        || wa.n_rows != wb.n_rows || wa.n_cols != wb.n_cols
-        || wa.col_bytes != wb.col_bytes {
+    if wa.wtype != WType::Q4K
+        || wb.wtype != WType::Q4K
+        || wa.n_rows != wb.n_rows
+        || wa.n_cols != wb.n_cols
+        || wa.col_bytes != wb.col_bytes
+    {
         return Ok(false);
     }
     let n_rows = wa.n_rows as i32;
@@ -472,12 +479,64 @@ pub(crate) fn try_gemv_q4_dual(
     let col_bytes = wa.col_bytes as i32;
     quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
     unsafe {
-        stream.launch_builder(&k.gemv_q4_dual)
-            .arg(&wa.data).arg(&wb.data).arg(q8_x).arg(q8_d)
-            .arg(out_a).arg(out_b).arg(&n_rows).arg(&n_cols).arg(&col_bytes)
+        stream
+            .launch_builder(&k.gemv_q4_dual)
+            .arg(&wa.data)
+            .arg(&wb.data)
+            .arg(q8_x)
+            .arg(q8_d)
+            .arg(out_a)
+            .arg(out_b)
+            .arg(&n_rows)
+            .arg(&n_cols)
+            .arg(&col_bytes)
             .launch(LaunchConfig {
                 grid_dim: (wa.n_cols as u32, 1, 1),
-                block_dim: (64, 1, 1), shared_mem_bytes: 0,
+                block_dim: (k.gemv_q4_dual_threads, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(true)
+}
+
+/// Equal-width Q4_K FFN gate+up with the SiLU/multiply epilogue fused.
+pub(crate) fn try_gemv_q4_ffn(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    gate: &GpuMat,
+    up: &GpuMat,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
+) -> Result<bool> {
+    if gate.wtype != WType::Q4K
+        || up.wtype != WType::Q4K
+        || gate.n_rows != up.n_rows
+        || gate.n_cols != up.n_cols
+        || gate.col_bytes != up.col_bytes
+    {
+        return Ok(false);
+    }
+    let n_rows = gate.n_rows as i32;
+    let n_cols = gate.n_cols as i32;
+    let col_bytes = gate.col_bytes as i32;
+    quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+    unsafe {
+        stream
+            .launch_builder(&k.gemv_q4_ffn)
+            .arg(&gate.data)
+            .arg(&up.data)
+            .arg(q8_x)
+            .arg(q8_d)
+            .arg(out)
+            .arg(&n_rows)
+            .arg(&n_cols)
+            .arg(&col_bytes)
+            .launch(LaunchConfig {
+                grid_dim: (gate.n_cols as u32, 1, 1),
+                block_dim: (k.gemv_q4_dual_threads, 1, 1),
+                shared_mem_bytes: 0,
             })?;
     }
     Ok(true)
@@ -656,7 +715,7 @@ pub(crate) fn try_gemv_qkv(
                 .arg(bq_p)
                 .arg(bk_p)
                 .arg(bv_p)
-                .launch(lc_gemv_quantized(n_tot))?;
+                .launch(lc_gemv_quantized(n_tot, k.gemv_quantized_warps))?;
         }
         return Ok(true);
     }
@@ -735,6 +794,7 @@ pub(crate) fn gemm(
     let col_bytes = w.col_bytes as i32;
     let f = match w.wtype {
         WType::Q4K => &k.gemm_q4,
+        WType::Q5K => &k.gemm_q5k,
         WType::Q5_0 => &k.gemm_q5,
         WType::Q6K => &k.gemm_q6,
         WType::Q8_0 => &k.gemm_q8,
@@ -765,6 +825,7 @@ impl CudaModel {
         let col_bytes = self.token_embd.col_bytes as i32;
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4,
+            WType::Q5K => &self.k.embed_q5k,
             WType::Q5_0 => &self.k.embed_q5,
             WType::Q6K => &self.k.embed_q6,
             WType::Q8_0 => &self.k.embed_q8,
@@ -792,6 +853,7 @@ impl CudaModel {
         let col_bytes = self.token_embd.col_bytes as i32;
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4_one,
+            WType::Q5K => &self.k.embed_q5k_one,
             WType::Q5_0 => &self.k.embed_q5_one,
             WType::Q6K => &self.k.embed_q6_one,
             WType::Q8_0 => &self.k.embed_q8_one,
@@ -819,6 +881,7 @@ impl CudaModel {
         let col_bytes = self.token_embd.col_bytes as i32;
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4_one_d,
+            WType::Q5K => &self.k.embed_q5k_one_d,
             WType::Q5_0 => &self.k.embed_q5_one_d,
             WType::Q6K => &self.k.embed_q6_one_d,
             WType::Q8_0 => &self.k.embed_q8_one_d,

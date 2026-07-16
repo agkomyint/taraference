@@ -5,10 +5,13 @@ use std::collections::HashMap;
 
 /// Max tokens in one prefill GEMM launch.
 pub const MAX_BATCH: usize = 256;
+/// Current token plus up to eight prompt-lookup draft tokens.
+pub const MAX_VERIFY_TOKENS: usize = 9;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WType {
     Q4K,
+    Q5K,
     Q5_0,
     Q6K,
     Q8_0,
@@ -53,6 +56,7 @@ pub struct Kernels {
     pub gemv_q4: CudaFunction,
     pub gemv_q4_global: CudaFunction,
     pub gemv_q5: CudaFunction,
+    pub gemv_q5k: CudaFunction,
     pub gemv_q6: CudaFunction,
     pub gemv_q6_repack: CudaFunction,
     pub gemv_q6_repack_global: CudaFunction,
@@ -62,6 +66,7 @@ pub struct Kernels {
     pub gemv_q4_splitk: CudaFunction,
     pub gemv_q4_global_splitk: CudaFunction,
     pub gemv_q5_splitk: CudaFunction,
+    pub gemv_q5k_splitk: CudaFunction,
     pub gemv_q6_splitk: CudaFunction,
     pub gemv_q6_repack_splitk: CudaFunction,
     pub gemv_q6_repack_global_splitk: CudaFunction,
@@ -75,21 +80,28 @@ pub struct Kernels {
     /// Fused dual single-token GEMV for Q4_K (gate+up / Q+K on larger Q4_K_M).
     pub gemv_q4_pair: CudaFunction,
     pub gemv_q4_dual: CudaFunction,
+    pub gemv_q4_ffn: CudaFunction,
+    pub gemv_q4_dual_threads: u32,
+    pub gemv_quantized_warps: u32,
     pub gemv_q4_qkv: CudaFunction,
     pub gemm_q4: CudaFunction,
     pub gemm_q5: CudaFunction,
+    pub gemm_q5k: CudaFunction,
     pub gemm_q6: CudaFunction,
     pub gemm_q8: CudaFunction,
     pub embed_q4: CudaFunction,
     pub embed_q5: CudaFunction,
+    pub embed_q5k: CudaFunction,
     pub embed_q6: CudaFunction,
     pub embed_q8: CudaFunction,
     pub embed_q4_one: CudaFunction,
     pub embed_q5_one: CudaFunction,
+    pub embed_q5k_one: CudaFunction,
     pub embed_q6_one: CudaFunction,
     pub embed_q8_one: CudaFunction,
     pub embed_q4_one_d: CudaFunction,
     pub embed_q5_one_d: CudaFunction,
+    pub embed_q5k_one_d: CudaFunction,
     pub embed_q6_one_d: CudaFunction,
     pub embed_q8_one_d: CudaFunction,
     pub rms_norm: CudaFunction,
@@ -105,6 +117,7 @@ pub struct Kernels {
     pub copy_kv: CudaFunction,
     pub copy_kv_d: CudaFunction,
     pub argmax: CudaFunction,
+    pub argmax_rows: CudaFunction,
     pub copy_last: CudaFunction,
 }
 
