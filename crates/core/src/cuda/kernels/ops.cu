@@ -33,6 +33,160 @@ extern "C" __global__ void rms_norm_f32(
         ot[i] = xt[i] * s * w[i];
 }
 
+/// Decode attn prep (n_tok=1): RMSNorm → xb + Q8 quantize for fused QKV GEMV.
+extern "C" __global__ void attn_prep_rms_quant(
+    const float* __restrict__ x,
+    const float* __restrict__ attn_norm,
+    float* __restrict__ xb,
+    signed char* __restrict__ q8,
+    float* __restrict__ d8,
+    int n_embd,
+    float eps
+) {
+    int tid = (int)threadIdx.x;
+    __shared__ float red[256];
+    __shared__ float scale;
+    float local = 0.f;
+    for (int i = tid; i < n_embd; i += (int)blockDim.x) {
+        float v = x[i];
+        local += v * v;
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) scale = rsqrtf(red[0] / (float)n_embd + eps);
+    __syncthreads();
+    float s = scale;
+    for (int i = tid; i < n_embd; i += (int)blockDim.x)
+        xb[i] = x[i] * s * attn_norm[i];
+    __syncthreads();
+    int n_blocks = n_embd >> 5;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nwarps = (int)blockDim.x >> 5;
+    for (int bi = warp; bi < n_blocks; bi += nwarps) {
+        int i = (bi << 5) + lane;
+        float xi = xb[i];
+        float amax = fabsf(xi);
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 16));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 8));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 4));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 2));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 1));
+        amax = __shfl_sync(0xffffffffu, amax, 0);
+        float d = amax * (1.0f / 127.0f);
+        q8[i] = amax == 0.f ? 0 : (signed char)__float2int_rn(xi / d);
+        if (lane == 0) d8[bi] = d;
+    }
+}
+
+/// Decode MoE prep (n_tok=1): RMSNorm → xb, device router top-k, Q8 quantize xb.
+/// One block (256 threads). Replaces 3 launches per MoE layer.
+extern "C" __global__ void moe_ffn_prep_rms_router_quant(
+    const float* __restrict__ x,
+    const float* __restrict__ ffn_norm,
+    float* __restrict__ xb,
+    const float* __restrict__ router,
+    int* __restrict__ top_idx,
+    float* __restrict__ top_w,
+    signed char* __restrict__ q8,
+    float* __restrict__ d8,
+    int n_embd,
+    int n_experts,
+    int top_k,
+    float eps
+) {
+    int tid = (int)threadIdx.x;
+    __shared__ float red[256];
+    __shared__ float scores[32];
+    __shared__ float scale;
+
+    // RMSNorm
+    float local = 0.f;
+    for (int i = tid; i < n_embd; i += (int)blockDim.x) {
+        float v = x[i];
+        local += v * v;
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) scale = rsqrtf(red[0] / (float)n_embd + eps);
+    __syncthreads();
+    float s = scale;
+    for (int i = tid; i < n_embd; i += (int)blockDim.x)
+        xb[i] = x[i] * s * ffn_norm[i];
+    __syncthreads();
+
+    // Router scores (E is tiny, serial over experts)
+    for (int e = 0; e < n_experts; e++) {
+        const float* wr = router + (size_t)e * (size_t)n_embd;
+        float loc = 0.f;
+        for (int i = tid; i < n_embd; i += (int)blockDim.x)
+            loc += wr[i] * xb[i];
+        red[tid] = loc;
+        __syncthreads();
+        for (int ss = (int)blockDim.x / 2; ss > 0; ss >>= 1) {
+            if (tid < ss) red[tid] += red[tid + ss];
+            __syncthreads();
+        }
+        if (tid == 0) scores[e] = red[0];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        for (int k = 0; k < top_k; k++) {
+            int best_i = 0;
+            float best_v = -1e30f;
+            for (int e = 0; e < n_experts; e++) {
+                float sc = scores[e];
+                if (sc > best_v) {
+                    best_v = sc;
+                    best_i = e;
+                }
+            }
+            top_idx[k] = best_i;
+            top_w[k] = best_v;
+            scores[best_i] = -1e30f;
+        }
+        float max_l = top_w[0];
+        for (int k = 1; k < top_k; k++)
+            if (top_w[k] > max_l) max_l = top_w[k];
+        float sum = 0.f;
+        for (int k = 0; k < top_k; k++) {
+            top_w[k] = expf(top_w[k] - max_l);
+            sum += top_w[k];
+        }
+        float inv = sum > 0.f ? 1.f / sum : 0.f;
+        for (int k = 0; k < top_k; k++) top_w[k] *= inv;
+    }
+    __syncthreads();
+
+    // Q8 quantize xb (groups of 32)
+    int n_blocks = n_embd >> 5;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nwarps = (int)blockDim.x >> 5;
+    for (int bi = warp; bi < n_blocks; bi += nwarps) {
+        int i = (bi << 5) + lane;
+        float xi = xb[i];
+        float amax = fabsf(xi);
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 16));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 8));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 4));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 2));
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 1));
+        amax = __shfl_sync(0xffffffffu, amax, 0);
+        float d = amax * (1.0f / 127.0f);
+        q8[i] = amax == 0.f ? 0 : (signed char)__float2int_rn(xi / d);
+        if (lane == 0) d8[bi] = d;
+    }
+}
+
 extern "C" __global__ void silu_mul_f32(
     float* __restrict__ gate,
     const float* __restrict__ up,

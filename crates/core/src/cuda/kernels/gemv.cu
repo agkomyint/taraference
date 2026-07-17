@@ -541,8 +541,314 @@ __device__ __forceinline__ int load_int_unaligned(const void* ptr) {
     return val;
 }
 
-// Q4_0: 32 vals / block, 18 bytes (f16 d + 16B nibbles). Values = (nibble-8)*d.
-// DP4A path: pack 4 int8 q-values and 4 activations per __dp4a (Ampere+ fast).
+// ── Block-major Q4_0 experts: layout [n_blocks][n_cols][18] ─────────────────
+// Thread-per-column: for fixed bi, consecutive threads load consecutive columns
+// → coalesced 18B-block streams (warp-per-col + lane-over-bi is the WRONG pattern).
+
+__device__ __forceinline__ float dot_q4_0_bm_col_full(
+    const unsigned char* __restrict__ w_bm,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    int n_cols,
+    int j,
+    int n_blocks
+) {
+    float acc = 0.f;
+    // Unroll small block counts (d=640 → 20, expert_ff=1536 → 48).
+    #pragma unroll 1
+    for (int bi = 0; bi < n_blocks; bi++) {
+        // Coalesced across threads in a warp: base_j, base_j+1, ... are 18B apart.
+        const unsigned char* base = w_bm + ((size_t)bi * (size_t)n_cols + (size_t)j) * 18u;
+        float dw = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const unsigned char* qs = base + 2;
+        const signed char* xv = xq + (bi << 5);
+        int sum = 0;
+        #pragma unroll
+        for (int t = 0; t < 16; t += 4) {
+            int qlo =
+                (((int)(qs[t + 0] & 0x0f) - 8) & 0xff) |
+                ((((int)(qs[t + 1] & 0x0f) - 8) & 0xff) << 8) |
+                ((((int)(qs[t + 2] & 0x0f) - 8) & 0xff) << 16) |
+                ((((int)(qs[t + 3] & 0x0f) - 8) & 0xff) << 24);
+            int xlo = load_int_unaligned(xv + t);
+            sum = __dp4a(qlo, xlo, sum);
+            int qhi =
+                (((int)(qs[t + 0] >> 4) - 8) & 0xff) |
+                ((((int)(qs[t + 1] >> 4) - 8) & 0xff) << 8) |
+                ((((int)(qs[t + 2] >> 4) - 8) & 0xff) << 16) |
+                ((((int)(qs[t + 3] >> 4) - 8) & 0xff) << 24);
+            int xhi = load_int_unaligned(xv + t + 16);
+            sum = __dp4a(qhi, xhi, sum);
+        }
+        acc += dw * xd[bi] * (float)sum;
+    }
+    return acc;
+}
+
+/// Gate+up+SiLU, block-major Q4. Launch: grid=ceil(n_cols/threads), block=threads (e.g. 128).
+extern "C" __global__ void gemv_q4_0_bm_expert_gate_up(
+    const unsigned char* __restrict__ gate_bm,
+    const unsigned char* __restrict__ up_bm,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out_ff,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert
+) {
+    const int j = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (j >= n_cols_expert) return;
+    const int expert = expert_ids[slot];
+    const int n_blocks = n_rows >> 5;
+    // Per-expert BM slice: [n_blocks][n_cols_expert][18], experts consecutive.
+    const size_t exp_off = (size_t)expert * (size_t)n_blocks * (size_t)n_cols_expert * 18u;
+    const unsigned char* g = gate_bm + exp_off;
+    const unsigned char* u = up_bm + exp_off;
+    float ag = dot_q4_0_bm_col_full(g, xq, xd, n_cols_expert, j, n_blocks);
+    float au = dot_q4_0_bm_col_full(u, xq, xd, n_cols_expert, j, n_blocks);
+    out_ff[j] = (ag / (1.f + __expf(-ag))) * au;
+}
+
+extern "C" __global__ void gemv_q4_0_bm_expert_down_scale(
+    const unsigned char* __restrict__ down_bm,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ residual_x,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ weights,
+    int slot,
+    int n_rows,
+    int n_cols_expert
+) {
+    const int j = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (j >= n_cols_expert) return;
+    const int expert = expert_ids[slot];
+    const float w = weights[slot];
+    const int n_blocks = n_rows >> 5;
+    const size_t exp_off = (size_t)expert * (size_t)n_blocks * (size_t)n_cols_expert * 18u;
+    const unsigned char* d = down_bm + exp_off;
+    float acc = dot_q4_0_bm_col_full(d, xq, xd, n_cols_expert, j, n_blocks);
+    residual_x[j] += w * acc;
+}
+
+// ── f16 column-major GEMV (optional expand; often more BW than Q4) ───────────
+// Layout: for column j, halfs at w[j * n_rows + 0 .. n_rows).
+
+__device__ __forceinline__ float dot_f16_col_f32(
+    const unsigned short* __restrict__ col, // __half bit patterns
+    const float* __restrict__ x,
+    int n_rows,
+    int lane
+) {
+    float acc = 0.f;
+    for (int i = lane; i < n_rows; i += 32) {
+        float w = half_to_float(col[i]);
+        acc += w * x[i];
+    }
+    return warp_sum(acc);
+}
+
+/// Fused gate+up+SiLU for f16 packed experts (storage is u8 bytes of f16 LE).
+extern "C" __global__ void gemv_f16_expert_gate_up(
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ up_packed,
+    const float* __restrict__ x,
+    float* __restrict__ out_ff,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert
+) {
+    const int expert = expert_ids[slot];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols_expert) return;
+    const int packed_j = expert * n_cols_expert + j;
+    const unsigned short* cg =
+        reinterpret_cast<const unsigned short*>(gate_packed) + (size_t)packed_j * (size_t)n_rows;
+    const unsigned short* cu =
+        reinterpret_cast<const unsigned short*>(up_packed) + (size_t)packed_j * (size_t)n_rows;
+    float ag = dot_f16_col_f32(cg, x, n_rows, lane);
+    float au = dot_f16_col_f32(cu, x, n_rows, lane);
+    if (lane == 0) {
+        float silu = ag / (1.f + __expf(-ag));
+        out_ff[j] = silu * au;
+    }
+}
+
+/// Down f16 GEMV + scale residual. n_rows = expert_ff, n_cols_expert = n_embd.
+extern "C" __global__ void gemv_f16_expert_down_scale(
+    const unsigned char* __restrict__ down_packed,
+    const float* __restrict__ hb,
+    float* __restrict__ residual_x,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ weights,
+    int slot,
+    int n_rows,
+    int n_cols_expert
+) {
+    const int expert = expert_ids[slot];
+    const float w = weights[slot];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols_expert) return;
+    const int packed_j = expert * n_cols_expert + j;
+    const unsigned short* col =
+        reinterpret_cast<const unsigned short*>(down_packed) + (size_t)packed_j * (size_t)n_rows;
+    float acc = dot_f16_col_f32(col, hb, n_rows, lane);
+    if (lane == 0) residual_x[j] += w * acc;
+}
+
+/// 4 warps/col f16 gate_up — more latency hiding for n_rows=640 / 1536.
+extern "C" __global__ void gemv_f16_expert_gate_up_4w(
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ up_packed,
+    const float* __restrict__ x,
+    float* __restrict__ out_ff,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols_expert) return;
+    const int expert = expert_ids[slot];
+    const int packed_j = expert * n_cols_expert + j;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int chunk = (n_rows + 3) >> 2;
+    const int i0 = warp * chunk;
+    int i1 = i0 + chunk;
+    if (i1 > n_rows) i1 = n_rows;
+    const unsigned short* cg =
+        reinterpret_cast<const unsigned short*>(gate_packed) + (size_t)packed_j * (size_t)n_rows;
+    const unsigned short* cu =
+        reinterpret_cast<const unsigned short*>(up_packed) + (size_t)packed_j * (size_t)n_rows;
+    float ag = 0.f, au = 0.f;
+    for (int i = i0 + lane; i < i1; i += 32) {
+        ag += half_to_float(cg[i]) * x[i];
+        au += half_to_float(cu[i]) * x[i];
+    }
+    ag = warp_sum(ag);
+    au = warp_sum(au);
+    __shared__ float pg[4], pu[4];
+    if (lane == 0) {
+        pg[warp] = ag;
+        pu[warp] = au;
+    }
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        float g = pg[0] + pg[1] + pg[2] + pg[3];
+        float u = pu[0] + pu[1] + pu[2] + pu[3];
+        out_ff[j] = (g / (1.f + __expf(-g))) * u;
+    }
+}
+
+extern "C" __global__ void gemv_f16_expert_down_scale_4w(
+    const unsigned char* __restrict__ down_packed,
+    const float* __restrict__ hb,
+    float* __restrict__ residual_x,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ weights,
+    int slot,
+    int n_rows,
+    int n_cols_expert
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols_expert) return;
+    const int expert = expert_ids[slot];
+    const float w = weights[slot];
+    const int packed_j = expert * n_cols_expert + j;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int chunk = (n_rows + 3) >> 2;
+    const int i0 = warp * chunk;
+    int i1 = i0 + chunk;
+    if (i1 > n_rows) i1 = n_rows;
+    const unsigned short* col =
+        reinterpret_cast<const unsigned short*>(down_packed) + (size_t)packed_j * (size_t)n_rows;
+    float acc = 0.f;
+    for (int i = i0 + lane; i < i1; i += 32)
+        acc += half_to_float(col[i]) * hb[i];
+    acc = warp_sum(acc);
+    __shared__ float p[4];
+    if (lane == 0) p[warp] = acc;
+    __syncthreads();
+    if (warp == 0 && lane == 0)
+        residual_x[j] += w * (p[0] + p[1] + p[2] + p[3]);
+}
+
+// Q4_0: 32 vals / block. File format 18B (f16 d + 16B qs).
+// Aligned decode format 32B: f16 d + 2B pad + 16B qs + pad (qs is 4-byte aligned → uint4 loads).
+// Values = (nibble-8)*d. DP4A path for Ampere+.
+__device__ __forceinline__ float dot_q4_0_col_q8_range_bsz(
+    const unsigned char* __restrict__ col,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    int bi0,
+    int bi1,
+    int lane,
+    int bsz
+) {
+    float acc = 0.f;
+    for (int bi = bi0 + lane; bi < bi1; bi += 32) {
+        const unsigned char* base = col + bi * bsz;
+        float dw = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const signed char* xv = xq + (bi << 5);
+        int sum = 0;
+        if (bsz >= 32) {
+            // qs at +4 is 4-byte aligned — safe vector load
+            const unsigned int* qs = reinterpret_cast<const unsigned int*>(base + 4);
+            unsigned int q0 = qs[0], q1 = qs[1], q2 = qs[2], q3 = qs[3];
+            unsigned int qwords[4] = {q0, q1, q2, q3};
+            #pragma unroll
+            for (int t = 0; t < 4; t++) {
+                unsigned int qw = qwords[t];
+                int qlo =
+                    ((((int)(qw & 0x0fu)) - 8) & 0xff) |
+                    (((((int)((qw >> 8) & 0x0fu)) - 8) & 0xff) << 8) |
+                    (((((int)((qw >> 16) & 0x0fu)) - 8) & 0xff) << 16) |
+                    (((((int)((qw >> 24) & 0x0fu)) - 8) & 0xff) << 24);
+                int xlo = load_int_unaligned(xv + t * 4);
+                sum = __dp4a(qlo, xlo, sum);
+                int qhi =
+                    ((((int)((qw >> 4) & 0x0fu)) - 8) & 0xff) |
+                    (((((int)((qw >> 12) & 0x0fu)) - 8) & 0xff) << 8) |
+                    (((((int)((qw >> 20) & 0x0fu)) - 8) & 0xff) << 16) |
+                    (((((int)((qw >> 28) & 0x0fu)) - 8) & 0xff) << 24);
+                int xhi = load_int_unaligned(xv + 16 + t * 4);
+                sum = __dp4a(qhi, xhi, sum);
+            }
+        } else {
+            const unsigned char* qs = base + 2;
+            #pragma unroll
+            for (int j = 0; j < 16; j += 4) {
+                int qlo =
+                    (((int)(qs[j + 0] & 0x0f) - 8) & 0xff) |
+                    ((((int)(qs[j + 1] & 0x0f) - 8) & 0xff) << 8) |
+                    ((((int)(qs[j + 2] & 0x0f) - 8) & 0xff) << 16) |
+                    ((((int)(qs[j + 3] & 0x0f) - 8) & 0xff) << 24);
+                int xlo = load_int_unaligned(xv + j);
+                sum = __dp4a(qlo, xlo, sum);
+                int qhi =
+                    (((int)(qs[j + 0] >> 4) - 8) & 0xff) |
+                    ((((int)(qs[j + 1] >> 4) - 8) & 0xff) << 8) |
+                    ((((int)(qs[j + 2] >> 4) - 8) & 0xff) << 16) |
+                    ((((int)(qs[j + 3] >> 4) - 8) & 0xff) << 24);
+                int xhi = load_int_unaligned(xv + j + 16);
+                sum = __dp4a(qhi, xhi, sum);
+            }
+        }
+        acc += dw * xd[bi] * (float)sum;
+    }
+    return warp_sum(acc);
+}
+
 __device__ __forceinline__ float dot_q4_0_col_q8_range(
     const unsigned char* __restrict__ col,
     const signed char* __restrict__ xq,
@@ -551,36 +857,13 @@ __device__ __forceinline__ float dot_q4_0_col_q8_range(
     int bi1,
     int lane
 ) {
-    float acc = 0.f;
-    for (int bi = bi0 + lane; bi < bi1; bi += 32) {
-        const unsigned char* base = col + bi * 18;
-        float dw = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
-        const unsigned char* qs = base + 2;
-        const signed char* xv = xq + (bi << 5);
-        int sum = 0;
-        // Low nibbles → indices 0..15; high → 16..31. Four groups of 4.
-        #pragma unroll
-        for (int j = 0; j < 16; j += 4) {
-            // Pack 4 low-nibble q values as signed bytes in an int.
-            int qlo =
-                (((int)(qs[j + 0] & 0x0f) - 8) & 0xff) |
-                ((((int)(qs[j + 1] & 0x0f) - 8) & 0xff) << 8) |
-                ((((int)(qs[j + 2] & 0x0f) - 8) & 0xff) << 16) |
-                ((((int)(qs[j + 3] & 0x0f) - 8) & 0xff) << 24);
-            int xlo = load_int_unaligned(xv + j);
-            sum = __dp4a(qlo, xlo, sum);
+    // Legacy 18B blocks (callers without col_bytes context).
+    return dot_q4_0_col_q8_range_bsz(col, xq, xd, bi0, bi1, lane, 18);
+}
 
-            int qhi =
-                (((int)(qs[j + 0] >> 4) - 8) & 0xff) |
-                ((((int)(qs[j + 1] >> 4) - 8) & 0xff) << 8) |
-                ((((int)(qs[j + 2] >> 4) - 8) & 0xff) << 16) |
-                ((((int)(qs[j + 3] >> 4) - 8) & 0xff) << 24);
-            int xhi = load_int_unaligned(xv + j + 16);
-            sum = __dp4a(qhi, xhi, sum);
-        }
-        acc += dw * xd[bi] * (float)sum;
-    }
-    return warp_sum(acc);
+__device__ __forceinline__ int q4_0_block_bytes(int n_rows, int col_bytes) {
+    int nb = n_rows >> 5;
+    return (nb > 0) ? (col_bytes / nb) : 18;
 }
 
 // Q4_0 GEMV with in-kernel activation quant (prefill / baseline; graph decode prefers global).
@@ -604,7 +887,7 @@ extern "C" __global__ void gemv_q4_0(
     const int j = (int)blockIdx.x * warps_per_block + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
-    float acc = dot_q4_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    float acc = dot_q4_0_col_q8_range_bsz(col, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
     if (lane == 0) {
         acc = gemv_apply_res(use_res, acc, out, j, residual);
         if (use_bias) acc += bias[j];
@@ -627,7 +910,7 @@ extern "C" __global__ void gemv_q4_0_global(
     const int j = (int)blockIdx.x * warps_per_block + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
-    float acc = dot_q4_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    float acc = dot_q4_0_col_q8_range_bsz(col, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
     if (lane == 0) {
         acc = gemv_apply_res(use_res, acc, out, j, residual);
         if (use_bias) acc += bias[j];
@@ -656,7 +939,7 @@ extern "C" __global__ void gemv_q4_0_global_expert_slot(
     if (j >= n_cols_expert) return;
     const int packed_j = expert * n_cols_expert + j;
     const unsigned char* col = w_packed + (size_t)packed_j * (size_t)col_bytes;
-    float acc = dot_q4_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    float acc = dot_q4_0_col_q8_range_bsz(col, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
     if (lane == 0) {
         acc = gemv_apply_res(use_res, acc, out, j, residual);
         out[j] = acc;
@@ -665,6 +948,7 @@ extern "C" __global__ void gemv_q4_0_global_expert_slot(
 
 /// Fused gate+up+SiLU*mul expert GEMV for one MoE slot.
 /// Writes out_ff[j] = silu(gate[j]) * up[j] (ready for down-proj).
+/// Interleaves gate/up block loads in one K-loop for short-K latency hiding (d=640).
 extern "C" __global__ void gemv_q4_0_global_expert_gate_up(
     const unsigned char* __restrict__ gate_packed,
     const unsigned char* __restrict__ up_packed,
@@ -685,16 +969,153 @@ extern "C" __global__ void gemv_q4_0_global_expert_gate_up(
     const int j = (int)blockIdx.x * warps_per_block + warp;
     if (j >= n_cols_expert) return;
     const int packed_j = expert * n_cols_expert + j;
+    const int bsz = q4_0_block_bytes(n_rows, col_bytes);
+    const int n_blocks = n_rows >> 5;
     const unsigned char* cg = gate_packed + (size_t)packed_j * (size_t)col_bytes;
     const unsigned char* cu = up_packed + (size_t)packed_j * (size_t)col_bytes;
-    float ag = dot_q4_0_col_q8_range(cg, xq, xd, 0, n_rows / 32, lane);
-    float au = dot_q4_0_col_q8_range(cu, xq, xd, 0, n_rows / 32, lane);
+    float ag = 0.f, au = 0.f;
+    for (int bi = lane; bi < n_blocks; bi += 32) {
+        const unsigned char* bg = cg + bi * bsz;
+        const unsigned char* bu = cu + bi * bsz;
+        float dwg = half_to_float((unsigned short)(bg[0] | (bg[1] << 8)));
+        float dwu = half_to_float((unsigned short)(bu[0] | (bu[1] << 8)));
+        const signed char* xv = xq + (bi << 5);
+        const float xsc = xd[bi];
+        int sumg = 0, sumu = 0;
+        if (bsz >= 32) {
+            const unsigned int* qsg = reinterpret_cast<const unsigned int*>(bg + 4);
+            const unsigned int* qsu = reinterpret_cast<const unsigned int*>(bu + 4);
+            #pragma unroll
+            for (int t = 0; t < 4; t++) {
+                unsigned int qwg = qsg[t], qwu = qsu[t];
+                int xlo = load_int_unaligned(xv + t * 4);
+                int xhi = load_int_unaligned(xv + 16 + t * 4);
+                int qglo =
+                    ((((int)(qwg & 0x0fu)) - 8) & 0xff) |
+                    (((((int)((qwg >> 8) & 0x0fu)) - 8) & 0xff) << 8) |
+                    (((((int)((qwg >> 16) & 0x0fu)) - 8) & 0xff) << 16) |
+                    (((((int)((qwg >> 24) & 0x0fu)) - 8) & 0xff) << 24);
+                int qulo =
+                    ((((int)(qwu & 0x0fu)) - 8) & 0xff) |
+                    (((((int)((qwu >> 8) & 0x0fu)) - 8) & 0xff) << 8) |
+                    (((((int)((qwu >> 16) & 0x0fu)) - 8) & 0xff) << 16) |
+                    (((((int)((qwu >> 24) & 0x0fu)) - 8) & 0xff) << 24);
+                sumg = __dp4a(qglo, xlo, sumg);
+                sumu = __dp4a(qulo, xlo, sumu);
+                int qghi =
+                    ((((int)((qwg >> 4) & 0x0fu)) - 8) & 0xff) |
+                    (((((int)((qwg >> 12) & 0x0fu)) - 8) & 0xff) << 8) |
+                    (((((int)((qwg >> 20) & 0x0fu)) - 8) & 0xff) << 16) |
+                    (((((int)((qwg >> 28) & 0x0fu)) - 8) & 0xff) << 24);
+                int quhi =
+                    ((((int)((qwu >> 4) & 0x0fu)) - 8) & 0xff) |
+                    (((((int)((qwu >> 12) & 0x0fu)) - 8) & 0xff) << 8) |
+                    (((((int)((qwu >> 20) & 0x0fu)) - 8) & 0xff) << 16) |
+                    (((((int)((qwu >> 28) & 0x0fu)) - 8) & 0xff) << 24);
+                sumg = __dp4a(qghi, xhi, sumg);
+                sumu = __dp4a(quhi, xhi, sumu);
+            }
+        } else {
+            const unsigned char* qsg = bg + 2;
+            const unsigned char* qsu = bu + 2;
+            #pragma unroll
+            for (int t = 0; t < 16; t += 4) {
+                int xlo = load_int_unaligned(xv + t);
+                int xhi = load_int_unaligned(xv + t + 16);
+                int qglo =
+                    (((int)(qsg[t + 0] & 0x0f) - 8) & 0xff) |
+                    ((((int)(qsg[t + 1] & 0x0f) - 8) & 0xff) << 8) |
+                    ((((int)(qsg[t + 2] & 0x0f) - 8) & 0xff) << 16) |
+                    ((((int)(qsg[t + 3] & 0x0f) - 8) & 0xff) << 24);
+                int qulo =
+                    (((int)(qsu[t + 0] & 0x0f) - 8) & 0xff) |
+                    ((((int)(qsu[t + 1] & 0x0f) - 8) & 0xff) << 8) |
+                    ((((int)(qsu[t + 2] & 0x0f) - 8) & 0xff) << 16) |
+                    ((((int)(qsu[t + 3] & 0x0f) - 8) & 0xff) << 24);
+                sumg = __dp4a(qglo, xlo, sumg);
+                sumu = __dp4a(qulo, xlo, sumu);
+                int qghi =
+                    (((int)(qsg[t + 0] >> 4) - 8) & 0xff) |
+                    ((((int)(qsg[t + 1] >> 4) - 8) & 0xff) << 8) |
+                    ((((int)(qsg[t + 2] >> 4) - 8) & 0xff) << 16) |
+                    ((((int)(qsg[t + 3] >> 4) - 8) & 0xff) << 24);
+                int quhi =
+                    (((int)(qsu[t + 0] >> 4) - 8) & 0xff) |
+                    ((((int)(qsu[t + 1] >> 4) - 8) & 0xff) << 8) |
+                    ((((int)(qsu[t + 2] >> 4) - 8) & 0xff) << 16) |
+                    ((((int)(qsu[t + 3] >> 4) - 8) & 0xff) << 24);
+                sumg = __dp4a(qghi, xhi, sumg);
+                sumu = __dp4a(quhi, xhi, sumu);
+            }
+        }
+        ag += dwg * xsc * (float)sumg;
+        au += dwu * xsc * (float)sumu;
+    }
+    ag = warp_sum(ag);
+    au = warp_sum(au);
     if (lane == 0) {
-        // SiLU(g) * up
         float silu = ag / (1.f + __expf(-ag));
         out_ff[j] = silu * au;
         (void)out_unused;
     }
+}
+
+/// Gate+up+SiLU for 32 intermediate cols per block, then Q8-quantize the tile in-smem.
+/// Launch: grid = ceil(n_cols_expert/32), block = 32 warps (1024 threads).
+/// Writes q8_out[32*bi + lane] and d8_out[bi] — drops a separate quantize launch before down.
+extern "C" __global__ void gemv_q4_0_global_expert_gate_up_q8(
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ up_packed,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    signed char* __restrict__ q8_out,
+    float* __restrict__ d8_out,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes
+) {
+    // Exactly 32 warps: one output column each in this tile.
+    const int expert = expert_ids[slot];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int bi = (int)blockIdx.x; // tile index over intermediate/32
+    const int j = (bi << 5) + warp;
+    __shared__ float tile[32];
+
+    float val = 0.f;
+    if (j < n_cols_expert) {
+        const int packed_j = expert * n_cols_expert + j;
+        const unsigned char* cg = gate_packed + (size_t)packed_j * (size_t)col_bytes;
+        const unsigned char* cu = up_packed + (size_t)packed_j * (size_t)col_bytes;
+        float ag = dot_q4_0_col_q8_range_bsz(cg, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+        float au = dot_q4_0_col_q8_range_bsz(cu, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+        if (lane == 0) {
+            val = (ag / (1.f + __expf(-ag))) * au;
+            tile[warp] = val;
+        }
+    } else if (lane == 0) {
+        tile[warp] = 0.f;
+    }
+    __syncthreads();
+
+    // Q8 quantize the 32-wide tile (one activation block).
+    float xi = tile[lane];
+    float amax = fabsf(xi);
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 16));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 8));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 4));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 1));
+    amax = __shfl_sync(0xffffffffu, amax, 0);
+    const float d = amax * (1.0f / 127.0f);
+    // Always write full 32-wide group (OOB cols are 0 in tile).
+    const int base = bi << 5;
+    q8_out[base + lane] = (amax == 0.f || d == 0.f)
+        ? 0
+        : (signed char)__float2int_rn(xi / d);
+    if (lane == 0) d8_out[bi] = d;
 }
 
 /// Down GEMV + scale-add residual: x[i] += weights[slot] * (W_down @ hb)[i]
@@ -719,7 +1140,379 @@ extern "C" __global__ void gemv_q4_0_global_expert_down_scale(
     if (j >= n_cols_expert) return;
     const int packed_j = expert * n_cols_expert + j;
     const unsigned char* col = down_packed + (size_t)packed_j * (size_t)col_bytes;
-    float acc = dot_q4_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    float acc = dot_q4_0_col_q8_range_bsz(col, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    if (lane == 0) residual_x[j] += w * acc;
+}
+
+/// 4 warps per column: better BW latency hiding when n_rows/32 is modest (d=640 → 20 blocks).
+/// Launch: grid=n_cols_expert, block=128 (4 warps).
+extern "C" __global__ void gemv_q4_0_global_expert_gate_up_4w(
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ up_packed,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out_ff,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols_expert) return;
+    const int expert = expert_ids[slot];
+    const int packed_j = expert * n_cols_expert + j;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5; // 0..3
+    const int n_blocks = n_rows / 32;
+    const int chunk = (n_blocks + 3) >> 2;
+    const int bi0 = warp * chunk;
+    int bi1 = bi0 + chunk;
+    if (bi1 > n_blocks) bi1 = n_blocks;
+
+    const unsigned char* cg = gate_packed + (size_t)packed_j * (size_t)col_bytes;
+    const unsigned char* cu = up_packed + (size_t)packed_j * (size_t)col_bytes;
+    float ag = (bi0 < bi1) ? dot_q4_0_col_q8_range_bsz(cg, xq, xd, bi0, bi1, lane, q4_0_block_bytes(n_rows, col_bytes)) : 0.f;
+    float au = (bi0 < bi1) ? dot_q4_0_col_q8_range_bsz(cu, xq, xd, bi0, bi1, lane, q4_0_block_bytes(n_rows, col_bytes)) : 0.f;
+    __shared__ float pg[4], pu[4];
+    if (lane == 0) {
+        pg[warp] = ag;
+        pu[warp] = au;
+    }
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        float g = pg[0] + pg[1] + pg[2] + pg[3];
+        float u = pu[0] + pu[1] + pu[2] + pu[3];
+        out_ff[j] = (g / (1.f + __expf(-g))) * u;
+    }
+}
+
+extern "C" __global__ void gemv_q4_0_global_expert_down_scale_4w(
+    const unsigned char* __restrict__ down_packed,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ residual_x,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ weights,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols_expert) return;
+    const int expert = expert_ids[slot];
+    const float w = weights[slot];
+    const int packed_j = expert * n_cols_expert + j;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int n_blocks = n_rows / 32;
+    const int chunk = (n_blocks + 3) >> 2;
+    const int bi0 = warp * chunk;
+    int bi1 = bi0 + chunk;
+    if (bi1 > n_blocks) bi1 = n_blocks;
+    const unsigned char* col = down_packed + (size_t)packed_j * (size_t)col_bytes;
+    float acc = (bi0 < bi1) ? dot_q4_0_col_q8_range_bsz(col, xq, xd, bi0, bi1, lane, q4_0_block_bytes(n_rows, col_bytes)) : 0.f;
+    __shared__ float p[4];
+    if (lane == 0) p[warp] = acc;
+    __syncthreads();
+    if (warp == 0 && lane == 0)
+        residual_x[j] += w * (p[0] + p[1] + p[2] + p[3]);
+}
+
+/// 2 warps per output column: better latency hiding on tall expert_ff (1536).
+/// Launch: grid=n_cols_expert, block=64 (exactly 2 warps).
+extern "C" __global__ void gemv_q4_0_global_expert_gate_up_2w(
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ up_packed,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out_ff,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols_expert) return;
+    const int expert = expert_ids[slot];
+    const int packed_j = expert * n_cols_expert + j;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5; // 0 or 1
+    const int n_blocks = n_rows / 32;
+    const int mid = n_blocks >> 1;
+    const int bi0 = (warp == 0) ? 0 : mid;
+    const int bi1 = (warp == 0) ? mid : n_blocks;
+
+    const unsigned char* cg = gate_packed + (size_t)packed_j * (size_t)col_bytes;
+    const unsigned char* cu = up_packed + (size_t)packed_j * (size_t)col_bytes;
+    float ag = dot_q4_0_col_q8_range_bsz(cg, xq, xd, bi0, bi1, lane, q4_0_block_bytes(n_rows, col_bytes));
+    float au = dot_q4_0_col_q8_range_bsz(cu, xq, xd, bi0, bi1, lane, q4_0_block_bytes(n_rows, col_bytes));
+
+    __shared__ float pg[2], pu[2];
+    if (lane == 0) {
+        pg[warp] = ag;
+        pu[warp] = au;
+    }
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        float g = pg[0] + pg[1];
+        float u = pu[0] + pu[1];
+        out_ff[j] = (g / (1.f + __expf(-g))) * u;
+    }
+}
+
+/// 2 warps per column for expert down + residual scale-add.
+/// Launch: grid=n_cols_expert (=n_embd), block=64.
+extern "C" __global__ void gemv_q4_0_global_expert_down_scale_2w(
+    const unsigned char* __restrict__ down_packed,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ residual_x,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ weights,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols_expert) return;
+    const int expert = expert_ids[slot];
+    const float w = weights[slot];
+    const int packed_j = expert * n_cols_expert + j;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int n_blocks = n_rows / 32;
+    const int mid = n_blocks >> 1;
+    const int bi0 = (warp == 0) ? 0 : mid;
+    const int bi1 = (warp == 0) ? mid : n_blocks;
+
+    const unsigned char* col = down_packed + (size_t)packed_j * (size_t)col_bytes;
+    float acc = dot_q4_0_col_q8_range_bsz(col, xq, xd, bi0, bi1, lane, q4_0_block_bytes(n_rows, col_bytes));
+    __shared__ float p[2];
+    if (lane == 0) p[warp] = acc;
+    __syncthreads();
+    if (warp == 0 && lane == 0) residual_x[j] += w * (p[0] + p[1]);
+}
+
+/// 2 warps per column fused Q+K+V for Q4_0 MoE packs (n_rows often 640).
+/// Launch: grid = n_q+n_k+n_v, block=64.
+extern "C" __global__ void gemv_q4_0_global_qkv_2w(
+    const unsigned char* __restrict__ wq,
+    const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wv,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int n_rows, int n_q, int n_k, int n_v, int col_bytes,
+    int use_bias,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv
+) {
+    const int j = (int)blockIdx.x;
+    const int n_tot = n_q + n_k + n_v;
+    if (j >= n_tot) return;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int n_blocks = n_rows / 32;
+    const int mid = n_blocks >> 1;
+    const int bi0 = (warp == 0) ? 0 : mid;
+    const int bi1 = (warp == 0) ? mid : n_blocks;
+
+    const unsigned char* wcol;
+    float* out;
+    const float* bias;
+    int oj;
+    if (j < n_q) {
+        wcol = wq + (size_t)j * (size_t)col_bytes;
+        out = q; bias = bq; oj = j;
+    } else if (j < n_q + n_k) {
+        oj = j - n_q;
+        wcol = wk + (size_t)oj * (size_t)col_bytes;
+        out = k; bias = bk;
+    } else {
+        oj = j - n_q - n_k;
+        wcol = wv + (size_t)oj * (size_t)col_bytes;
+        out = v; bias = bv;
+    }
+    float acc = dot_q4_0_col_q8_range_bsz(wcol, xq, xd, bi0, bi1, lane, q4_0_block_bytes(n_rows, col_bytes));
+    __shared__ float p[2];
+    if (lane == 0) p[warp] = acc;
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        float a = p[0] + p[1];
+        if (use_bias) a += bias[oj];
+        out[oj] = a;
+    }
+}
+
+// ── Q4_0 fused decode paths (MoE packs): stage activation once, multi-mat GEMV ──
+
+/// Fused Q+K+V for Tara MoE Q4_0 packs (quantize x once globally).
+extern "C" __global__ void gemv_q4_0_global_qkv(
+    const unsigned char* __restrict__ wq,
+    const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wv,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int n_rows, int n_q, int n_k, int n_v, int col_bytes,
+    int use_bias,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    const int n_tot = n_q + n_k + n_v;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    const float* bias;
+    int oj;
+    if (j < n_q) {
+        wcol = wq + (size_t)j * (size_t)col_bytes;
+        out = q; bias = bq; oj = j;
+    } else if (j < n_q + n_k) {
+        oj = j - n_q;
+        wcol = wk + (size_t)oj * (size_t)col_bytes;
+        out = k; bias = bk;
+    } else {
+        oj = j - n_q - n_k;
+        wcol = wv + (size_t)oj * (size_t)col_bytes;
+        out = v; bias = bv;
+    }
+    float acc = dot_q4_0_col_q8_range_bsz(wcol, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    if (lane == 0) {
+        if (use_bias) acc += bias[oj];
+        out[oj] = acc;
+    }
+}
+
+/// Fused dual GEMV for equal-shape Q4_0 mats (gate+up or Q+K). Quantize once.
+extern "C" __global__ void gemv_q4_0_global_pair(
+    const unsigned char* __restrict__ wa,
+    const unsigned char* __restrict__ wb,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out_a,
+    float* __restrict__ out_b,
+    int n_rows, int n_cols, int col_bytes
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols) return;
+    const unsigned char* ca = wa + (size_t)j * (size_t)col_bytes;
+    const unsigned char* cb = wb + (size_t)j * (size_t)col_bytes;
+    float aa = dot_q4_0_col_q8_range_bsz(ca, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    float ab = dot_q4_0_col_q8_range_bsz(cb, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    if (lane == 0) {
+        out_a[j] = aa;
+        out_b[j] = ab;
+    }
+}
+
+/// Dense Q4_0 gate+up+SiLU*mul (same math as expert path, no expert index).
+extern "C" __global__ void gemv_q4_0_global_ffn(
+    const unsigned char* __restrict__ gate,
+    const unsigned char* __restrict__ up,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out_ff,
+    int n_rows, int n_cols, int col_bytes
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols) return;
+    const unsigned char* cg = gate + (size_t)j * (size_t)col_bytes;
+    const unsigned char* cu = up + (size_t)j * (size_t)col_bytes;
+    float ag = dot_q4_0_col_q8_range_bsz(cg, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    float au = dot_q4_0_col_q8_range_bsz(cu, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    if (lane == 0) {
+        float silu = ag / (1.f + __expf(-ag));
+        out_ff[j] = silu * au;
+    }
+}
+
+/// MoE expert gate+up from float x: quantize once in smem (drops host quantize launch).
+extern "C" __global__ void gemv_q4_0_expert_gate_up_f32(
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ up_packed,
+    const float* __restrict__ x,
+    float* __restrict__ out_ff,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    const int expert = expert_ids[slot];
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols_expert) return;
+    const int packed_j = expert * n_cols_expert + j;
+    const unsigned char* cg = gate_packed + (size_t)packed_j * (size_t)col_bytes;
+    const unsigned char* cu = up_packed + (size_t)packed_j * (size_t)col_bytes;
+    float ag = dot_q4_0_col_q8_range_bsz(cg, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    float au = dot_q4_0_col_q8_range_bsz(cu, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    if (lane == 0) {
+        float silu = ag / (1.f + __expf(-ag));
+        out_ff[j] = silu * au;
+    }
+}
+
+/// MoE expert down from float hb + residual scale-add (smem quantize once).
+extern "C" __global__ void gemv_q4_0_expert_down_scale_f32(
+    const unsigned char* __restrict__ down_packed,
+    const float* __restrict__ hb,
+    float* __restrict__ residual_x,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ weights,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(hb, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    const int expert = expert_ids[slot];
+    const float w = weights[slot];
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols_expert) return;
+    const int packed_j = expert * n_cols_expert + j;
+    const unsigned char* col = down_packed + (size_t)packed_j * (size_t)col_bytes;
+    float acc = dot_q4_0_col_q8_range_bsz(col, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
     if (lane == 0) residual_x[j] += w * acc;
 }
 

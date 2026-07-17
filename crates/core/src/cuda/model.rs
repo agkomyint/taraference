@@ -60,6 +60,9 @@ pub struct CudaModel {
     /// Decode activation quantization arena, reused by fused Q4 projections.
     pub(crate) q8_x: CudaSlice<i8>,
     pub(crate) q8_d: CudaSlice<f32>,
+    /// MoE intermediate (post gate×up) Q8 for fused gate_up→down without float hb.
+    pub(crate) q8_ff: CudaSlice<i8>,
+    pub(crate) q8_ff_d: CudaSlice<f32>,
     /// Split-K GEMV partials: layout `[GEMV_SPLIT_MAX, max_gemv_cols]`.
     pub(crate) gemv_partial: CudaSlice<f32>,
     /// Capacity of one partial row (= max n_cols among gemv mats / vocab).

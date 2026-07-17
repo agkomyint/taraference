@@ -318,8 +318,33 @@ impl CudaModel {
             gemv_q4_0_global: module.load_function("gemv_q4_0_global")?,
             gemv_q4_0_expert_slot: module.load_function("gemv_q4_0_global_expert_slot")?,
             gemv_q4_0_expert_gate_up: module.load_function("gemv_q4_0_global_expert_gate_up")?,
+            gemv_q4_0_expert_gate_up_q8: module
+                .load_function("gemv_q4_0_global_expert_gate_up_q8")?,
             gemv_q4_0_expert_down_scale: module
                 .load_function("gemv_q4_0_global_expert_down_scale")?,
+            gemv_f16_expert_gate_up: module.load_function("gemv_f16_expert_gate_up")?,
+            gemv_f16_expert_down_scale: module.load_function("gemv_f16_expert_down_scale")?,
+            gemv_f16_expert_gate_up_4w: module.load_function("gemv_f16_expert_gate_up_4w")?,
+            gemv_f16_expert_down_scale_4w: module
+                .load_function("gemv_f16_expert_down_scale_4w")?,
+            gemv_q4_0_bm_expert_gate_up: module.load_function("gemv_q4_0_bm_expert_gate_up")?,
+            gemv_q4_0_bm_expert_down_scale: module
+                .load_function("gemv_q4_0_bm_expert_down_scale")?,
+            gemv_q4_0_qkv: module.load_function("gemv_q4_0_global_qkv")?,
+            gemv_q4_0_qkv_2w: module.load_function("gemv_q4_0_global_qkv_2w")?,
+            gemv_q4_0_pair: module.load_function("gemv_q4_0_global_pair")?,
+            gemv_q4_0_ffn: module.load_function("gemv_q4_0_global_ffn")?,
+            gemv_q4_0_expert_gate_up_2w: module
+                .load_function("gemv_q4_0_global_expert_gate_up_2w")?,
+            gemv_q4_0_expert_down_scale_2w: module
+                .load_function("gemv_q4_0_global_expert_down_scale_2w")?,
+            gemv_q4_0_expert_gate_up_4w: module
+                .load_function("gemv_q4_0_global_expert_gate_up_4w")?,
+            gemv_q4_0_expert_down_scale_4w: module
+                .load_function("gemv_q4_0_global_expert_down_scale_4w")?,
+            gemv_q4_0_expert_gate_up_f32: module.load_function("gemv_q4_0_expert_gate_up_f32")?,
+            gemv_q4_0_expert_down_scale_f32: module
+                .load_function("gemv_q4_0_expert_down_scale_f32")?,
             gemv_q8_expert_gate_up: module.load_function("gemv_q8_0_global_expert_gate_up")?,
             gemv_q8_expert_down_scale: module
                 .load_function("gemv_q8_0_global_expert_down_scale")?,
@@ -375,6 +400,8 @@ impl CudaModel {
             embed_q6_one_d: module.load_function("embed_q6_k_one_d")?,
             embed_q8_one_d: module.load_function("embed_q8_0_one_d")?,
             rms_norm: module.load_function("rms_norm_f32")?,
+            moe_ffn_prep: module.load_function("moe_ffn_prep_rms_router_quant")?,
+            attn_prep: module.load_function("attn_prep_rms_quant")?,
             silu_mul: module.load_function("silu_mul_f32")?,
             add: module.load_function("add_f32")?,
             scale_add: module.load_function("scale_add_f32")?,
@@ -671,8 +698,7 @@ impl CudaModel {
         let mut type_bytes = [0usize; 5];
         let mut count_mat = |m: &GpuMat| {
             let idx = match m.wtype {
-                WType::Q4K => 0,
-                WType::Q4_0 => 0,
+                WType::Q4K | WType::Q4_0 | WType::Q4_0_BM | WType::F16 => 0,
                 WType::Q5K => 1,
                 WType::Q5_0 => 2,
                 WType::Q6K => 3,
@@ -811,6 +837,8 @@ impl CudaModel {
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,
             q8_x: stream.alloc_zeros(cfg.n_ff.max(n_embd).max(ssm_qkv).max(ssm_val))?,
             q8_d: stream.alloc_zeros((cfg.n_ff.max(n_embd).max(ssm_qkv).max(ssm_val) + 31) / 32)?,
+            q8_ff: stream.alloc_zeros(cfg.n_ff.max(32))?,
+            q8_ff_d: stream.alloc_zeros((cfg.n_ff.max(32) + 31) / 32)?,
             gemv_partial: stream.alloc_zeros(GEMV_SPLIT_MAX * gemv_partial_stride)?,
             gemv_partial_stride,
             d_pos0: stream.alloc_zeros(1)?,

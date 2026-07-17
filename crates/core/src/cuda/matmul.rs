@@ -328,6 +328,9 @@ fn gemv_baseline(
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4,
         WType::Q4_0 => &k.gemv_q4_0,
+        WType::F16 | WType::Q4_0_BM => {
+            unreachable!("F16/Q4_0_BM MoE experts use expert kernels")
+        }
         WType::Q5K => &k.gemv_q5k,
         WType::Q5_0 => &k.gemv_q5,
         WType::Q6K if use_q6_repack => &k.gemv_q6_repack,
@@ -407,7 +410,9 @@ fn gemv_splitk(
 
     let f = match w.wtype {
         WType::Q4K => &k.gemv_q4_splitk,
-        WType::Q4_0 => unreachable!("Q4_0 uses baseline/global path"),
+        WType::Q4_0 | WType::Q4_0_BM | WType::F16 => {
+            unreachable!("Q4_0/BM/F16 use baseline/expert paths")
+        }
         WType::Q5K => &k.gemv_q5k_splitk,
         WType::Q5_0 => &k.gemv_q5_splitk,
         WType::Q6K if use_q6_repack => &k.gemv_q6_repack_splitk,
@@ -475,7 +480,60 @@ pub(crate) fn try_gemv_pair(
     if try_gemv_q5_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb)? {
         return Ok(true);
     }
+    if try_gemv_q4_0_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb, q8_x, q8_d)? {
+        return Ok(true);
+    }
     try_gemv_q4_pair(stream, k, wa, wb, x, out_a, out_b, ba, bb, q8_x, q8_d)
+}
+
+/// Equal-width Q4_0 pair (MoE pack attn Q+K / dense dual). No bias support (MoE packs have none).
+fn try_gemv_q4_0_pair(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    wa: &GpuMat,
+    wb: &GpuMat,
+    x: &CudaSlice<f32>,
+    out_a: &mut CudaSlice<f32>,
+    out_b: &mut CudaSlice<f32>,
+    ba: Option<&CudaSlice<f32>>,
+    bb: Option<&CudaSlice<f32>>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
+) -> Result<bool> {
+    if ba.is_some() || bb.is_some() {
+        return Ok(false);
+    }
+    if wa.wtype != WType::Q4_0
+        || wb.wtype != WType::Q4_0
+        || wa.n_rows != wb.n_rows
+        || wa.n_cols != wb.n_cols
+        || wa.col_bytes != wb.col_bytes
+    {
+        return Ok(false);
+    }
+    let n_rows = wa.n_rows as i32;
+    let n_cols = wa.n_cols as i32;
+    let col_bytes = wa.col_bytes as i32;
+    quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+    unsafe {
+        stream
+            .launch_builder(&k.gemv_q4_0_pair)
+            .arg(&wa.data)
+            .arg(&wb.data)
+            .arg(q8_x)
+            .arg(q8_d)
+            .arg(out_a)
+            .arg(out_b)
+            .arg(&n_rows)
+            .arg(&n_cols)
+            .arg(&col_bytes)
+            .launch(lc_gemv_quantized(
+                wa.n_cols as u32,
+                wa.n_rows as u32,
+                k.gemv_quantized_warps,
+            ))?;
+    }
+    Ok(true)
 }
 
 /// Equal-width Q4_K pair with both matrices evaluated by the same block.
@@ -523,7 +581,7 @@ pub(crate) fn try_gemv_q4_dual(
     Ok(true)
 }
 
-/// Equal-width Q4_K FFN gate+up with the SiLU/multiply epilogue fused.
+/// Equal-width Q4_K / Q4_0 FFN gate+up with the SiLU/multiply epilogue fused.
 pub(crate) fn try_gemv_q4_ffn(
     stream: &Arc<CudaStream>,
     k: &Kernels,
@@ -534,6 +592,36 @@ pub(crate) fn try_gemv_q4_ffn(
     q8_x: &mut CudaSlice<i8>,
     q8_d: &mut CudaSlice<f32>,
 ) -> Result<bool> {
+    // MoE-pack dense layers: Q4_0 gate+up+SiLU in one launch.
+    if gate.wtype == WType::Q4_0
+        && up.wtype == WType::Q4_0
+        && gate.n_rows == up.n_rows
+        && gate.n_cols == up.n_cols
+        && gate.col_bytes == up.col_bytes
+    {
+        let n_rows = gate.n_rows as i32;
+        let n_cols = gate.n_cols as i32;
+        let col_bytes = gate.col_bytes as i32;
+        quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+        unsafe {
+            stream
+                .launch_builder(&k.gemv_q4_0_ffn)
+                .arg(&gate.data)
+                .arg(&up.data)
+                .arg(q8_x)
+                .arg(q8_d)
+                .arg(out)
+                .arg(&n_rows)
+                .arg(&n_cols)
+                .arg(&col_bytes)
+                .launch(lc_gemv_quantized(
+                    gate.n_cols as u32,
+                    gate.n_rows as u32,
+                    k.gemv_quantized_warps,
+                ))?;
+        }
+        return Ok(true);
+    }
     if gate.wtype != WType::Q4K
         || up.wtype != WType::Q4K
         || gate.n_rows != up.n_rows
@@ -707,6 +795,91 @@ fn try_gemv_q5_pair(
     Ok(true)
 }
 
+/// Launch Q4_0 fused QKV using **already quantized** activations (q8_x / q8_d).
+pub(crate) fn launch_gemv_q4_0_qkv(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    wq: &GpuMat,
+    wk: &GpuMat,
+    wv: &GpuMat,
+    q8_x: &CudaSlice<i8>,
+    q8_d: &CudaSlice<f32>,
+    q: &mut CudaSlice<f32>,
+    k_out: &mut CudaSlice<f32>,
+    v_out: &mut CudaSlice<f32>,
+    bq: Option<&CudaSlice<f32>>,
+    bk: Option<&CudaSlice<f32>>,
+    bv: Option<&CudaSlice<f32>>,
+    x_placeholder: &CudaSlice<f32>,
+) -> Result<bool> {
+    let n_rows = wq.n_rows as i32;
+    let n_q = wq.n_cols as i32;
+    let n_k = wk.n_cols as i32;
+    let n_v = wv.n_cols as i32;
+    let col_bytes = wq.col_bytes as i32;
+    let all_bias = bq.is_some() && bk.is_some() && bv.is_some();
+    let use_bias = if all_bias { 1i32 } else { 0i32 };
+    let bq_p = bq.unwrap_or(x_placeholder);
+    let bk_p = bk.unwrap_or(x_placeholder);
+    let bv_p = bv.unwrap_or(x_placeholder);
+    let n_tot = (wq.n_cols + wk.n_cols + wv.n_cols) as u32;
+    let use_2w = wq.n_rows >= 512 && (wq.n_rows / 32) >= 16;
+    unsafe {
+        if use_2w {
+            stream
+                .launch_builder(&k.gemv_q4_0_qkv_2w)
+                .arg(&wq.data)
+                .arg(&wk.data)
+                .arg(&wv.data)
+                .arg(q8_x)
+                .arg(q8_d)
+                .arg(q)
+                .arg(k_out)
+                .arg(v_out)
+                .arg(&n_rows)
+                .arg(&n_q)
+                .arg(&n_k)
+                .arg(&n_v)
+                .arg(&col_bytes)
+                .arg(&use_bias)
+                .arg(bq_p)
+                .arg(bk_p)
+                .arg(bv_p)
+                .launch(LaunchConfig {
+                    grid_dim: (n_tot, 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        } else {
+            stream
+                .launch_builder(&k.gemv_q4_0_qkv)
+                .arg(&wq.data)
+                .arg(&wk.data)
+                .arg(&wv.data)
+                .arg(q8_x)
+                .arg(q8_d)
+                .arg(q)
+                .arg(k_out)
+                .arg(v_out)
+                .arg(&n_rows)
+                .arg(&n_q)
+                .arg(&n_k)
+                .arg(&n_v)
+                .arg(&col_bytes)
+                .arg(&use_bias)
+                .arg(bq_p)
+                .arg(bk_p)
+                .arg(bv_p)
+                .launch(lc_gemv_quantized(
+                    n_tot,
+                    wq.n_rows as u32,
+                    k.gemv_quantized_warps,
+                ))?;
+        }
+    }
+    Ok(true)
+}
+
 /// Decode Q+K+V in one GEMV for Q4_K or Q5_0 (stage `x` once).
 pub(crate) fn try_gemv_qkv(
     stream: &Arc<CudaStream>,
@@ -732,6 +905,18 @@ pub(crate) fn try_gemv_qkv(
         && wq.col_bytes == wv.col_bytes;
     let all_bias = bq.is_some() && bk.is_some() && bv.is_some();
     let no_bias = bq.is_none() && bk.is_none() && bv.is_none();
+    // Tara MoE Q4_0 packs: fused Q+K+V (was falling back to 3× baseline GEMV).
+    if wq.wtype == WType::Q4_0
+        && wk.wtype == WType::Q4_0
+        && wv.wtype == WType::Q4_0
+        && same_shape
+        && (all_bias || no_bias)
+    {
+        quantize_q8(stream, k, x, q8_x, q8_d, wq.n_rows as i32)?;
+        return launch_gemv_q4_0_qkv(
+            stream, k, wq, wk, wv, q8_x, q8_d, q, k_out, v_out, bq, bk, bv, x,
+        );
+    }
     if wq.wtype == WType::Q4K
         && wk.wtype == WType::Q4K
         && wv.wtype == WType::Q4K
@@ -1074,7 +1259,7 @@ pub(crate) fn gemm(
     }
     let f = match w.wtype {
         WType::Q4K => &k.gemm_q4,
-        WType::Q4_0 => unreachable!(),
+        WType::Q4_0 | WType::Q4_0_BM | WType::F16 => unreachable!(),
         WType::Q5K => &k.gemm_q5k,
         WType::Q5_0 => &k.gemm_q5,
         WType::Q6K => &k.gemm_q6,
@@ -1109,7 +1294,7 @@ impl CudaModel {
         }
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4,
-            WType::Q4_0 => unreachable!(),
+            WType::Q4_0 | WType::Q4_0_BM | WType::F16 => unreachable!(),
             WType::Q5K => &self.k.embed_q5k,
             WType::Q5_0 => &self.k.embed_q5,
             WType::Q6K => &self.k.embed_q6,
@@ -1141,7 +1326,7 @@ impl CudaModel {
         }
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4_one,
-            WType::Q4_0 => unreachable!(),
+            WType::Q4_0 | WType::Q4_0_BM | WType::F16 => unreachable!(),
             WType::Q5K => &self.k.embed_q5k_one,
             WType::Q5_0 => &self.k.embed_q5_one,
             WType::Q6K => &self.k.embed_q6_one,
@@ -1173,7 +1358,7 @@ impl CudaModel {
         }
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4_one_d,
-            WType::Q4_0 => unreachable!(),
+            WType::Q4_0 | WType::Q4_0_BM | WType::F16 => unreachable!(),
             WType::Q5K => &self.k.embed_q5k_one_d,
             WType::Q5_0 => &self.k.embed_q5_one_d,
             WType::Q6K => &self.k.embed_q6_one_d,

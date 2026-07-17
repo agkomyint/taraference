@@ -58,6 +58,8 @@ struct PackFileMeta {
 
 const Q8_0_BLOCK: usize = 34;
 const Q4_0_BLOCK: usize = 18;
+/// Padded Q4_0 block for vectorized loads: f16 d + 2B pad + 16B qs + pad.
+const Q4_0_ALIGN_BLOCK: usize = 32;
 
 fn q8_col_bytes(n_rows: usize) -> usize {
     (n_rows / 32) * Q8_0_BLOCK
@@ -65,6 +67,133 @@ fn q8_col_bytes(n_rows: usize) -> usize {
 
 fn q4_col_bytes(n_rows: usize) -> usize {
     (n_rows / 32) * Q4_0_BLOCK
+}
+
+fn q4_align_col_bytes(n_rows: usize) -> usize {
+    (n_rows / 32) * Q4_0_ALIGN_BLOCK
+}
+
+/// IEEE f32 → f16 bits (round-to-nearest-even-ish).
+fn f32_to_f16_bits(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let mant = x & 0x7f_ffff;
+    let exp = ((x >> 23) & 0xff) as i32;
+    if exp == 255 {
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    if exp == 0 {
+        return sign; // flush denorm to 0
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return sign | 0x7c00; // inf
+    }
+    if new_exp <= 0 {
+        return sign; // underflow
+    }
+    let new_mant = mant + 0x1000; // round
+    sign | ((new_exp as u16) << 10) | ((new_mant >> 13) as u16)
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h as u32) & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let bits = if exp == 0 {
+        sign
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | ((mant as u32) << 13)
+    } else {
+        sign | (((exp as u32) - 15 + 127) << 23) | ((mant as u32) << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Column-major Q4_0 [n_cols][n_blocks][18] → block-major [n_blocks][n_cols][18].
+fn repack_q4_0_block_major(src: &[u8], n_rows: usize, n_cols: usize) -> Result<Vec<u8>> {
+    let n_blocks = n_rows / 32;
+    let col_stride = n_blocks * Q4_0_BLOCK;
+    if src.len() != col_stride * n_cols {
+        bail!("q4 bm size mismatch");
+    }
+    let mut out = vec![0u8; src.len()];
+    for j in 0..n_cols {
+        for bi in 0..n_blocks {
+            let s = j * col_stride + bi * Q4_0_BLOCK;
+            let d = bi * n_cols * Q4_0_BLOCK + j * Q4_0_BLOCK;
+            out[d..d + Q4_0_BLOCK].copy_from_slice(&src[s..s + Q4_0_BLOCK]);
+        }
+    }
+    Ok(out)
+}
+
+/// Dequant Q4_0 file bytes → column-major f16 (u16 LE bits).
+fn dequant_q4_0_to_f16(src: &[u8], n_rows: usize, n_cols: usize) -> Result<Vec<u8>> {
+    let n_blocks = n_rows / 32;
+    let src_col = n_blocks * Q4_0_BLOCK;
+    if src.len() != src_col * n_cols {
+        bail!(
+            "q4→f16 size mismatch: got {} want {}",
+            src.len(),
+            src_col * n_cols
+        );
+    }
+    let mut out = vec![0u8; n_cols * n_rows * 2];
+    for j in 0..n_cols {
+        let sbase = j * src_col;
+        let dbase = j * n_rows;
+        for bi in 0..n_blocks {
+            let s = sbase + bi * Q4_0_BLOCK;
+            let d_bits = u16::from_le_bytes([src[s], src[s + 1]]);
+            let d = f16_bits_to_f32(d_bits);
+            let qs = &src[s + 2..s + 18];
+            for t in 0..16 {
+                let lo = (qs[t] & 0x0f) as i32 - 8;
+                let hi = (qs[t] >> 4) as i32 - 8;
+                let i0 = bi * 32 + t;
+                let i1 = bi * 32 + 16 + t;
+                let b0 = f32_to_f16_bits(lo as f32 * d).to_le_bytes();
+                let b1 = f32_to_f16_bits(hi as f32 * d).to_le_bytes();
+                let o0 = (dbase + i0) * 2;
+                let o1 = (dbase + i1) * 2;
+                out[o0] = b0[0];
+                out[o0 + 1] = b0[1];
+                out[o1] = b1[0];
+                out[o1 + 1] = b1[1];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Repack file Q4_0 (18B/block) → 32B aligned blocks for faster GEMV.
+fn repack_q4_0_align32(src: &[u8], n_rows: usize, n_cols: usize) -> Result<Vec<u8>> {
+    let n_blocks = n_rows / 32;
+    let src_col = n_blocks * Q4_0_BLOCK;
+    let dst_col = n_blocks * Q4_0_ALIGN_BLOCK;
+    if src.len() != src_col * n_cols {
+        bail!(
+            "q4 repack size mismatch: got {} want {}",
+            src.len(),
+            src_col * n_cols
+        );
+    }
+    let mut out = vec![0u8; dst_col * n_cols];
+    for j in 0..n_cols {
+        let sbase = j * src_col;
+        let dbase = j * dst_col;
+        for bi in 0..n_blocks {
+            let s = sbase + bi * Q4_0_BLOCK;
+            let d = dbase + bi * Q4_0_ALIGN_BLOCK;
+            // f16 scale
+            out[d] = src[s];
+            out[d + 1] = src[s + 1];
+            // bytes 2-3 pad; qs at 4..20 (4-byte aligned)
+            out[d + 4..d + 20].copy_from_slice(&src[s + 2..s + 18]);
+        }
+    }
+    Ok(out)
 }
 
 impl CudaModel {
@@ -99,7 +228,19 @@ impl CudaModel {
             attention_head_dim: meta.head_dim,
             no_rope_layer_interval: 0,
             n_ff,
-            n_ctx: meta.n_ctx,
+            // Train may say 1024; small MoE KV is cheap — allow longer chat ctx.
+            // Override: TARAFER_N_CTX=8192. Floor: max(meta, 4096) unless TARAFER_STRICT_CTX=1.
+            n_ctx: {
+                let env_ctx = std::env::var("TARAFER_N_CTX")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&n| n >= 256);
+                if std::env::var_os("TARAFER_STRICT_CTX").is_some() {
+                    env_ctx.unwrap_or(meta.n_ctx)
+                } else {
+                    env_ctx.unwrap_or(meta.n_ctx.max(4096))
+                }
+            },
             rope_theta: meta.rope_theta,
             rms_eps: meta.rms_eps,
             rope_dim: meta.head_dim,
@@ -123,8 +264,18 @@ impl CudaModel {
                 weight_bytes += e.metadata()?.len();
             }
         }
+        if is_q4 {
+            let mode = if std::env::var_os("TARAFER_MOE_F16").is_some() {
+                "experts Q4→f16"
+            } else if std::env::var_os("TARAFER_MOE_BM").is_some() {
+                "experts Q4 block-major"
+            } else {
+                "experts Q4 column-major"
+            };
+            eprintln!("decode | {mode}");
+        }
         eprintln!(
-            "GPU | {} MoE L={} dense_ffn={} moe_ffn={} d={} heads={}/{} ff={} experts={} top_k={} expert_ff={} | {:.2} GiB pack | decode={}",
+            "GPU | {} MoE L={} dense_ffn={} moe_ffn={} d={} heads={}/{} ff={} experts={} top_k={} expert_ff={} n_ctx={} | {:.2} GiB pack | decode={}",
             cfg.architecture,
             cfg.n_layer,
             cfg.num_dense_layers,
@@ -136,6 +287,7 @@ impl CudaModel {
             cfg.n_experts,
             cfg.router_top_k,
             cfg.expert_ff,
+            cfg.n_ctx,
             weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             decode.name()
         );
@@ -217,8 +369,33 @@ impl CudaModel {
             gemv_q4_0_global: module.load_function("gemv_q4_0_global")?,
             gemv_q4_0_expert_slot: module.load_function("gemv_q4_0_global_expert_slot")?,
             gemv_q4_0_expert_gate_up: module.load_function("gemv_q4_0_global_expert_gate_up")?,
+            gemv_q4_0_expert_gate_up_q8: module
+                .load_function("gemv_q4_0_global_expert_gate_up_q8")?,
             gemv_q4_0_expert_down_scale: module
                 .load_function("gemv_q4_0_global_expert_down_scale")?,
+            gemv_f16_expert_gate_up: module.load_function("gemv_f16_expert_gate_up")?,
+            gemv_f16_expert_down_scale: module.load_function("gemv_f16_expert_down_scale")?,
+            gemv_f16_expert_gate_up_4w: module.load_function("gemv_f16_expert_gate_up_4w")?,
+            gemv_f16_expert_down_scale_4w: module
+                .load_function("gemv_f16_expert_down_scale_4w")?,
+            gemv_q4_0_bm_expert_gate_up: module.load_function("gemv_q4_0_bm_expert_gate_up")?,
+            gemv_q4_0_bm_expert_down_scale: module
+                .load_function("gemv_q4_0_bm_expert_down_scale")?,
+            gemv_q4_0_qkv: module.load_function("gemv_q4_0_global_qkv")?,
+            gemv_q4_0_qkv_2w: module.load_function("gemv_q4_0_global_qkv_2w")?,
+            gemv_q4_0_pair: module.load_function("gemv_q4_0_global_pair")?,
+            gemv_q4_0_ffn: module.load_function("gemv_q4_0_global_ffn")?,
+            gemv_q4_0_expert_gate_up_2w: module
+                .load_function("gemv_q4_0_global_expert_gate_up_2w")?,
+            gemv_q4_0_expert_down_scale_2w: module
+                .load_function("gemv_q4_0_global_expert_down_scale_2w")?,
+            gemv_q4_0_expert_gate_up_4w: module
+                .load_function("gemv_q4_0_global_expert_gate_up_4w")?,
+            gemv_q4_0_expert_down_scale_4w: module
+                .load_function("gemv_q4_0_global_expert_down_scale_4w")?,
+            gemv_q4_0_expert_gate_up_f32: module.load_function("gemv_q4_0_expert_gate_up_f32")?,
+            gemv_q4_0_expert_down_scale_f32: module
+                .load_function("gemv_q4_0_expert_down_scale_f32")?,
             gemv_q8_expert_gate_up: module.load_function("gemv_q8_0_global_expert_gate_up")?,
             gemv_q8_expert_down_scale: module
                 .load_function("gemv_q8_0_global_expert_down_scale")?,
@@ -274,6 +451,8 @@ impl CudaModel {
             embed_q6_one_d: module.load_function("embed_q6_k_one_d")?,
             embed_q8_one_d: module.load_function("embed_q8_0_one_d")?,
             rms_norm: module.load_function("rms_norm_f32")?,
+            moe_ffn_prep: module.load_function("moe_ffn_prep_rms_router_quant")?,
+            attn_prep: module.load_function("attn_prep_rms_quant")?,
             silu_mul: module.load_function("silu_mul_f32")?,
             add: module.load_function("add_f32")?,
             scale_add: module.load_function("scale_add_f32")?,
@@ -341,35 +520,70 @@ impl CudaModel {
             let fi = meta.files.get(&name).unwrap();
             let path = dir.join(&name);
             let raw = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-            let col_bytes = if is_q4_file {
-                q4_col_bytes(fi.n_rows)
-            } else {
-                q8_col_bytes(fi.n_rows)
-            };
-            let expect = col_bytes * fi.n_cols;
-            if raw.len() != expect {
-                bail!(
-                    "{name}: got {} bytes, expected {expect} (rows={} cols={})",
-                    raw.len(),
-                    fi.n_rows,
-                    fi.n_cols
-                );
-            }
-            Ok(GpuMat {
-                data: stream.clone_htod(&raw)?,
-                decode_data: None,
-                compact_data: None,
-                n_rows: fi.n_rows,
-                n_cols: fi.n_cols,
-                col_bytes,
-                decode_col_bytes: col_bytes,
-                compact_col_bytes: 0,
-                wtype: if is_q4_file {
-                    WType::Q4_0
+            if is_q4_file {
+                let expect = q4_col_bytes(fi.n_rows) * fi.n_cols;
+                if raw.len() != expect {
+                    bail!(
+                        "{name}: got {} bytes, expected {expect} (rows={} cols={})",
+                        raw.len(),
+                        fi.n_rows,
+                        fi.n_cols
+                    );
+                }
+                // Optional 32B-aligned repack (TARAFER_Q4_ALIGN=1). Default keeps 18B
+                // (less weight traffic); align can help some GPUs with vector loads.
+                let use_align = std::env::var_os("TARAFER_Q4_ALIGN").is_some();
+                if use_align {
+                    let aligned = repack_q4_0_align32(&raw, fi.n_rows, fi.n_cols)?;
+                    let col_bytes = q4_align_col_bytes(fi.n_rows);
+                    Ok(GpuMat {
+                        data: stream.clone_htod(&aligned)?,
+                        decode_data: None,
+                        compact_data: None,
+                        n_rows: fi.n_rows,
+                        n_cols: fi.n_cols,
+                        col_bytes,
+                        decode_col_bytes: col_bytes,
+                        compact_col_bytes: 0,
+                        wtype: WType::Q4_0,
+                    })
                 } else {
-                    WType::Q8_0
-                },
-            })
+                    let col_bytes = q4_col_bytes(fi.n_rows);
+                    Ok(GpuMat {
+                        data: stream.clone_htod(&raw)?,
+                        decode_data: None,
+                        compact_data: None,
+                        n_rows: fi.n_rows,
+                        n_cols: fi.n_cols,
+                        col_bytes,
+                        decode_col_bytes: col_bytes,
+                        compact_col_bytes: 0,
+                        wtype: WType::Q4_0,
+                    })
+                }
+            } else {
+                let col_bytes = q8_col_bytes(fi.n_rows);
+                let expect = col_bytes * fi.n_cols;
+                if raw.len() != expect {
+                    bail!(
+                        "{name}: got {} bytes, expected {expect} (rows={} cols={})",
+                        raw.len(),
+                        fi.n_rows,
+                        fi.n_cols
+                    );
+                }
+                Ok(GpuMat {
+                    data: stream.clone_htod(&raw)?,
+                    decode_data: None,
+                    compact_data: None,
+                    n_rows: fi.n_rows,
+                    n_cols: fi.n_cols,
+                    col_bytes,
+                    decode_col_bytes: col_bytes,
+                    compact_col_bytes: 0,
+                    wtype: WType::Q8_0,
+                })
+            }
         };
         let upload_f32_vec = |name: &str, n: usize| -> Result<_> {
             let path = dir.join(name);
@@ -448,22 +662,39 @@ impl CudaModel {
                 }
                 let path = dir.join(&name);
                 let raw = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-                let cb = if is_q4_file {
-                    q4_col_bytes(n_rows)
+                if is_q4_file {
+                    let expect = q4_col_bytes(n_rows) * n_cols_e;
+                    if raw.len() != expect {
+                        bail!("{name}: got {} bytes, expected {expect}", raw.len());
+                    }
+                    // Default: col-major Q4 (best measured on short-K d=640; max CTA fill).
+                    // TARAFER_MOE_BM=1 → block-major layout + BM kernels.
+                    // TARAFER_MOE_F16=1 → expand f16 (usually slower / more BW).
+                    if std::env::var_os("TARAFER_MOE_F16").is_some() {
+                        let f16b = dequant_q4_0_to_f16(&raw, n_rows, n_cols_e)?;
+                        col_bytes = n_rows * 2;
+                        wtype = WType::F16;
+                        packed.extend_from_slice(&f16b);
+                    } else if std::env::var_os("TARAFER_MOE_BM").is_some() {
+                        let bm = repack_q4_0_block_major(&raw, n_rows, n_cols_e)?;
+                        col_bytes = q4_col_bytes(n_rows); // logical; kernel uses BM layout
+                        wtype = WType::Q4_0_BM;
+                        packed.extend_from_slice(&bm);
+                    } else {
+                        col_bytes = q4_col_bytes(n_rows);
+                        wtype = WType::Q4_0;
+                        packed.extend_from_slice(&raw);
+                    }
                 } else {
-                    q8_col_bytes(n_rows)
-                };
-                let expect = cb * n_cols_e;
-                if raw.len() != expect {
-                    bail!("{name}: got {} bytes, expected {expect}", raw.len());
+                    let cb = q8_col_bytes(n_rows);
+                    let expect = cb * n_cols_e;
+                    if raw.len() != expect {
+                        bail!("{name}: got {} bytes, expected {expect}", raw.len());
+                    }
+                    col_bytes = cb;
+                    wtype = WType::Q8_0;
+                    packed.extend_from_slice(&raw);
                 }
-                col_bytes = cb;
-                wtype = if is_q4_file {
-                    WType::Q4_0
-                } else {
-                    WType::Q8_0
-                };
-                packed.extend_from_slice(&raw);
             }
             Ok(GpuMat {
                 data: stream.clone_htod(&packed)?,
@@ -584,6 +815,8 @@ impl CudaModel {
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,
             q8_x: stream.alloc_zeros(cfg.n_ff.max(n_embd))?,
             q8_d: stream.alloc_zeros((cfg.n_ff.max(n_embd) + 31) / 32)?,
+            q8_ff: stream.alloc_zeros(cfg.n_ff.max(32))?,
+            q8_ff_d: stream.alloc_zeros((cfg.n_ff.max(32) + 31) / 32)?,
             gemv_partial: stream.alloc_zeros(GEMV_SPLIT_MAX * gemv_partial_stride)?,
             gemv_partial_stride,
             d_pos0: stream.alloc_zeros(1)?,

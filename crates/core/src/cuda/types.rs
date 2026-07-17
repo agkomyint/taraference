@@ -11,8 +11,12 @@ pub const MAX_VERIFY_TOKENS: usize = 9;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WType {
     Q4K,
-    /// GGML Q4_0 (18 B / 32 vals) — MoE pack BW path toward 750.
+    /// GGML Q4_0 (18 B / 32 vals) — column-major [n_cols][n_blocks][18].
     Q4_0,
+    /// Q4_0 block-major [n_blocks][n_cols][18] for coalesced multi-col expert GEMV.
+    Q4_0_BM,
+    /// Decode-optimized: Q4_0 expanded to f16 column-major (2 B/elem) at load.
+    F16,
     Q5K,
     Q5_0,
     Q6K,
@@ -130,7 +134,27 @@ pub struct Kernels {
     /// Packed MoE expert GEMV for Q4_0.
     pub gemv_q4_0_expert_slot: CudaFunction,
     pub gemv_q4_0_expert_gate_up: CudaFunction,
+    /// Gate+up+SiLU then Q8-quantize 32-col tiles (skips separate quantize before down).
+    pub gemv_q4_0_expert_gate_up_q8: CudaFunction,
     pub gemv_q4_0_expert_down_scale: CudaFunction,
+    /// f16 expert GEMV (Q4 expanded at load) — hot path for 100M@750.
+    pub gemv_f16_expert_gate_up: CudaFunction,
+    pub gemv_f16_expert_down_scale: CudaFunction,
+    pub gemv_f16_expert_gate_up_4w: CudaFunction,
+    pub gemv_f16_expert_down_scale_4w: CudaFunction,
+    pub gemv_q4_0_bm_expert_gate_up: CudaFunction,
+    pub gemv_q4_0_bm_expert_down_scale: CudaFunction,
+    /// Fused Q4_0 decode helpers (MoE packs fall off Q4_K paths without these).
+    pub gemv_q4_0_qkv: CudaFunction,
+    pub gemv_q4_0_qkv_2w: CudaFunction,
+    pub gemv_q4_0_pair: CudaFunction,
+    pub gemv_q4_0_ffn: CudaFunction,
+    pub gemv_q4_0_expert_gate_up_2w: CudaFunction,
+    pub gemv_q4_0_expert_down_scale_2w: CudaFunction,
+    pub gemv_q4_0_expert_gate_up_4w: CudaFunction,
+    pub gemv_q4_0_expert_down_scale_4w: CudaFunction,
+    pub gemv_q4_0_expert_gate_up_f32: CudaFunction,
+    pub gemv_q4_0_expert_down_scale_f32: CudaFunction,
     pub gemv_q8_expert_gate_up: CudaFunction,
     pub gemv_q8_expert_down_scale: CudaFunction,
     pub gemv_q4_splitk: CudaFunction,
@@ -188,6 +212,10 @@ pub struct Kernels {
     pub embed_q6_one_d: CudaFunction,
     pub embed_q8_one_d: CudaFunction,
     pub rms_norm: CudaFunction,
+    /// Fused MoE FFN prep: rms + router top-k + Q8 quant (decode n_tok=1).
+    pub moe_ffn_prep: CudaFunction,
+    /// Fused attn prep: rms + Q8 quant (decode n_tok=1).
+    pub attn_prep: CudaFunction,
     pub silu_mul: CudaFunction,
     pub add: CudaFunction,
     /// `a[i] += scale * b[i]` (MoE expert residual).

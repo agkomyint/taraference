@@ -3,8 +3,8 @@
 use super::decode::{find_by_name, AttnLaunch};
 use super::kv::CudaKv;
 use super::matmul::{
-    gemm, gemv, try_gemv_gdn_4way, try_gemv_global_q8, try_gemv_pair, try_gemv_q4_dual, try_gemv_q4_ffn, try_gemv_qkv,
-    GemvResidual,
+    gemm, gemv, launch_gemv_q4_0_qkv, try_gemv_gdn_4way, try_gemv_global_q8, try_gemv_pair,
+    try_gemv_q4_dual, try_gemv_q4_ffn, try_gemv_qkv, GemvResidual,
 };
 use super::model::CudaModel;
 use super::types::{FullAttnWeights, LayerAttn, LinearAttnWeights};
@@ -139,26 +139,55 @@ impl CudaModel {
     }
 
     fn attn_block(&mut self, li: usize, d: &ChunkDims, cache: &mut CudaKv) -> Result<()> {
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.rms_norm)
-                .arg(&self.x)
-                .arg(&self.layers[li].attn_norm)
-                .arg(&mut self.xb)
-                .arg(&d.n_embd)
-                .arg(&d.n_tok)
-                .arg(&d.eps)
-                .launch(LaunchConfig {
-                    grid_dim: (d.n_tok_u as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+        // Decode + Q4 MoE: fuse rms + quant once, then QKV from q8 (skip second quantize).
+        let use_attn_prep = d.n_tok_u == 1
+            && matches!(
+                &self.layers[li].attn,
+                LayerAttn::Full(full)
+                    if full.wq.wtype == super::types::WType::Q4_0
+                        && full.wk.wtype == super::types::WType::Q4_0
+                        && full.wv.wtype == super::types::WType::Q4_0
+            );
+        if use_attn_prep {
+            let n_embd_i = d.n_embd;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.attn_prep)
+                    .arg(&self.x)
+                    .arg(&self.layers[li].attn_norm)
+                    .arg(&mut self.xb)
+                    .arg(&mut self.q8_x)
+                    .arg(&mut self.q8_d)
+                    .arg(&n_embd_i)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        } else {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.rms_norm)
+                    .arg(&self.x)
+                    .arg(&self.layers[li].attn_norm)
+                    .arg(&mut self.xb)
+                    .arg(&d.n_embd)
+                    .arg(&d.n_tok)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (d.n_tok_u as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
         }
         // Layer storage is stable for this call; raw pointer avoids borrow conflicts
         // with gemv/gemm mutably borrowing `self`.
         let layer_ptr = &self.layers[li] as *const super::types::GpuLayer;
         match unsafe { &(*layer_ptr).attn } {
-            LayerAttn::Full(full) => self.attn_block_full(li, d, cache, full),
+            LayerAttn::Full(full) => self.attn_block_full(li, d, cache, full, use_attn_prep),
             LayerAttn::Linear(lin) => self.attn_block_linear(li, d, cache, lin),
         }
     }
@@ -169,12 +198,35 @@ impl CudaModel {
         d: &ChunkDims,
         cache: &mut CudaKv,
         full: &FullAttnWeights,
+        prequant_q8: bool,
     ) -> Result<()> {
         let fused = full.fused_q_gate;
         let apply_out_gate = fused && !flag_no_out_gate();
 
         if d.n_tok == 1 {
-            if try_gemv_qkv(
+            let qkv_ok = if prequant_q8
+                && full.wq.wtype == super::types::WType::Q4_0
+                && full.wk.wtype == super::types::WType::Q4_0
+                && full.wv.wtype == super::types::WType::Q4_0
+            {
+                launch_gemv_q4_0_qkv(
+                    &self.stream,
+                    &self.k,
+                    &full.wq,
+                    &full.wk,
+                    &full.wv,
+                    &self.q8_x,
+                    &self.q8_d,
+                    &mut self.q,
+                    &mut self.k_buf,
+                    &mut self.v_buf,
+                    full.bq.as_ref(),
+                    full.bk.as_ref(),
+                    full.bv.as_ref(),
+                    &self.xb,
+                )?
+            } else {
+                try_gemv_qkv(
                     &self.stream,
                     &self.k,
                     &full.wq,
@@ -192,7 +244,8 @@ impl CudaModel {
                     &mut self.gemv_partial,
                     self.gemv_partial_stride,
                 )?
-            {
+            };
+            if qkv_ok {
                 // fused Q+K+V
             } else if try_gemv_pair(
                     &self.stream,
@@ -1445,24 +1498,8 @@ impl CudaModel {
 
     fn ffn_block_moe_one(&mut self, li: usize, d: &ChunkDims) -> Result<()> {
         debug_assert_eq!(d.n_tok, 1);
-        let one = 1i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.rms_norm)
-                .arg(&self.x)
-                .arg(&self.layers[li].ffn_norm)
-                .arg(&mut self.xb)
-                .arg(&d.n_embd)
-                .arg(&one)
-                .arg(&d.eps)
-                .launch(LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
 
-        let (n_experts, mut top_k, expert_ff, gate_col_bytes, down_col_bytes, is_q4) =
+        let (n_experts, mut top_k, expert_ff, gate_col_bytes, down_col_bytes, is_q4, is_f16, is_q4_bm) =
             match &self.layers[li].ffn {
                 super::types::LayerFfn::Moe(m) => (
                     m.n_experts,
@@ -1471,6 +1508,8 @@ impl CudaModel {
                     m.gate_all.col_bytes,
                     m.down_all.col_bytes,
                     m.gate_all.wtype == super::types::WType::Q4_0,
+                    m.gate_all.wtype == super::types::WType::F16,
+                    m.gate_all.wtype == super::types::WType::Q4_0_BM,
                 ),
                 _ => unreachable!(),
             };
@@ -1491,8 +1530,24 @@ impl CudaModel {
         let gate_cb = gate_col_bytes as i32;
         let down_cb = down_col_bytes as i32;
 
-        // Device router top-k → moe_idx / moe_w (no host sync; CUDA-graph safe).
-        {
+        // f16 experts: rms+router (float x). Q4: fused prep with quant.
+        if is_f16 {
+            let one = 1i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.rms_norm)
+                    .arg(&self.x)
+                    .arg(&self.layers[li].ffn_norm)
+                    .arg(&mut self.xb)
+                    .arg(&n_embd_i)
+                    .arg(&one)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
             let router = match &self.layers[li].ffn {
                 super::types::LayerFfn::Moe(m) => &m.router as *const _,
                 _ => unreachable!(),
@@ -1514,23 +1569,58 @@ impl CudaModel {
                         shared_mem_bytes: 0,
                     })?;
             }
+        } else {
+            let router = match &self.layers[li].ffn {
+                super::types::LayerFfn::Moe(m) => &m.router as *const _,
+                _ => unreachable!(),
+            };
+            let router = unsafe { &*router };
+            let ffn_norm = &self.layers[li].ffn_norm;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.moe_ffn_prep)
+                    .arg(&self.x)
+                    .arg(ffn_norm)
+                    .arg(&mut self.xb)
+                    .arg(router)
+                    .arg(&mut self.moe_idx)
+                    .arg(&mut self.moe_w)
+                    .arg(&mut self.q8_x)
+                    .arg(&mut self.q8_d)
+                    .arg(&n_embd_i)
+                    .arg(&n_exp_i)
+                    .arg(&top_k_i)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
         }
 
-        // Quantize xb once for gate/up (n_rows = n_embd).
-        {
-            use super::matmul::quantize_q8;
-            quantize_q8(
-                &self.stream,
-                &self.k,
-                &self.xb,
-                &mut self.q8_x,
-                &mut self.q8_d,
-                n_embd_i,
-            )?;
-        }
-
-        // Fat blocks for expert GEMVs (1536 cols → fewer launches, high occupancy).
-        let warps = if is_q4 { 32u32 } else { self.k.gemv_quantized_warps.max(1) };
+        let use_f16 = is_f16;
+        let use_q4_bm = is_q4_bm;
+        let use_q4_4w = is_q4 && std::env::var_os("TARAFER_MOE_4W").is_some();
+        let use_q4_2w = is_q4 && std::env::var_os("TARAFER_MOE_2W").is_some();
+        // gate_up_q8 underfills short-K (d=640 → 20 blocks): only expert_ff/32 CTAs.
+        // Classic float hb + quant wins (~570 vs ~530). Opt-in: TARAFER_MOE_GATE_Q8=1.
+        let use_gate_q8 = is_q4
+            && expert_ff >= 32
+            && expert_ff % 32 == 0
+            && std::env::var_os("TARAFER_MOE_GATE_Q8").is_some()
+            && std::env::var_os("TARAFER_MOE_CLASSIC").is_none()
+            && !use_q4_4w
+            && !use_q4_2w;
+        // Short K (n_blocks < 32): 1 warp/col maximizes CTA count (latency-bound on laptop).
+        // Tall K: more warps amortize. Override with TARAFER_GEMV_WARPS.
+        let n_blocks_gate = (d.n_embd_u / 32).max(1);
+        let default_warps = if n_blocks_gate < 32 { 1u32 } else { 4u32 };
+        let warps = std::env::var("TARAFER_GEMV_WARPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&w: &u32| (1..=32).contains(&w))
+            .unwrap_or(default_warps);
         let threads = warps * 32;
         let grid_gate = ((expert_ff as u32) + warps - 1) / warps;
         let grid_down = ((d.n_embd_u as u32) + warps - 1) / warps;
@@ -1549,69 +1639,294 @@ impl CudaModel {
             let up_all = unsafe { &*up_all };
             let down_all = unsafe { &*down_all };
 
-            let gate_up_k = if is_q4 {
-                &self.k.gemv_q4_0_expert_gate_up
+            if use_q4_bm {
+                // Block-major Q4: one thread per output column (coalesced across j for fixed bi).
+                let bm_threads = 128u32;
+                let bm_grid_gate = (expert_ff as u32 + bm_threads - 1) / bm_threads;
+                let bm_grid_down = (d.n_embd_u as u32 + bm_threads - 1) / bm_threads;
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.gemv_q4_0_bm_expert_gate_up)
+                        .arg(&gate_all.data)
+                        .arg(&up_all.data)
+                        .arg(&self.q8_x)
+                        .arg(&self.q8_d)
+                        .arg(&mut self.hb)
+                        .arg(&self.moe_idx)
+                        .arg(&slot_i)
+                        .arg(&n_embd_i)
+                        .arg(&expert_ff_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (bm_grid_gate, 1, 1),
+                            block_dim: (bm_threads, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+                {
+                    use super::matmul::quantize_q8;
+                    quantize_q8(
+                        &self.stream,
+                        &self.k,
+                        &self.hb,
+                        &mut self.q8_ff,
+                        &mut self.q8_ff_d,
+                        expert_ff_i,
+                    )?;
+                }
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.gemv_q4_0_bm_expert_down_scale)
+                        .arg(&down_all.data)
+                        .arg(&self.q8_ff)
+                        .arg(&self.q8_ff_d)
+                        .arg(&mut self.x)
+                        .arg(&self.moe_idx)
+                        .arg(&self.moe_w)
+                        .arg(&slot_i)
+                        .arg(&expert_ff_i)
+                        .arg(&n_embd_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (bm_grid_down, 1, 1),
+                            block_dim: (bm_threads, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+            } else if use_f16 {
+                // f16 experts: float residual path, no per-token Q4 dequant.
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.gemv_f16_expert_gate_up_4w)
+                        .arg(&gate_all.data)
+                        .arg(&up_all.data)
+                        .arg(&self.xb)
+                        .arg(&mut self.hb)
+                        .arg(&self.moe_idx)
+                        .arg(&slot_i)
+                        .arg(&n_embd_i)
+                        .arg(&expert_ff_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (expert_ff as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    self.stream
+                        .launch_builder(&self.k.gemv_f16_expert_down_scale_4w)
+                        .arg(&down_all.data)
+                        .arg(&self.hb)
+                        .arg(&mut self.x)
+                        .arg(&self.moe_idx)
+                        .arg(&self.moe_w)
+                        .arg(&slot_i)
+                        .arg(&expert_ff_i)
+                        .arg(&n_embd_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (d.n_embd_u as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+            } else if use_q4_4w {
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.gemv_q4_0_expert_gate_up_4w)
+                        .arg(&gate_all.data)
+                        .arg(&up_all.data)
+                        .arg(&self.q8_x)
+                        .arg(&self.q8_d)
+                        .arg(&mut self.hb)
+                        .arg(&self.moe_idx)
+                        .arg(&slot_i)
+                        .arg(&n_embd_i)
+                        .arg(&expert_ff_i)
+                        .arg(&gate_cb)
+                        .launch(LaunchConfig {
+                            grid_dim: (expert_ff as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+                {
+                    use super::matmul::quantize_q8;
+                    quantize_q8(
+                        &self.stream,
+                        &self.k,
+                        &self.hb,
+                        &mut self.q8_ff,
+                        &mut self.q8_ff_d,
+                        expert_ff_i,
+                    )?;
+                }
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.gemv_q4_0_expert_down_scale_4w)
+                        .arg(&down_all.data)
+                        .arg(&self.q8_ff)
+                        .arg(&self.q8_ff_d)
+                        .arg(&mut self.x)
+                        .arg(&self.moe_idx)
+                        .arg(&self.moe_w)
+                        .arg(&slot_i)
+                        .arg(&expert_ff_i)
+                        .arg(&n_embd_i)
+                        .arg(&down_cb)
+                        .launch(LaunchConfig {
+                            grid_dim: (d.n_embd_u as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+            } else if use_q4_2w {
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.gemv_q4_0_expert_gate_up_2w)
+                        .arg(&gate_all.data)
+                        .arg(&up_all.data)
+                        .arg(&self.q8_x)
+                        .arg(&self.q8_d)
+                        .arg(&mut self.hb)
+                        .arg(&self.moe_idx)
+                        .arg(&slot_i)
+                        .arg(&n_embd_i)
+                        .arg(&expert_ff_i)
+                        .arg(&gate_cb)
+                        .launch(LaunchConfig {
+                            grid_dim: (expert_ff as u32, 1, 1),
+                            block_dim: (64, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+                {
+                    use super::matmul::quantize_q8;
+                    quantize_q8(
+                        &self.stream,
+                        &self.k,
+                        &self.hb,
+                        &mut self.q8_ff,
+                        &mut self.q8_ff_d,
+                        expert_ff_i,
+                    )?;
+                }
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.gemv_q4_0_expert_down_scale_2w)
+                        .arg(&down_all.data)
+                        .arg(&self.q8_ff)
+                        .arg(&self.q8_ff_d)
+                        .arg(&mut self.x)
+                        .arg(&self.moe_idx)
+                        .arg(&self.moe_w)
+                        .arg(&slot_i)
+                        .arg(&expert_ff_i)
+                        .arg(&n_embd_i)
+                        .arg(&down_cb)
+                        .launch(LaunchConfig {
+                            grid_dim: (d.n_embd_u as u32, 1, 1),
+                            block_dim: (64, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+            } else if use_gate_q8 {
+                // Gate+up → q8_ff (intermediate), then down. Input xb stays in q8_x.
+                let n_tiles = (expert_ff as u32) / 32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.gemv_q4_0_expert_gate_up_q8)
+                        .arg(&gate_all.data)
+                        .arg(&up_all.data)
+                        .arg(&self.q8_x)
+                        .arg(&self.q8_d)
+                        .arg(&mut self.q8_ff)
+                        .arg(&mut self.q8_ff_d)
+                        .arg(&self.moe_idx)
+                        .arg(&slot_i)
+                        .arg(&n_embd_i)
+                        .arg(&expert_ff_i)
+                        .arg(&gate_cb)
+                        .launch(LaunchConfig {
+                            grid_dim: (n_tiles, 1, 1),
+                            block_dim: (1024, 1, 1), // 32 warps × 32 lanes
+                            shared_mem_bytes: 0,
+                        })?;
+                    self.stream
+                        .launch_builder(&self.k.gemv_q4_0_expert_down_scale)
+                        .arg(&down_all.data)
+                        .arg(&self.q8_ff)
+                        .arg(&self.q8_ff_d)
+                        .arg(&mut self.x)
+                        .arg(&self.moe_idx)
+                        .arg(&self.moe_w)
+                        .arg(&slot_i)
+                        .arg(&expert_ff_i)
+                        .arg(&n_embd_i)
+                        .arg(&down_cb)
+                        .launch(LaunchConfig {
+                            grid_dim: (grid_down, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
             } else {
-                &self.k.gemv_q8_expert_gate_up
-            };
-            let down_scale_k = if is_q4 {
-                &self.k.gemv_q4_0_expert_down_scale
-            } else {
-                &self.k.gemv_q8_expert_down_scale
-            };
-
-            // Fused gate+up+SiLU → hb (hb2 unused placeholder for ABI)
-            unsafe {
-                self.stream
-                    .launch_builder(gate_up_k)
-                    .arg(&gate_all.data)
-                    .arg(&up_all.data)
-                    .arg(&self.q8_x)
-                    .arg(&self.q8_d)
-                    .arg(&mut self.hb)
-                    .arg(&mut self.hb2)
-                    .arg(&self.moe_idx)
-                    .arg(&slot_i)
-                    .arg(&n_embd_i)
-                    .arg(&expert_ff_i)
-                    .arg(&gate_cb)
-                    .launch(LaunchConfig {
-                        grid_dim: (grid_gate, 1, 1),
-                        block_dim: (threads, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
-            }
-            // Quantize silu*up (hb) for down.
-            {
-                use super::matmul::quantize_q8;
-                quantize_q8(
-                    &self.stream,
-                    &self.k,
-                    &self.hb,
-                    &mut self.q8_x,
-                    &mut self.q8_d,
-                    expert_ff_i,
-                )?;
-            }
-            // Fused down + residual scale-add
-            unsafe {
-                self.stream
-                    .launch_builder(down_scale_k)
-                    .arg(&down_all.data)
-                    .arg(&self.q8_x)
-                    .arg(&self.q8_d)
-                    .arg(&mut self.x)
-                    .arg(&self.moe_idx)
-                    .arg(&self.moe_w)
-                    .arg(&slot_i)
-                    .arg(&expert_ff_i)
-                    .arg(&n_embd_i)
-                    .arg(&down_cb)
-                    .launch(LaunchConfig {
-                        grid_dim: (grid_down, 1, 1),
-                        block_dim: (threads, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
+                // Classic: max CTA fill on short-K. Separate quantize once (don't re-quant per CTA).
+                let gate_up_k = if is_q4 {
+                    &self.k.gemv_q4_0_expert_gate_up
+                } else {
+                    &self.k.gemv_q8_expert_gate_up
+                };
+                let down_scale_k = if is_q4 {
+                    &self.k.gemv_q4_0_expert_down_scale
+                } else {
+                    &self.k.gemv_q8_expert_down_scale
+                };
+                unsafe {
+                    self.stream
+                        .launch_builder(gate_up_k)
+                        .arg(&gate_all.data)
+                        .arg(&up_all.data)
+                        .arg(&self.q8_x)
+                        .arg(&self.q8_d)
+                        .arg(&mut self.hb)
+                        .arg(&mut self.hb2)
+                        .arg(&self.moe_idx)
+                        .arg(&slot_i)
+                        .arg(&n_embd_i)
+                        .arg(&expert_ff_i)
+                        .arg(&gate_cb)
+                        .launch(LaunchConfig {
+                            grid_dim: (grid_gate, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+                {
+                    use super::matmul::quantize_q8;
+                    quantize_q8(
+                        &self.stream,
+                        &self.k,
+                        &self.hb,
+                        &mut self.q8_x,
+                        &mut self.q8_d,
+                        expert_ff_i,
+                    )?;
+                }
+                unsafe {
+                    self.stream
+                        .launch_builder(down_scale_k)
+                        .arg(&down_all.data)
+                        .arg(&self.q8_x)
+                        .arg(&self.q8_d)
+                        .arg(&mut self.x)
+                        .arg(&self.moe_idx)
+                        .arg(&self.moe_w)
+                        .arg(&slot_i)
+                        .arg(&expert_ff_i)
+                        .arg(&n_embd_i)
+                        .arg(&down_cb)
+                        .launch(LaunchConfig {
+                            grid_dim: (grid_down, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
             }
         }
         Ok(())
