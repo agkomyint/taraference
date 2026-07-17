@@ -11,6 +11,8 @@ pub const MAX_VERIFY_TOKENS: usize = 9;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WType {
     Q4K,
+    /// GGML Q4_0 (18 B / 32 vals) — MoE pack BW path toward 750.
+    Q4_0,
     Q5K,
     Q5_0,
     Q6K,
@@ -73,23 +75,21 @@ pub enum LayerAttn {
     Linear(LinearAttnWeights),
 }
 
-/// One MoE expert's SwiGLU weights (Q8_0).
-pub struct MoeExpertWeights {
-    pub gate: GpuMat,
-    pub up: GpuMat,
-    pub down: GpuMat,
-}
-
-/// Sparse MoE FFN: router (f32) + N experts; decode touches top-k only.
+/// Sparse MoE FFN: router (f32) + packed expert Q8 weights.
+/// Experts packed as consecutive column groups so GEMV can index by device top-k id
+/// (CUDA-graph safe, no host roundtrip). Inspired by AirLLM sparse weight access.
 pub struct MoeFfnWeights {
-    /// Row-major `[n_experts, n_embd]` f32 on device (optional path).
+    /// Row-major `[n_experts, n_embd]` f32.
     pub router: CudaSlice<f32>,
-    /// Host copy of router for CPU top-k without a device router GEMV.
-    pub router_host: Vec<f32>,
     pub n_experts: usize,
     pub top_k: usize,
     pub expert_ff: usize,
-    pub experts: Vec<MoeExpertWeights>,
+    /// Packed gate: n_rows=n_embd, n_cols=expert_ff * n_experts (Q8_0 columns).
+    pub gate_all: GpuMat,
+    /// Packed up: same layout as gate_all.
+    pub up_all: GpuMat,
+    /// Packed down: n_rows=expert_ff, n_cols=n_embd * n_experts.
+    pub down_all: GpuMat,
 }
 
 pub enum LayerFfn {
@@ -125,6 +125,10 @@ pub struct Kernels {
     pub gemv_q6_compact_global_mcol: CudaFunction,
     pub gemv_q8: CudaFunction,
     pub gemv_q8_global: CudaFunction,
+    pub gemv_q4_0: CudaFunction,
+    pub gemv_q4_0_global: CudaFunction,
+    /// Packed MoE expert GEMV for Q4_0.
+    pub gemv_q4_0_expert_slot: CudaFunction,
     pub gemv_q4_splitk: CudaFunction,
     pub gemv_q4_global_splitk: CudaFunction,
     pub gemv_q5_splitk: CudaFunction,
@@ -184,8 +188,14 @@ pub struct Kernels {
     pub add: CudaFunction,
     /// `a[i] += scale * b[i]` (MoE expert residual).
     pub scale_add: CudaFunction,
+    /// `a[i] += weights[slot] * b[i]`.
+    pub scale_add_slot: CudaFunction,
     /// Dense f32 GEMV for MoE router scores.
     pub gemv_f32_rows: CudaFunction,
+    /// Device MoE router top-k + softmax.
+    pub moe_router_topk: CudaFunction,
+    /// Q8 GEMV for packed expert column group selected by device top-k slot.
+    pub gemv_q8_expert_slot: CudaFunction,
     pub add_bias: CudaFunction,
     pub rope: CudaFunction,
     pub rope_d: CudaFunction,

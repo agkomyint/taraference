@@ -163,9 +163,8 @@ impl InferenceEngine {
             );
         }
         let mut model = CudaModel::load_tara_moe_pack(&path, cfg.decode)?;
-        // Dynamic top-k is data-dependent. Fixed experts (`TARAFER_MOE_FIXED`) can graph.
-        let moe_graph = std::env::var_os("TARAFER_MOE_FIXED").is_some() && cfg.cuda_graph;
-        model.set_cuda_graph(moe_graph);
+        // Device top-k + packed experts → fixed launch graph (real routing, no FIXED cheat).
+        model.set_cuda_graph(cfg.cuda_graph);
 
         let tok_gguf = resolve_tokenizer_gguf(&path)?;
         eprintln!("tokenizer | {}", tok_gguf.display());
@@ -189,9 +188,8 @@ impl InferenceEngine {
             .unwrap_or("tara-moe")
             .to_string();
         eprintln!(
-            "flags | cuda_graph={} | moe_fixed={} | decode={} | weight_gib={weight_gib:.3}",
-            moe_graph,
-            std::env::var_os("TARAFER_MOE_FIXED").is_some(),
+            "flags | cuda_graph={} | moe_device_topk=1 | decode={} | weight_gib={weight_gib:.3}",
+            cfg.cuda_graph,
             cfg.decode.name()
         );
 

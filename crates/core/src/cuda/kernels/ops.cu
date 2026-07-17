@@ -85,6 +85,81 @@ extern "C" __global__ void gemv_f32_rows(
     if (threadIdx.x == 0) y[row] = buf[0];
 }
 
+/// Device MoE router: scores = router @ x, write top-k indices + softmax weights.
+/// One block; n_experts <= 32, top_k <= 8. Fully device-side (CUDA-graph safe).
+extern "C" __global__ void moe_router_topk_f32(
+    const float* __restrict__ router,
+    const float* __restrict__ x,
+    int* __restrict__ top_idx,
+    float* __restrict__ top_w,
+    int n_experts,
+    int n_embd,
+    int top_k
+) {
+    __shared__ float scores[32];
+    __shared__ float red[256];
+    int tid = (int)threadIdx.x;
+    // Score each expert (serial over E, parallel reduce over embd — E is tiny).
+    for (int e = 0; e < n_experts; e++) {
+        const float* wr = router + (size_t)e * (size_t)n_embd;
+        float local = 0.f;
+        for (int i = tid; i < n_embd; i += (int)blockDim.x)
+            local += wr[i] * x[i];
+        red[tid] = local;
+        __syncthreads();
+        for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) scores[e] = red[0];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        // Iterative top-k (n_experts <= 32).
+        float taken = -1e30f;
+        for (int k = 0; k < top_k; k++) {
+            int best_i = 0;
+            float best_v = -1e30f;
+            for (int e = 0; e < n_experts; e++) {
+                float s = scores[e];
+                // Skip already chosen by marking after pick.
+                if (s > best_v) {
+                    best_v = s;
+                    best_i = e;
+                }
+            }
+            top_idx[k] = best_i;
+            top_w[k] = best_v;
+            scores[best_i] = -1e30f; // remove from next rounds
+            (void)taken;
+        }
+        // Softmax over selected logits only.
+        float max_l = top_w[0];
+        for (int k = 1; k < top_k; k++)
+            if (top_w[k] > max_l) max_l = top_w[k];
+        float sum = 0.f;
+        for (int k = 0; k < top_k; k++) {
+            top_w[k] = expf(top_w[k] - max_l);
+            sum += top_w[k];
+        }
+        float inv = sum > 0.f ? 1.f / sum : 0.f;
+        for (int k = 0; k < top_k; k++) top_w[k] *= inv;
+    }
+}
+
+/// a[i] += weights[slot] * b[i]  (device MoE residual; graph-safe)
+extern "C" __global__ void scale_add_slot_f32(
+    float* __restrict__ a,
+    const float* __restrict__ b,
+    const float* __restrict__ weights,
+    int slot,
+    int n
+) {
+    float scale = weights[slot];
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) a[i] += scale * b[i];
+}
+
 extern "C" __global__ void add_bias_f32(
     float* __restrict__ x, const float* __restrict__ b, int n_feat, int n_tok
 ) {

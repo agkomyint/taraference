@@ -6,8 +6,7 @@ use super::decode::DecodeBackend;
 use super::kernels::SOURCE;
 use super::model::CudaModel;
 use super::types::{
-    FullAttnWeights, GpuLayer, GpuMat, Kernels, LayerAttn, LayerFfn, MoeExpertWeights, MoeFfnWeights,
-    WType, MAX_BATCH,
+    FullAttnWeights, GpuLayer, GpuMat, Kernels, LayerAttn, LayerFfn, MoeFfnWeights, WType, MAX_BATCH,
 };
 use crate::config::{LayerKind, ModelConfig};
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,6 +19,10 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 struct PackMeta {
     format: String,
+    #[serde(default)]
+    quant: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
     arch: String,
     n_vocab: usize,
     n_embd: usize,
@@ -54,9 +57,14 @@ struct PackFileMeta {
 }
 
 const Q8_0_BLOCK: usize = 34;
+const Q4_0_BLOCK: usize = 18;
 
 fn q8_col_bytes(n_rows: usize) -> usize {
     (n_rows / 32) * Q8_0_BLOCK
+}
+
+fn q4_col_bytes(n_rows: usize) -> usize {
+    (n_rows / 32) * Q4_0_BLOCK
 }
 
 impl CudaModel {
@@ -66,8 +74,12 @@ impl CudaModel {
         let meta_raw = fs::read_to_string(&meta_path)
             .with_context(|| format!("read {}", meta_path.display()))?;
         let meta: PackMeta = serde_json::from_str(&meta_raw).context("parse meta.json")?;
-        if meta.format != "tara_moe_q8_v1" {
-            bail!("unsupported pack format {:?} (want tara_moe_q8_v1)", meta.format);
+        let is_q4 = meta.format == "tara_moe_q4_v1" || meta.quant.as_deref() == Some("q4_0");
+        if meta.format != "tara_moe_q8_v1" && !is_q4 {
+            bail!(
+                "unsupported pack format {:?} (want tara_moe_q8_v1 or tara_moe_q4_v1)",
+                meta.format
+            );
         }
         if meta.n_embd % 32 != 0 {
             bail!("n_embd={} must be multiple of 32 for Q8_0", meta.n_embd);
@@ -201,6 +213,9 @@ impl CudaModel {
             gemv_q6_compact_global_mcol: module.load_function("gemv_q6_k_compact_global_mcol")?,
             gemv_q8: module.load_function("gemv_q8_0")?,
             gemv_q8_global: module.load_function("gemv_q8_0_global")?,
+            gemv_q4_0: module.load_function("gemv_q4_0")?,
+            gemv_q4_0_global: module.load_function("gemv_q4_0_global")?,
+            gemv_q4_0_expert_slot: module.load_function("gemv_q4_0_global_expert_slot")?,
             gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
             gemv_q4_global_splitk: module.load_function("gemv_q4_k_global_splitk")?,
             gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,
@@ -256,7 +271,10 @@ impl CudaModel {
             silu_mul: module.load_function("silu_mul_f32")?,
             add: module.load_function("add_f32")?,
             scale_add: module.load_function("scale_add_f32")?,
+            scale_add_slot: module.load_function("scale_add_slot_f32")?,
             gemv_f32_rows: module.load_function("gemv_f32_rows")?,
+            moe_router_topk: module.load_function("moe_router_topk_f32")?,
+            gemv_q8_expert_slot: module.load_function("gemv_q8_0_global_expert_slot")?,
             add_bias: module.load_function("add_bias_f32")?,
             rope: module.load_function("rope_neox_f32")?,
             rope_d: module.load_function("rope_neox_f32_d")?,
@@ -305,14 +323,24 @@ impl CudaModel {
             copy_last: module.load_function("copy_last_row")?,
         };
 
-        let upload_q8 = |name: &str| -> Result<GpuMat> {
-            let fi = meta
-                .files
-                .get(name)
-                .ok_or_else(|| anyhow!("meta.files missing {name}"))?;
-            let path = dir.join(name);
+        let upload_mat = |stem: &str| -> Result<GpuMat> {
+            // Prefer .q4 then .q8 (Q4 packs mix embd.q8 + weight.q4).
+            let (name, is_q4_file) = if meta.files.contains_key(&format!("{stem}.q4")) {
+                (format!("{stem}.q4"), true)
+            } else if meta.files.contains_key(&format!("{stem}.q8")) {
+                (format!("{stem}.q8"), false)
+            } else {
+                bail!("meta.files missing {stem}.q4 or {stem}.q8");
+            };
+            let fi = meta.files.get(&name).unwrap();
+            let path = dir.join(&name);
             let raw = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-            let expect = q8_col_bytes(fi.n_rows) * fi.n_cols;
+            let col_bytes = if is_q4_file {
+                q4_col_bytes(fi.n_rows)
+            } else {
+                q8_col_bytes(fi.n_rows)
+            };
+            let expect = col_bytes * fi.n_cols;
             if raw.len() != expect {
                 bail!(
                     "{name}: got {} bytes, expected {expect} (rows={} cols={})",
@@ -321,7 +349,6 @@ impl CudaModel {
                     fi.n_cols
                 );
             }
-            let col_bytes = q8_col_bytes(fi.n_rows);
             Ok(GpuMat {
                 data: stream.clone_htod(&raw)?,
                 decode_data: None,
@@ -331,7 +358,11 @@ impl CudaModel {
                 col_bytes,
                 decode_col_bytes: col_bytes,
                 compact_col_bytes: 0,
-                wtype: WType::Q8_0,
+                wtype: if is_q4_file {
+                    WType::Q4_0
+                } else {
+                    WType::Q8_0
+                },
             })
         };
         let upload_f32_vec = |name: &str, n: usize| -> Result<_> {
@@ -347,12 +378,70 @@ impl CudaModel {
             Ok(stream.clone_htod(&v)?)
         };
 
-        let token_embd = upload_q8("token_embd.q8")?;
+        let token_embd = upload_mat("token_embd")?;
         let output_norm = upload_f32_vec("output_norm.f32", cfg.n_embd)?;
         // Tied embeddings: no separate output head.
         let output = None;
         let output_special = None;
         let output_special_id = None;
+
+        let pack_experts = |kind: &str,
+                            n_rows: usize,
+                            n_cols_e: usize,
+                            layer_i: usize|
+         -> Result<GpuMat> {
+            let mut packed = Vec::new();
+            let mut col_bytes = 0usize;
+            let mut wtype = WType::Q8_0;
+            for e in 0..meta.n_experts {
+                let stem = format!("blk.{layer_i}.exp{e}.ffn_{kind}");
+                let (name, is_q4_file) = if meta.files.contains_key(&format!("{stem}.q4")) {
+                    (format!("{stem}.q4"), true)
+                } else {
+                    (format!("{stem}.q8"), false)
+                };
+                let fi = meta
+                    .files
+                    .get(&name)
+                    .ok_or_else(|| anyhow!("meta.files missing {name}"))?;
+                if fi.n_rows != n_rows || fi.n_cols != n_cols_e {
+                    bail!(
+                        "{name}: shape {}x{}, expected {n_rows}x{n_cols_e}",
+                        fi.n_rows,
+                        fi.n_cols
+                    );
+                }
+                let path = dir.join(&name);
+                let raw = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+                let cb = if is_q4_file {
+                    q4_col_bytes(n_rows)
+                } else {
+                    q8_col_bytes(n_rows)
+                };
+                let expect = cb * n_cols_e;
+                if raw.len() != expect {
+                    bail!("{name}: got {} bytes, expected {expect}", raw.len());
+                }
+                col_bytes = cb;
+                wtype = if is_q4_file {
+                    WType::Q4_0
+                } else {
+                    WType::Q8_0
+                };
+                packed.extend_from_slice(&raw);
+            }
+            Ok(GpuMat {
+                data: stream.clone_htod(&packed)?,
+                decode_data: None,
+                compact_data: None,
+                n_rows,
+                n_cols: n_cols_e * meta.n_experts,
+                col_bytes,
+                decode_col_bytes: col_bytes,
+                compact_col_bytes: 0,
+                wtype,
+            })
+        };
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
@@ -367,57 +456,37 @@ impl CudaModel {
                     "moe"
                 });
             let attn = LayerAttn::Full(FullAttnWeights {
-                wq: upload_q8(&format!("blk.{i}.attn_q.q8"))?,
+                wq: upload_mat(&format!("blk.{i}.attn_q"))?,
                 bq: None,
-                wk: upload_q8(&format!("blk.{i}.attn_k.q8"))?,
+                wk: upload_mat(&format!("blk.{i}.attn_k"))?,
                 bk: None,
-                wv: upload_q8(&format!("blk.{i}.attn_v.q8"))?,
+                wv: upload_mat(&format!("blk.{i}.attn_v"))?,
                 bv: None,
-                // Pack uses attn_o; GGUF path uses attn_output.
-                wo: upload_q8(&format!("blk.{i}.attn_o.q8"))?,
+                wo: upload_mat(&format!("blk.{i}.attn_o"))?,
                 attn_q_norm: None,
                 attn_k_norm: None,
                 fused_q_gate: false,
             });
             let ffn = if kind == "dense" {
                 LayerFfn::Dense {
-                    gate: upload_q8(&format!("blk.{i}.ffn_gate.q8"))?,
-                    up: upload_q8(&format!("blk.{i}.ffn_up.q8"))?,
-                    down: upload_q8(&format!("blk.{i}.ffn_down.q8"))?,
+                    gate: upload_mat(&format!("blk.{i}.ffn_gate"))?,
+                    up: upload_mat(&format!("blk.{i}.ffn_up"))?,
+                    down: upload_mat(&format!("blk.{i}.ffn_down"))?,
                 }
             } else {
                 let router_elems = meta.n_experts * cfg.n_embd;
-                let router_host = {
-                    let path = dir.join(format!("blk.{i}.router.f32"));
-                    let raw = fs::read(&path)
-                        .with_context(|| format!("read {}", path.display()))?;
-                    if raw.len() != router_elems * 4 {
-                        bail!(
-                            "blk.{i}.router.f32: got {} bytes, expected {}",
-                            raw.len(),
-                            router_elems * 4
-                        );
-                    }
-                    raw.chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect::<Vec<f32>>()
-                };
-                let router = stream.clone_htod(&router_host)?;
-                let mut experts = Vec::with_capacity(meta.n_experts);
-                for e in 0..meta.n_experts {
-                    experts.push(MoeExpertWeights {
-                        gate: upload_q8(&format!("blk.{i}.exp{e}.ffn_gate.q8"))?,
-                        up: upload_q8(&format!("blk.{i}.exp{e}.ffn_up.q8"))?,
-                        down: upload_q8(&format!("blk.{i}.exp{e}.ffn_down.q8"))?,
-                    });
-                }
+                let router = upload_f32_vec(&format!("blk.{i}.router.f32"), router_elems)?;
+                let gate_all = pack_experts("gate", cfg.n_embd, meta.expert_ff, i)?;
+                let up_all = pack_experts("up", cfg.n_embd, meta.expert_ff, i)?;
+                let down_all = pack_experts("down", meta.expert_ff, cfg.n_embd, i)?;
                 LayerFfn::Moe(MoeFfnWeights {
                     router,
-                    router_host,
                     n_experts: meta.n_experts,
                     top_k: meta.router_top_k,
                     expert_ff: meta.expert_ff,
-                    experts,
+                    gate_all,
+                    up_all,
+                    down_all,
                 })
             };
             layers.push(GpuLayer {
@@ -439,7 +508,7 @@ impl CudaModel {
         eprintln!("weights | Q8_0 pack on device (tied embd, no separate output head)");
         ctx.synchronize().context("ctx sync after load")?;
         eprintln!(
-            "ready | decode={} | MoE sparse top-k | CUDA-graph disabled for dynamic routing",
+            "ready | decode={} | MoE device top-k (packed experts, graph-ready)",
             decode.name()
         );
 
@@ -495,11 +564,12 @@ impl CudaModel {
             gdn_conv: stream.alloc_zeros(1)?,
             gdn_out: stream.alloc_zeros(1)?,
             decode_graph: None,
-            // Dynamic top-k routing is data-dependent (graphs unsafe).
-            // Fixed experts (`TARAFER_MOE_FIXED`) is static — graphs OK if enabled later.
             graph_tried: false,
-            cuda_graph: std::env::var_os("TARAFER_MOE_FIXED").is_some(),
+            // Device-side top-k + packed experts → fixed launch structure → CUDA graphs OK.
+            cuda_graph: true,
             graph_active: false,
+            moe_idx: stream.alloc_zeros(8)?,
+            moe_w: stream.alloc_zeros(8)?,
             cfg,
             decode,
             gpu_name,

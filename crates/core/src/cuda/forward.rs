@@ -28,9 +28,11 @@ impl CudaModel {
             return self.forward_decode_one(tokens[0], cache);
         }
 
+        // Tara MoE Q4 packs (and sparse MoE prefill) use n_tok=1 chunks.
+        let max_chunk = if self.cfg.is_moe() { 1 } else { MAX_BATCH };
         let mut offset = 0usize;
         while offset < tokens.len() {
-            let n = (tokens.len() - offset).min(MAX_BATCH);
+            let n = (tokens.len() - offset).min(max_chunk);
             let chunk = &tokens[offset..offset + n];
             let pos0 = cache.len + offset;
             let is_last = offset + n == tokens.len();

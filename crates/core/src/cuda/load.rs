@@ -17,12 +17,13 @@ use taraference_gguf::{GgmlType, GgufFile};
 fn wtype_of(t: GgmlType) -> Result<WType> {
     Ok(match t {
         GgmlType::Q4_K => WType::Q4K,
+        GgmlType::Q4_0 => WType::Q4_0,
         GgmlType::Q5_K => WType::Q5K,
         GgmlType::Q5_0 => WType::Q5_0,
         GgmlType::Q6_K => WType::Q6K,
         GgmlType::Q8_0 => WType::Q8_0,
         other => bail!(
-            "unsupported weight type {} (supported: Q4_K, Q5_K, Q5_0, Q6_K, Q8_0)",
+            "unsupported weight type {} (supported: Q4_0, Q4_K, Q5_K, Q5_0, Q6_K, Q8_0)",
             other.name()
         ),
     })
@@ -313,6 +314,9 @@ impl CudaModel {
             gemv_q6_compact_global_mcol: module.load_function("gemv_q6_k_compact_global_mcol")?,
             gemv_q8: module.load_function("gemv_q8_0")?,
             gemv_q8_global: module.load_function("gemv_q8_0_global")?,
+            gemv_q4_0: module.load_function("gemv_q4_0")?,
+            gemv_q4_0_global: module.load_function("gemv_q4_0_global")?,
+            gemv_q4_0_expert_slot: module.load_function("gemv_q4_0_global_expert_slot")?,
             gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
             gemv_q4_global_splitk: module.load_function("gemv_q4_k_global_splitk")?,
             gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,
@@ -368,7 +372,10 @@ impl CudaModel {
             silu_mul: module.load_function("silu_mul_f32")?,
             add: module.load_function("add_f32")?,
             scale_add: module.load_function("scale_add_f32")?,
+            scale_add_slot: module.load_function("scale_add_slot_f32")?,
             gemv_f32_rows: module.load_function("gemv_f32_rows")?,
+            moe_router_topk: module.load_function("moe_router_topk_f32")?,
+            gemv_q8_expert_slot: module.load_function("gemv_q8_0_global_expert_slot")?,
             add_bias: module.load_function("add_bias_f32")?,
             rope: module.load_function("rope_neox_f32")?,
             rope_d: module.load_function("rope_neox_f32_d")?,
@@ -659,6 +666,7 @@ impl CudaModel {
         let mut count_mat = |m: &GpuMat| {
             let idx = match m.wtype {
                 WType::Q4K => 0,
+                WType::Q4_0 => 0,
                 WType::Q5K => 1,
                 WType::Q5_0 => 2,
                 WType::Q6K => 3,
@@ -679,11 +687,9 @@ impl CudaModel {
                     count_mat(down);
                 }
                 LayerFfn::Moe(m) => {
-                    for e in &m.experts {
-                        count_mat(&e.gate);
-                        count_mat(&e.up);
-                        count_mat(&e.down);
-                    }
+                    count_mat(&m.gate_all);
+                    count_mat(&m.up_all);
+                    count_mat(&m.down_all);
                 }
             }
             match &layer.attn {
@@ -817,6 +823,8 @@ impl CudaModel {
             graph_tried: false,
             cuda_graph: true,
             graph_active: false,
+            moe_idx: stream.alloc_zeros(8)?,
+            moe_w: stream.alloc_zeros(8)?,
             cfg,
             decode,
             gpu_name,

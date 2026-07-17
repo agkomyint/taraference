@@ -88,6 +88,10 @@ pub struct CudaModel {
     pub cuda_graph: bool,
     /// True once a graph is live and replaying.
     pub graph_active: bool,
+    /// MoE: device top-k expert indices (length >= router_top_k).
+    pub(crate) moe_idx: CudaSlice<i32>,
+    /// MoE: device top-k softmax weights.
+    pub(crate) moe_w: CudaSlice<f32>,
 }
 
 impl CudaModel {

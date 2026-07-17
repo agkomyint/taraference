@@ -541,6 +541,115 @@ __device__ __forceinline__ int load_int_unaligned(const void* ptr) {
     return val;
 }
 
+// Q4_0: 32 vals / block, 18 bytes (f16 d + 16B nibbles). Values = (nibble-8)*d.
+__device__ __forceinline__ float dot_q4_0_col_q8_range(
+    const unsigned char* __restrict__ col,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    int bi0,
+    int bi1,
+    int lane
+) {
+    float acc = 0.f;
+    for (int bi = bi0 + lane; bi < bi1; bi += 32) {
+        const unsigned char* base = col + bi * 18;
+        float dw = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const unsigned char* qs = base + 2;
+        const signed char* xv = xq + (bi << 5);
+        // Low nibbles → first 16; high nibbles → next 16 (GGML Q4_0 layout).
+        int sum = 0;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            int q0 = (int)(qs[j] & 0x0f) - 8;
+            int q1 = (int)(qs[j] >> 4) - 8;
+            sum += q0 * (int)xv[j];
+            sum += q1 * (int)xv[j + 16];
+        }
+        acc += dw * xd[bi] * (float)sum;
+    }
+    return warp_sum(acc);
+}
+
+// Q4_0 GEMV with in-kernel activation quant (prefill / baseline; graph decode prefers global).
+extern "C" __global__ void gemv_q4_0(
+    const unsigned char* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q4_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+extern "C" __global__ void gemv_q4_0_global(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q4_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+extern "C" __global__ void gemv_q4_0_global_expert_slot(
+    const unsigned char* __restrict__ w_packed,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes,
+    int use_res,
+    const float* __restrict__ residual
+) {
+    const int expert = expert_ids[slot];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols_expert) return;
+    const int packed_j = expert * n_cols_expert + j;
+    const unsigned char* col = w_packed + (size_t)packed_j * (size_t)col_bytes;
+    float acc = dot_q4_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        out[j] = acc;
+    }
+}
+
 // Fast path for Q5→Q8 hybrid weights: activation quantized once globally.
 // Q8_0 block = f16 d + 32×int8; activation groups match (32 vals, scale xd[bi]).
 __device__ __forceinline__ float dot_q8_0_col_q8_range(
@@ -618,6 +727,37 @@ extern "C" __global__ void gemv_q8_0_global(
     if (lane == 0) {
         acc = gemv_apply_res(use_res, acc, out, j, residual);
         if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+/// Sparse MoE expert GEMV: columns live in a packed buffer
+/// `w_packed[expert * n_cols_expert + j]`. Expert id from device `expert_ids[slot]`.
+/// CUDA-graph safe (static base ptr + device-side expert index).
+extern "C" __global__ void gemv_q8_0_global_expert_slot(
+    const unsigned char* __restrict__ w_packed,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    const int* __restrict__ expert_ids,
+    int slot,
+    int n_rows,
+    int n_cols_expert,
+    int col_bytes,
+    int use_res,
+    const float* __restrict__ residual
+) {
+    const int expert = expert_ids[slot];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols_expert) return;
+    const int packed_j = expert * n_cols_expert + j;
+    const unsigned char* col = w_packed + (size_t)packed_j * (size_t)col_bytes;
+    float acc = dot_q8_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
         out[j] = acc;
     }
 }

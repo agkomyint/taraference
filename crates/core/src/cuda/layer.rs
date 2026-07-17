@@ -1237,7 +1237,8 @@ impl CudaModel {
                     &mut self.q8_d,
                 )?
             {
-                gemv(
+                // Q4_0 / Q8 global quant path (required for MoE Q4 packs).
+                if !try_gemv_global_q8(
                     &self.stream,
                     &self.k,
                     gate,
@@ -1245,10 +1246,24 @@ impl CudaModel {
                     &mut self.hb,
                     None,
                     GemvResidual::None,
+                    &mut self.q8_x,
+                    &mut self.q8_d,
                     &mut self.gemv_partial,
                     self.gemv_partial_stride,
-                )?;
-                gemv(
+                )? {
+                    gemv(
+                        &self.stream,
+                        &self.k,
+                        gate,
+                        &self.xb,
+                        &mut self.hb,
+                        None,
+                        GemvResidual::None,
+                        &mut self.gemv_partial,
+                        self.gemv_partial_stride,
+                    )?;
+                }
+                if !try_gemv_global_q8(
                     &self.stream,
                     &self.k,
                     up,
@@ -1256,9 +1271,23 @@ impl CudaModel {
                     &mut self.hb2,
                     None,
                     GemvResidual::None,
+                    &mut self.q8_x,
+                    &mut self.q8_d,
                     &mut self.gemv_partial,
                     self.gemv_partial_stride,
-                )?;
+                )? {
+                    gemv(
+                        &self.stream,
+                        &self.k,
+                        up,
+                        &self.xb,
+                        &mut self.hb2,
+                        None,
+                        GemvResidual::None,
+                        &mut self.gemv_partial,
+                        self.gemv_partial_stride,
+                    )?;
+                }
             }
         } else {
             gemm(
@@ -1416,7 +1445,6 @@ impl CudaModel {
 
     fn ffn_block_moe_one(&mut self, li: usize, d: &ChunkDims) -> Result<()> {
         debug_assert_eq!(d.n_tok, 1);
-        let n_embd_u = d.n_embd_u;
         let one = 1i32;
         unsafe {
             self.stream
@@ -1434,110 +1462,129 @@ impl CudaModel {
                 })?;
         }
 
-        let (n_experts, top_k, expert_ff) = match &self.layers[li].ffn {
-            super::types::LayerFfn::Moe(m) => (m.n_experts, m.top_k, m.expert_ff),
-            _ => unreachable!(),
-        };
-
-        // Routing: fixed experts (BW ceiling) or host router on xb (one small D2H).
-        let selected: Vec<(usize, f32)> = if std::env::var_os("TARAFER_MOE_FIXED").is_some() {
-            // Always experts 0..top_k with equal weight — measures sparse FFN BW without sync.
-            let w = 1.0 / top_k.min(n_experts) as f32;
-            (0..top_k.min(n_experts)).map(|i| (i, w)).collect()
-        } else {
-            // CPU top-k on host router · xb (avoids GPU router kernel + score D2H).
-            let xb_host = self.stream.clone_dtoh(&self.xb)?;
-            let router_host = match &self.layers[li].ffn {
-                super::types::LayerFfn::Moe(m) => m.router_host.as_slice(),
+        let (n_experts, top_k, expert_ff, gate_col_bytes, up_col_bytes, down_col_bytes) =
+            match &self.layers[li].ffn {
+                super::types::LayerFfn::Moe(m) => (
+                    m.n_experts,
+                    m.top_k,
+                    m.expert_ff,
+                    m.gate_all.col_bytes,
+                    m.up_all.col_bytes,
+                    m.down_all.col_bytes,
+                ),
                 _ => unreachable!(),
             };
-            let mut scores = vec![0f32; n_experts];
-            for e in 0..n_experts {
-                let row = &router_host[e * n_embd_u..(e + 1) * n_embd_u];
-                let mut s = 0.0f32;
-                for i in 0..n_embd_u {
-                    s += row[i] * xb_host[i];
-                }
-                scores[e] = s;
-            }
-            let mut idx: Vec<usize> = (0..n_experts).collect();
-            idx.sort_by(|&a, &b| {
-                scores[b]
-                    .partial_cmp(&scores[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let k = top_k.min(n_experts);
-            let mut selected: Vec<(usize, f32)> =
-                idx[..k].iter().map(|&i| (i, scores[i])).collect();
-            let max_l = selected
-                .iter()
-                .map(|(_, s)| *s)
-                .fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for (_, s) in &mut selected {
-                *s = (*s - max_l).exp();
-                sum += *s;
-            }
-            if sum > 0.0 {
-                for (_, s) in &mut selected {
-                    *s /= sum;
-                }
-            }
-            selected
-        };
-
+        let n_exp_i = n_experts as i32;
+        let n_embd_i = d.n_embd;
+        let top_k_i = top_k as i32;
         let expert_ff_i = expert_ff as i32;
-        for (ei, weight) in selected {
-            let (gate, up, down) = match &self.layers[li].ffn {
-                super::types::LayerFfn::Moe(m) => {
-                    let e = &m.experts[ei];
-                    (
-                        &e.gate as *const _,
-                        &e.up as *const _,
-                        &e.down as *const _,
-                    )
-                }
+        let gate_cb = gate_col_bytes as i32;
+        let up_cb = up_col_bytes as i32;
+        let down_cb = down_col_bytes as i32;
+        let zero_res = 0i32;
+
+        // Device router top-k → moe_idx / moe_w (no host sync; CUDA-graph safe).
+        {
+            let router = match &self.layers[li].ffn {
+                super::types::LayerFfn::Moe(m) => &m.router as *const _,
                 _ => unreachable!(),
             };
-            let gate = unsafe { &*gate };
-            let up = unsafe { &*up };
-            let down = unsafe { &*down };
+            let router = unsafe { &*router };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.moe_router_topk)
+                    .arg(router)
+                    .arg(&self.xb)
+                    .arg(&mut self.moe_idx)
+                    .arg(&mut self.moe_w)
+                    .arg(&n_exp_i)
+                    .arg(&n_embd_i)
+                    .arg(&top_k_i)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        }
 
-            if !try_gemv_pair(
+        // Quantize xb once for gate/up (n_rows = n_embd).
+        {
+            use super::matmul::quantize_q8;
+            quantize_q8(
                 &self.stream,
                 &self.k,
-                gate,
-                up,
                 &self.xb,
-                &mut self.hb,
-                &mut self.hb2,
-                None,
-                None,
                 &mut self.q8_x,
                 &mut self.q8_d,
-            )? {
-                gemv(
-                    &self.stream,
-                    &self.k,
-                    gate,
-                    &self.xb,
-                    &mut self.hb,
-                    None,
-                    GemvResidual::None,
-                    &mut self.gemv_partial,
-                    self.gemv_partial_stride,
-                )?;
-                gemv(
-                    &self.stream,
-                    &self.k,
-                    up,
-                    &self.xb,
-                    &mut self.hb2,
-                    None,
-                    GemvResidual::None,
-                    &mut self.gemv_partial,
-                    self.gemv_partial_stride,
-                )?;
+                n_embd_i,
+            )?;
+        }
+
+        let warps = self.k.gemv_quantized_warps.max(1);
+        let threads = warps * 32;
+        let grid_gate = ((expert_ff as u32) + warps - 1) / warps;
+        let grid_down = ((d.n_embd_u as u32) + warps - 1) / warps;
+
+        for slot in 0..top_k {
+            let slot_i = slot as i32;
+            let (gate_all, up_all, down_all): (
+                *const super::types::GpuMat,
+                *const super::types::GpuMat,
+                *const super::types::GpuMat,
+            ) = match &self.layers[li].ffn {
+                super::types::LayerFfn::Moe(m) => (&m.gate_all, &m.up_all, &m.down_all),
+                _ => unreachable!(),
+            };
+            let gate_all = unsafe { &*gate_all };
+            let up_all = unsafe { &*up_all };
+            let down_all = unsafe { &*down_all };
+
+            let expert_slot_k = match gate_all.wtype {
+                super::types::WType::Q4_0 => &self.k.gemv_q4_0_expert_slot,
+                _ => &self.k.gemv_q8_expert_slot,
+            };
+            // gate
+            unsafe {
+                self.stream
+                    .launch_builder(expert_slot_k)
+                    .arg(&gate_all.data)
+                    .arg(&self.q8_x)
+                    .arg(&self.q8_d)
+                    .arg(&mut self.hb)
+                    .arg(&self.moe_idx)
+                    .arg(&slot_i)
+                    .arg(&n_embd_i)
+                    .arg(&expert_ff_i)
+                    .arg(&gate_cb)
+                    .arg(&zero_res)
+                    .arg(&self.xb) // unused residual
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_gate, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            // up
+            unsafe {
+                self.stream
+                    .launch_builder(expert_slot_k)
+                    .arg(&up_all.data)
+                    .arg(&self.q8_x)
+                    .arg(&self.q8_d)
+                    .arg(&mut self.hb2)
+                    .arg(&self.moe_idx)
+                    .arg(&slot_i)
+                    .arg(&n_embd_i)
+                    .arg(&expert_ff_i)
+                    .arg(&up_cb)
+                    .arg(&zero_res)
+                    .arg(&self.xb)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_gate, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
             }
             unsafe {
                 self.stream
@@ -1547,41 +1594,52 @@ impl CudaModel {
                     .arg(&expert_ff_i)
                     .launch(LaunchConfig::for_num_elems(expert_ff as u32))?;
             }
-            // Expert output → xb2, then x += weight * xb2
-            if !try_gemv_global_q8(
-                &self.stream,
-                &self.k,
-                down,
-                &self.hb,
-                &mut self.xb2,
-                None,
-                GemvResidual::None,
-                &mut self.q8_x,
-                &mut self.q8_d,
-                &mut self.gemv_partial,
-                self.gemv_partial_stride,
-            )? {
-                gemv(
+            // Quantize hb for down (n_rows = expert_ff).
+            {
+                use super::matmul::quantize_q8;
+                quantize_q8(
                     &self.stream,
                     &self.k,
-                    down,
                     &self.hb,
-                    &mut self.xb2,
-                    None,
-                    GemvResidual::None,
-                    &mut self.gemv_partial,
-                    self.gemv_partial_stride,
+                    &mut self.q8_x,
+                    &mut self.q8_d,
+                    expert_ff_i,
                 )?;
+            }
+            let down_slot_k = match down_all.wtype {
+                super::types::WType::Q4_0 => &self.k.gemv_q4_0_expert_slot,
+                _ => &self.k.gemv_q8_expert_slot,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(down_slot_k)
+                    .arg(&down_all.data)
+                    .arg(&self.q8_x)
+                    .arg(&self.q8_d)
+                    .arg(&mut self.xb2)
+                    .arg(&self.moe_idx)
+                    .arg(&slot_i)
+                    .arg(&expert_ff_i)
+                    .arg(&n_embd_i)
+                    .arg(&down_cb)
+                    .arg(&zero_res)
+                    .arg(&self.xb)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_down, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
             }
             let n = d.n_embd;
             unsafe {
                 self.stream
-                    .launch_builder(&self.k.scale_add)
+                    .launch_builder(&self.k.scale_add_slot)
                     .arg(&mut self.x)
                     .arg(&self.xb2)
-                    .arg(&weight)
+                    .arg(&self.moe_w)
+                    .arg(&slot_i)
                     .arg(&n)
-                    .launch(LaunchConfig::for_num_elems(n_embd_u as u32))?;
+                    .launch(LaunchConfig::for_num_elems(d.n_embd_u as u32))?;
             }
         }
         Ok(())
