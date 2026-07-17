@@ -8,6 +8,7 @@ mod layer;
 mod load;
 mod matmul;
 mod model;
+mod moe_pack;
 mod types;
 
 pub use decode::{AttnLaunch, DecodeBackend, DecodeSpec, SmemRule, REGISTRY};

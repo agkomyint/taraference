@@ -1145,6 +1145,15 @@ impl CudaModel {
     }
 
     fn ffn_block(&mut self, li: usize, d: &ChunkDims) -> Result<()> {
+        // Snapshot FFN kind without holding a borrow across GEMV calls.
+        let is_moe = matches!(self.layers[li].ffn, super::types::LayerFfn::Moe(_));
+        if is_moe {
+            return self.ffn_block_moe(li, d);
+        }
+        self.ffn_block_dense(li, d)
+    }
+
+    fn ffn_block_dense(&mut self, li: usize, d: &ChunkDims) -> Result<()> {
         let timing = layer_timing_enabled() && d.n_tok == 1;
         let t0 = if timing {
             Some(
@@ -1177,13 +1186,25 @@ impl CudaModel {
         } else {
             None
         };
+        let (gate, up, down) = match &self.layers[li].ffn {
+            super::types::LayerFfn::Dense { gate, up, down } => {
+                // SAFETY: pointers only used for the duration of this function; no layer mut.
+                (gate as *const _, up as *const _, down as *const _)
+            }
+            super::types::LayerFfn::Moe(_) => unreachable!("dense path"),
+        };
+        // Reconstruct refs for GEMV (layer weights immutable during forward).
+        let gate = unsafe { &*gate };
+        let up = unsafe { &*up };
+        let down = unsafe { &*down };
+
         let mut fused_ffn = false;
         if d.n_tok == 1 {
             fused_ffn = try_gemv_q4_ffn(
                 &self.stream,
                 &self.k,
-                &self.layers[li].gate,
-                &self.layers[li].up,
+                gate,
+                up,
                 &self.xb,
                 &mut self.hb,
                 &mut self.q8_x,
@@ -1194,8 +1215,8 @@ impl CudaModel {
                 && !try_gemv_q4_dual(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].gate,
-                    &self.layers[li].up,
+                    gate,
+                    up,
                     &self.xb,
                     &mut self.hb,
                     &mut self.hb2,
@@ -1205,8 +1226,8 @@ impl CudaModel {
                 && !try_gemv_pair(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].gate,
-                    &self.layers[li].up,
+                    gate,
+                    up,
                     &self.xb,
                     &mut self.hb,
                     &mut self.hb2,
@@ -1219,7 +1240,7 @@ impl CudaModel {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].gate,
+                    gate,
                     &self.xb,
                     &mut self.hb,
                     None,
@@ -1230,7 +1251,7 @@ impl CudaModel {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].up,
+                    up,
                     &self.xb,
                     &mut self.hb2,
                     None,
@@ -1243,7 +1264,7 @@ impl CudaModel {
             gemm(
                 &self.stream,
                 &self.k,
-                &self.layers[li].gate,
+                gate,
                 &self.xb,
                 &mut self.hb,
                 d.n_tok,
@@ -1253,7 +1274,7 @@ impl CudaModel {
             gemm(
                 &self.stream,
                 &self.k,
-                &self.layers[li].up,
+                up,
                 &self.xb,
                 &mut self.hb2,
                 d.n_tok,
@@ -1293,7 +1314,7 @@ impl CudaModel {
             if !try_gemv_global_q8(
                 &self.stream,
                 &self.k,
-                &self.layers[li].down,
+                down,
                 &self.hb,
                 &mut self.x,
                 None,
@@ -1306,7 +1327,7 @@ impl CudaModel {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].down,
+                    down,
                     &self.hb,
                     &mut self.x,
                     None,
@@ -1319,7 +1340,7 @@ impl CudaModel {
             gemm(
                 &self.stream,
                 &self.k,
-                &self.layers[li].down,
+                down,
                 &self.hb,
                 &mut self.xb2,
                 d.n_tok,
@@ -1347,6 +1368,221 @@ impl CudaModel {
                 t2.elapsed_ms(&t3)?,
                 t3.elapsed_ms(&t4)?
             );
+        }
+        Ok(())
+    }
+
+    /// Sparse MoE FFN: top-k experts only (decode + token-serial prefill).
+    fn ffn_block_moe(&mut self, li: usize, d: &ChunkDims) -> Result<()> {
+        if d.n_tok_u == 1 {
+            return self.ffn_block_moe_one(li, d);
+        }
+        // Expert choice differs per token — run serial single-token MoE for prefill.
+        let n = d.n_embd_u;
+        let n_tok = d.n_tok_u;
+        let batch = self.stream.clone_dtoh(&self.x)?;
+        let mut out_batch = batch.clone();
+        for t in 0..n_tok {
+            self.stream
+                .memcpy_htod(&batch[t * n..(t + 1) * n], &mut self.x)?;
+            let d1 = ChunkDims {
+                n_tok: 1,
+                n_tok_u: 1,
+                n_embd: d.n_embd,
+                n_embd_u: d.n_embd_u,
+                n_ff_u: d.n_ff_u,
+                n_head: d.n_head,
+                n_head_u: d.n_head_u,
+                n_kv: d.n_kv,
+                n_kv_heads: d.n_kv_heads,
+                head_dim: d.head_dim,
+                hd: d.hd,
+                stride: d.stride,
+                stride_u: d.stride_u,
+                pos0: d.pos0 + t,
+                pos0_i: d.pos0_i + t as i32,
+                eps: d.eps,
+                theta: d.theta,
+                scale: d.scale,
+                use_device_pos: false,
+            };
+            self.ffn_block_moe_one(li, &d1)?;
+            let out = self.stream.clone_dtoh(&self.x)?;
+            out_batch[t * n..(t + 1) * n].copy_from_slice(&out[..n]);
+        }
+        self.stream.memcpy_htod(&out_batch, &mut self.x)?;
+        Ok(())
+    }
+
+    fn ffn_block_moe_one(&mut self, li: usize, d: &ChunkDims) -> Result<()> {
+        debug_assert_eq!(d.n_tok, 1);
+        let n_embd_u = d.n_embd_u;
+        let one = 1i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.rms_norm)
+                .arg(&self.x)
+                .arg(&self.layers[li].ffn_norm)
+                .arg(&mut self.xb)
+                .arg(&d.n_embd)
+                .arg(&one)
+                .arg(&d.eps)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+
+        let (n_experts, top_k, expert_ff) = match &self.layers[li].ffn {
+            super::types::LayerFfn::Moe(m) => (m.n_experts, m.top_k, m.expert_ff),
+            _ => unreachable!(),
+        };
+
+        // Routing: fixed experts (BW ceiling) or host router on xb (one small D2H).
+        let selected: Vec<(usize, f32)> = if std::env::var_os("TARAFER_MOE_FIXED").is_some() {
+            // Always experts 0..top_k with equal weight — measures sparse FFN BW without sync.
+            let w = 1.0 / top_k.min(n_experts) as f32;
+            (0..top_k.min(n_experts)).map(|i| (i, w)).collect()
+        } else {
+            // CPU top-k on host router · xb (avoids GPU router kernel + score D2H).
+            let xb_host = self.stream.clone_dtoh(&self.xb)?;
+            let router_host = match &self.layers[li].ffn {
+                super::types::LayerFfn::Moe(m) => m.router_host.as_slice(),
+                _ => unreachable!(),
+            };
+            let mut scores = vec![0f32; n_experts];
+            for e in 0..n_experts {
+                let row = &router_host[e * n_embd_u..(e + 1) * n_embd_u];
+                let mut s = 0.0f32;
+                for i in 0..n_embd_u {
+                    s += row[i] * xb_host[i];
+                }
+                scores[e] = s;
+            }
+            let mut idx: Vec<usize> = (0..n_experts).collect();
+            idx.sort_by(|&a, &b| {
+                scores[b]
+                    .partial_cmp(&scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let k = top_k.min(n_experts);
+            let mut selected: Vec<(usize, f32)> =
+                idx[..k].iter().map(|&i| (i, scores[i])).collect();
+            let max_l = selected
+                .iter()
+                .map(|(_, s)| *s)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for (_, s) in &mut selected {
+                *s = (*s - max_l).exp();
+                sum += *s;
+            }
+            if sum > 0.0 {
+                for (_, s) in &mut selected {
+                    *s /= sum;
+                }
+            }
+            selected
+        };
+
+        let expert_ff_i = expert_ff as i32;
+        for (ei, weight) in selected {
+            let (gate, up, down) = match &self.layers[li].ffn {
+                super::types::LayerFfn::Moe(m) => {
+                    let e = &m.experts[ei];
+                    (
+                        &e.gate as *const _,
+                        &e.up as *const _,
+                        &e.down as *const _,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let gate = unsafe { &*gate };
+            let up = unsafe { &*up };
+            let down = unsafe { &*down };
+
+            if !try_gemv_pair(
+                &self.stream,
+                &self.k,
+                gate,
+                up,
+                &self.xb,
+                &mut self.hb,
+                &mut self.hb2,
+                None,
+                None,
+                &mut self.q8_x,
+                &mut self.q8_d,
+            )? {
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    gate,
+                    &self.xb,
+                    &mut self.hb,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    up,
+                    &self.xb,
+                    &mut self.hb2,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+            }
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.silu_mul)
+                    .arg(&mut self.hb)
+                    .arg(&self.hb2)
+                    .arg(&expert_ff_i)
+                    .launch(LaunchConfig::for_num_elems(expert_ff as u32))?;
+            }
+            // Expert output → xb2, then x += weight * xb2
+            if !try_gemv_global_q8(
+                &self.stream,
+                &self.k,
+                down,
+                &self.hb,
+                &mut self.xb2,
+                None,
+                GemvResidual::None,
+                &mut self.q8_x,
+                &mut self.q8_d,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )? {
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    down,
+                    &self.hb,
+                    &mut self.xb2,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+            }
+            let n = d.n_embd;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.scale_add)
+                    .arg(&mut self.x)
+                    .arg(&self.xb2)
+                    .arg(&weight)
+                    .arg(&n)
+                    .launch(LaunchConfig::for_num_elems(n_embd_u as u32))?;
+            }
         }
         Ok(())
     }

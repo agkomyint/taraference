@@ -252,10 +252,14 @@ impl<'a> Session<'a> {
         let mut pld_passes = 0usize;
         while step < self.max_new {
             let piece = self.tok.decode(&[next]);
-            if next == self.tok.eos_id
-                || piece == "<|im_end|>"
-                || piece == "<|endoftext|>"
-                || piece == "<|im_start|>"
+            // Speed benches for under-trained Sprint models: TARAFER_IGNORE_EOS=1
+            // forces max_new generation (do not use for quality claims).
+            let ignore_eos = std::env::var_os("TARAFER_IGNORE_EOS").is_some();
+            if !ignore_eos
+                && (next == self.tok.eos_id
+                    || piece == "<|im_end|>"
+                    || piece == "<|endoftext|>"
+                    || piece == "<|im_start|>")
             {
                 stop = if step == 0 && reply_ids.is_empty() {
                     StopReason::Empty

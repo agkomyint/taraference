@@ -53,6 +53,38 @@ extern "C" __global__ void add_f32(
     if (i < n) a[i] += b[i];
 }
 
+/// a[i] += scale * b[i]
+extern "C" __global__ void scale_add_f32(
+    float* __restrict__ a, const float* __restrict__ b, float scale, int n
+) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) a[i] += scale * b[i];
+}
+
+/// y[e] = sum_i W[e * n_in + i] * x[i]  (dense f32 router GEMV, one block per expert row)
+extern "C" __global__ void gemv_f32_rows(
+    const float* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int n_rows,
+    int n_in
+) {
+    int row = (int)blockIdx.x;
+    if (row >= n_rows) return;
+    const float* wr = w + (size_t)row * (size_t)n_in;
+    __shared__ float buf[256];
+    float local = 0.f;
+    for (int i = (int)threadIdx.x; i < n_in; i += (int)blockDim.x)
+        local += wr[i] * x[i];
+    buf[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) buf[threadIdx.x] += buf[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[row] = buf[0];
+}
+
 extern "C" __global__ void add_bias_f32(
     float* __restrict__ x, const float* __restrict__ b, int n_feat, int n_tok
 ) {

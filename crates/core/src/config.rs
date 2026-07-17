@@ -40,6 +40,14 @@ pub struct ModelConfig {
     pub ssm_inner_size: usize,
     /// Per-layer kind; length == n_layer. All FullAttention for non-hybrid.
     pub layer_kinds: Vec<LayerKind>,
+    /// MoE: total experts per MoE layer (0 = dense model).
+    pub n_experts: usize,
+    /// MoE: router top-k (active experts per token).
+    pub router_top_k: usize,
+    /// MoE: expert intermediate size (may differ from dense n_ff).
+    pub expert_ff: usize,
+    /// First N layers use dense FFN; rest are MoE (Tara Llama-MoE).
+    pub num_dense_layers: usize,
 }
 
 impl ModelConfig {
@@ -48,7 +56,13 @@ impl ModelConfig {
             .architecture()
             .ok_or_else(|| anyhow!("missing general.architecture"))?
             .to_string();
-        let p = |s: &str| format!("{architecture}.{s}");
+        // Llama dense GGUF uses the same RMSNorm / GQA / SwiGLU layout as Qwen2.
+        // Tara-Sprint models export as `llama` for the 750 tok/s stack.
+        let arch_key = match architecture.as_str() {
+            "llama" | "llama2" | "llama3" => "llama",
+            other => other,
+        };
+        let p = |s: &str| format!("{arch_key}.{s}");
         let u = |key: String| -> Result<u32> {
             gguf.meta_u32(&key)
                 .or_else(|| gguf.meta_u64(&key).map(|v| v as u32))
@@ -95,7 +109,11 @@ impl ModelConfig {
                     .and_then(|t| t.dims.get(1).map(|d| *d as usize))
             })
             .ok_or_else(|| anyhow!("vocab size"))?;
-        let rope_theta = gguf.meta_f32(&p("rope.freq_base")).unwrap_or(1_000_000.0);
+        let rope_theta = gguf.meta_f32(&p("rope.freq_base")).unwrap_or(if arch_key == "llama" {
+            10_000.0
+        } else {
+            1_000_000.0
+        });
         let rms_eps = gguf
             .meta_f32(&p("attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-6);
@@ -184,11 +202,19 @@ impl ModelConfig {
             ssm_n_v_heads,
             ssm_inner_size,
             layer_kinds,
+            n_experts: 0,
+            router_top_k: 0,
+            expert_ff: 0,
+            num_dense_layers: n_layer,
         })
     }
 
     pub fn head_dim(&self) -> usize {
         self.attention_head_dim
+    }
+
+    pub fn is_moe(&self) -> bool {
+        self.n_experts > 0 && self.router_top_k > 0
     }
 
     pub fn is_hybrid(&self) -> bool {

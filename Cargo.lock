@@ -1033,6 +1033,7 @@ dependencies = [
  "cudarc",
  "rayon",
  "serde",
+ "serde_json",
  "taraference-gguf",
  "thiserror",
 ]

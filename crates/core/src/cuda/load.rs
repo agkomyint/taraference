@@ -4,7 +4,8 @@ use super::decode::DecodeBackend;
 use super::kernels::SOURCE;
 use super::model::CudaModel;
 use super::types::{
-    FullAttnWeights, GpuLayer, GpuMat, Kernels, LayerAttn, LinearAttnWeights, WType, MAX_BATCH,
+    FullAttnWeights, GpuLayer, GpuMat, Kernels, LayerAttn, LayerFfn, LinearAttnWeights, WType,
+    MAX_BATCH,
 };
 use crate::config::LayerKind;
 use crate::config::ModelConfig;
@@ -366,6 +367,8 @@ impl CudaModel {
             rms_norm: module.load_function("rms_norm_f32")?,
             silu_mul: module.load_function("silu_mul_f32")?,
             add: module.load_function("add_f32")?,
+            scale_add: module.load_function("scale_add_f32")?,
+            gemv_f32_rows: module.load_function("gemv_f32_rows")?,
             add_bias: module.load_function("add_bias_f32")?,
             rope: module.load_function("rope_neox_f32")?,
             rope_d: module.load_function("rope_neox_f32_d")?,
@@ -637,9 +640,11 @@ impl CudaModel {
                 attn_norm: upload_vec(&format!("{p}.attn_norm.weight"))?,
                 ffn_norm,
                 attn,
-                gate: upload_mat(&format!("{p}.ffn_gate.weight"))?,
-                up: upload_mat(&format!("{p}.ffn_up.weight"))?,
-                down: upload_mat(&format!("{p}.ffn_down.weight"))?,
+                ffn: LayerFfn::Dense {
+                    gate: upload_mat(&format!("{p}.ffn_gate.weight"))?,
+                    up: upload_mat(&format!("{p}.ffn_up.weight"))?,
+                    down: upload_mat(&format!("{p}.ffn_down.weight"))?,
+                },
             });
         }
         if q5k_transcoded.get() != 0 || q5_1_transcoded.get() != 0 {
@@ -667,9 +672,20 @@ impl CudaModel {
             count_mat(m);
         }
         for layer in &layers {
-            count_mat(&layer.gate);
-            count_mat(&layer.up);
-            count_mat(&layer.down);
+            match &layer.ffn {
+                LayerFfn::Dense { gate, up, down } => {
+                    count_mat(gate);
+                    count_mat(up);
+                    count_mat(down);
+                }
+                LayerFfn::Moe(m) => {
+                    for e in &m.experts {
+                        count_mat(&e.gate);
+                        count_mat(&e.up);
+                        count_mat(&e.down);
+                    }
+                }
+            }
             match &layer.attn {
                 LayerAttn::Full(a) => {
                     count_mat(&a.wq);

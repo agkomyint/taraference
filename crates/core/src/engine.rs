@@ -5,9 +5,59 @@ use crate::cuda::{CudaKv, CudaModel, DecodeBackend};
 use crate::session::{Session, SessionOptions, TurnStats};
 use crate::tokenizer::Tokenizer;
 use crate::ModelConfig;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use taraference_gguf::GgufFile;
+
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Ok(m) = e.metadata() {
+                if m.is_file() {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Tokenizer GGUF for MoE packs: `TARAFER_TOKENIZER_GGUF`, pack-local `tokenizer.gguf`,
+/// or a Tara-Sprint GGUF under `models/` / department exports.
+fn resolve_tokenizer_gguf(pack_dir: &Path) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("TARAFER_TOKENIZER_GGUF") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Ok(pb);
+        }
+        bail!("TARAFER_TOKENIZER_GGUF not a file: {}", pb.display());
+    }
+    let local = pack_dir.join("tokenizer.gguf");
+    if local.is_file() {
+        return Ok(local);
+    }
+    let candidates = [
+        PathBuf::from("models/tara-sprint-80m-Q8_0.gguf"),
+        PathBuf::from("models/tara-sprint-50m-Q8_0.gguf"),
+        PathBuf::from("models/tara-sprint-150m-Q8_0.gguf"),
+        PathBuf::from(
+            r"D:\Tara_HQ\departments\taraference_750_department\exports\tara-sprint-80m-real\tara-sprint-80m-Q8_0.gguf",
+        ),
+        PathBuf::from(
+            r"D:\Tara_HQ\departments\taraference_750_department\exports\tara-sprint-50m-real\tara-sprint-50m-Q8_0.gguf",
+        ),
+    ];
+    for c in candidates {
+        if c.is_file() {
+            return Ok(c);
+        }
+    }
+    bail!(
+        "MoE pack needs a tokenizer GGUF. Set TARAFER_TOKENIZER_GGUF=path/to/tara-sprint-*.gguf \
+         (same vocab as training) or place tokenizer.gguf next to meta.json"
+    );
+}
 
 /// Configuration for loading an engine.
 #[derive(Debug, Clone)]
@@ -51,8 +101,14 @@ pub struct InferenceEngine {
 
 impl InferenceEngine {
     pub fn load(cfg: EngineConfig) -> Result<Self> {
-        let path = cfg.model_path;
+        let path = cfg.model_path.clone();
         eprintln!("loading {} …", path.display());
+
+        // Directory with meta.json → Tara MoE Q8 pack (sparse experts).
+        if path.is_dir() {
+            return Self::load_moe_pack(cfg, path);
+        }
+
         let gguf = GgufFile::open(&path).with_context(|| format!("open {}", path.display()))?;
         let weight_gib = gguf.total_tensor_bytes() as f64 / (1024.0 * 1024.0 * 1024.0);
         let tok = Tokenizer::from_gguf(&gguf)?;
@@ -81,6 +137,61 @@ impl InferenceEngine {
         eprintln!(
             "flags | cuda_graph={} | decode={}",
             cfg.cuda_graph,
+            cfg.decode.name()
+        );
+
+        Ok(Self {
+            model,
+            tok,
+            kv,
+            model_path: path,
+            model_id,
+            max_seq,
+            max_new: cfg.max_new,
+            default_system: cfg.default_system,
+            weight_gib,
+        })
+    }
+
+    /// Load Tara MoE Q8 pack directory + tokenizer from a sibling/env GGUF.
+    fn load_moe_pack(cfg: EngineConfig, path: PathBuf) -> Result<Self> {
+        let meta = path.join("meta.json");
+        if !meta.is_file() {
+            bail!(
+                "directory {} is not a Tara MoE pack (missing meta.json)",
+                path.display()
+            );
+        }
+        let mut model = CudaModel::load_tara_moe_pack(&path, cfg.decode)?;
+        // Dynamic top-k is data-dependent. Fixed experts (`TARAFER_MOE_FIXED`) can graph.
+        let moe_graph = std::env::var_os("TARAFER_MOE_FIXED").is_some() && cfg.cuda_graph;
+        model.set_cuda_graph(moe_graph);
+
+        let tok_gguf = resolve_tokenizer_gguf(&path)?;
+        eprintln!("tokenizer | {}", tok_gguf.display());
+        let tok_file =
+            GgufFile::open(&tok_gguf).with_context(|| format!("open tokenizer {}", tok_gguf.display()))?;
+        let tok = Tokenizer::from_gguf(&tok_file)?;
+        if tok.tokens.len() != model.cfg.n_vocab {
+            eprintln!(
+                "warn | tokenizer vocab {} != model n_vocab {} (pack may still run if ids overlap)",
+                tok.tokens.len(),
+                model.cfg.n_vocab
+            );
+        }
+
+        let weight_gib = dir_bytes(&path) as f64 / (1024.0 * 1024.0 * 1024.0);
+        let max_seq = cfg.max_seq.min(model.cfg.n_ctx);
+        let kv = model.alloc_kv(max_seq)?;
+        let model_id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("tara-moe")
+            .to_string();
+        eprintln!(
+            "flags | cuda_graph={} | moe_fixed={} | decode={} | weight_gib={weight_gib:.3}",
+            moe_graph,
+            std::env::var_os("TARAFER_MOE_FIXED").is_some(),
             cfg.decode.name()
         );
 

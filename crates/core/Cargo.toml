@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
 serde = { workspace = true }
+serde_json = { workspace = true }
 taraference-gguf = { path = "../gguf" }
 thiserror.workspace = true
 cudarc = { version = "0.19", default-features = false, features = [

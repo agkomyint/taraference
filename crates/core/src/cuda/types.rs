@@ -73,14 +73,40 @@ pub enum LayerAttn {
     Linear(LinearAttnWeights),
 }
 
+/// One MoE expert's SwiGLU weights (Q8_0).
+pub struct MoeExpertWeights {
+    pub gate: GpuMat,
+    pub up: GpuMat,
+    pub down: GpuMat,
+}
+
+/// Sparse MoE FFN: router (f32) + N experts; decode touches top-k only.
+pub struct MoeFfnWeights {
+    /// Row-major `[n_experts, n_embd]` f32 on device (optional path).
+    pub router: CudaSlice<f32>,
+    /// Host copy of router for CPU top-k without a device router GEMV.
+    pub router_host: Vec<f32>,
+    pub n_experts: usize,
+    pub top_k: usize,
+    pub expert_ff: usize,
+    pub experts: Vec<MoeExpertWeights>,
+}
+
+pub enum LayerFfn {
+    Dense {
+        gate: GpuMat,
+        up: GpuMat,
+        down: GpuMat,
+    },
+    Moe(MoeFfnWeights),
+}
+
 pub struct GpuLayer {
     pub attn_norm: CudaSlice<f32>,
     /// Pre-FFN norm (`ffn_norm` or Qwen3.5 `post_attention_norm`).
     pub ffn_norm: CudaSlice<f32>,
     pub attn: LayerAttn,
-    pub gate: GpuMat,
-    pub up: GpuMat,
-    pub down: GpuMat,
+    pub ffn: LayerFfn,
 }
 
 pub struct Kernels {
@@ -156,6 +182,10 @@ pub struct Kernels {
     pub rms_norm: CudaFunction,
     pub silu_mul: CudaFunction,
     pub add: CudaFunction,
+    /// `a[i] += scale * b[i]` (MoE expert residual).
+    pub scale_add: CudaFunction,
+    /// Dense f32 GEMV for MoE router scores.
+    pub gemv_f32_rows: CudaFunction,
     pub add_bias: CudaFunction,
     pub rope: CudaFunction,
     pub rope_d: CudaFunction,
