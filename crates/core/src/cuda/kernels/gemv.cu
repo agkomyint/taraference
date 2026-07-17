@@ -22,7 +22,8 @@ __device__ __forceinline__ void quantize_q8_smem(
     int lane
 ) {
     const int nb = n_rows >> 5;
-    for (int bi = warp; bi < nb; bi += GEMV_WARPS) {
+    const int warps_per_block = (int)blockDim.x >> 5;
+    for (int bi = warp; bi < nb; bi += warps_per_block) {
         const int i = (bi << 5) + lane;
         const float xi = x[i];
         float amax = fabsf(xi);
@@ -534,6 +535,41 @@ extern "C" __global__ void gemv_q6_k_compact_global(
     }
 }
 
+__device__ __forceinline__ int load_int_unaligned(const void* ptr) {
+    int val;
+    memcpy(&val, ptr, sizeof(int));
+    return val;
+}
+
+// Fast path for Q5→Q8 hybrid weights: activation quantized once globally.
+// Q8_0 block = f16 d + 32×int8; activation groups match (32 vals, scale xd[bi]).
+__device__ __forceinline__ float dot_q8_0_col_q8_range(
+    const unsigned char* __restrict__ col,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    int bi0,
+    int bi1,
+    int lane
+) {
+    float acc = 0.f;
+    for (int bi = bi0 + lane; bi < bi1; bi += 32) {
+        const unsigned char* base = col + bi * 34;
+        float dw = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const signed char* qs = (const signed char*)(base + 2);
+        const signed char* xv = xq + (bi << 5);
+        int sum = 0;
+        #pragma unroll
+        for (int t = 0; t < 32; t += 4) {
+            int w4 = load_int_unaligned(qs + t);
+            int x4 = load_int_unaligned(xv + t);
+            sum = __dp4a(w4, x4, sum);
+        }
+        acc += dw * xd[bi] * (float)sum;
+    }
+    return warp_sum(acc);
+}
+
+// Q8_0 × f32 (quantize x to smem, compute with hardware __dp4a int8 dot products).
 extern "C" __global__ void gemv_q8_0(
     const unsigned char* __restrict__ w,
     const float* __restrict__ x,
@@ -542,40 +578,74 @@ extern "C" __global__ void gemv_q8_0(
     int use_bias, const float* __restrict__ bias,
     int use_res, const float* __restrict__ residual
 ) {
-    extern __shared__ float xs[];
+    extern __shared__ unsigned char qsmem[];
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    {
-        int n4 = n_rows >> 2;
-        for (int i = tid; i < n4; i += GEMV_THREADS) {
-            float4 v = reinterpret_cast<const float4*>(x)[i];
-            int o = i << 2;
-            xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
-        }
-        for (int i = (n4 << 2) + tid; i < n_rows; i += GEMV_THREADS) xs[i] = x[i];
-    }
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
     __syncthreads();
 
-    int j = (int)blockIdx.x * GEMV_WARPS + warp;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
     if (j >= n_cols) return;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
-    float acc = 0.f;
-    int nb = n_rows / 32;
-    for (int bi = lane; bi < nb; bi += 32) {
-        const unsigned char* base = col + bi * 34;
-        float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
-        const signed char* qs = (const signed char*)(base + 2);
-        int yo = bi * 32;
-        #pragma unroll 8
-        for (int t = 0; t < 32; t++) acc += (float)qs[t] * d * xs[yo + t];
-    }
-    acc = warp_sum(acc);
+    float acc = dot_q8_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
     if (lane == 0) {
         acc = gemv_apply_res(use_res, acc, out, j, residual);
         if (use_bias) acc += bias[j];
         out[j] = acc;
     }
+}
+
+extern "C" __global__ void gemv_q8_0_global(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q8_0_col_q8_range(col, xq, xd, 0, n_rows / 32, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+extern "C" __global__ void gemv_q8_0_global_splitk(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ partial,
+    int n_rows, int n_cols, int col_bytes, int n_split
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int s = (int)blockIdx.y;
+    if (s >= n_split) return;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    if (j >= n_cols) return;
+    const int nb = n_rows / 32;
+    const int bi0 = (nb * s) / n_split;
+    const int bi1 = (nb * (s + 1)) / n_split;
+    if (bi0 >= bi1) {
+        if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = 0.f;
+        return;
+    }
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q8_0_col_q8_range(col, xq, xd, bi0, bi1, lane);
+    if (lane == 0) partial[(size_t)s * (size_t)n_cols + j] = acc;
 }
 
 extern "C" __global__ void gemv_q5_0(
@@ -877,6 +947,67 @@ extern "C" __global__ void gemv_q6_k_compact_global_4way(
     __syncthreads();
     if (threadIdx.x == 0) {
         float total = warp_acc[0] + warp_acc[1] + warp_acc[2] + warp_acc[3];
+        total = gemv_apply_res(use_res, total, out, j, residual);
+        if (use_bias) total += bias[j];
+        out[j] = total;
+    }
+}
+
+// Multi-column Q6 compact: 8 warps → 8 output cols, xq already global.
+// blockDim=256, grid=ceil(n_cols/8).
+extern "C" __global__ void gemv_q6_k_compact_global_mcol(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int j = (int)blockIdx.x * 8 + warp;
+    if (j >= n_cols) return;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = dot_q6_k_compact_q8_range(col, xq, xd, 0, n_rows / 256, lane);
+    if (lane == 0) {
+        acc = gemv_apply_res(use_res, acc, out, j, residual);
+        if (use_bias) acc += bias[j];
+        out[j] = acc;
+    }
+}
+
+// 8-warp cooperative Q6 compact decode (blockDim=256). Better SM fill on tall FFN down.
+extern "C" __global__ void gemv_q6_k_compact_global_8way(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes,
+    int use_bias, const float* __restrict__ bias,
+    int use_res, const float* __restrict__ residual
+) {
+    __shared__ float warp_acc[8];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols) return;
+    const int nsb = n_rows / 256;
+    const int bi0 = (nsb * warp) / 8;
+    const int bi1 = (nsb * (warp + 1)) / 8;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    float acc = 0.f;
+    if (bi0 < bi1) {
+        acc = dot_q6_k_compact_q8_range(
+            col, xq + bi0 * 256, xd + bi0 * 8, bi0, bi1, lane
+        );
+    }
+    if (lane == 0) warp_acc[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) total += warp_acc[i];
         total = gemv_apply_res(use_res, total, out, j, residual);
         if (use_bias) total += bias[j];
         out[j] = total;
@@ -1310,6 +1441,123 @@ extern "C" __global__ void gemv_q4_k_ffn_4way(
     }
 }
 
+// Multi-column fused FFN: 32 warps → 32 output columns, quantize x once in smem.
+// blockDim = 1024, grid = ceil(n_cols/32). Best for wide decode FFNs.
+extern "C" __global__ void gemv_q4_k_ffn_mcol(
+    const unsigned char* __restrict__ gate_w,
+    const unsigned char* __restrict__ up_w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    const int j = (int)blockIdx.x * 32 + warp;
+    if (j >= n_cols) return;
+    // Full-K reduction in this warp (no split-K).
+    const float2 pair = dot_q4_k_pair_q8_range(
+        gate_w + (size_t)j * (size_t)col_bytes,
+        up_w + (size_t)j * (size_t)col_bytes,
+        xq, xd, 0, n_rows / 256, lane
+    );
+    if (lane == 0) {
+        const float gate = pair.x;
+        const float up = pair.y;
+        out[j] = (gate / (1.f + __expf(-gate))) * up;
+    }
+}
+
+// 8-warp FFN gate+up (blockDim=256). Use when n_rows/256 is large enough.
+extern "C" __global__ void gemv_q4_k_ffn_8way(
+    const unsigned char* __restrict__ gate_w,
+    const unsigned char* __restrict__ up_w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes
+) {
+    __shared__ float gate_part[8];
+    __shared__ float up_part[8];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols) return;
+    const int n_blocks = n_rows / 256;
+    const int bi0 = (n_blocks * warp) / 8;
+    const int bi1 = (n_blocks * (warp + 1)) / 8;
+    float2 pair;
+    pair.x = 0.f;
+    pair.y = 0.f;
+    if (bi0 < bi1) {
+        pair = dot_q4_k_pair_q8_range(
+            gate_w + (size_t)j * (size_t)col_bytes,
+            up_w + (size_t)j * (size_t)col_bytes,
+            xq + bi0 * 256, xd + bi0 * 8, bi0, bi1, lane
+        );
+    }
+    if (lane == 0) {
+        gate_part[warp] = pair.x;
+        up_part[warp] = pair.y;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float gate = 0.f, up = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            gate += gate_part[i];
+            up += up_part[i];
+        }
+        out[j] = (gate / (1.f + __expf(-gate))) * up;
+    }
+}
+
+extern "C" __global__ void gemv_q4_k_ffn_4way_smem(
+    const unsigned char* __restrict__ gate_w,
+    const unsigned char* __restrict__ up_w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    __shared__ float gate_part[4];
+    __shared__ float up_part[4];
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols) return;
+    const int n_blocks = n_rows / 256;
+    const int bi0 = (n_blocks * warp) / 4;
+    const int bi1 = (n_blocks * (warp + 1)) / 4;
+    const float2 pair = dot_q4_k_pair_q8_range(
+        gate_w + (size_t)j * (size_t)col_bytes,
+        up_w + (size_t)j * (size_t)col_bytes,
+        xq + bi0 * 256, xd + bi0 * 8, bi0, bi1, lane
+    );
+    if (lane == 0) {
+        gate_part[warp] = pair.x;
+        up_part[warp] = pair.y;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const float gate = gate_part[0] + gate_part[1] + gate_part[2] + gate_part[3];
+        const float up = up_part[0] + up_part[1] + up_part[2] + up_part[3];
+        out[j] = (gate / (1.f + __expf(-gate))) * up;
+    }
+}
+
 // Fused Q+K+V for Q4_K decode: quantize/stage the hidden state once.
 extern "C" __global__ void gemv_q4_k_qkv(
     const unsigned char* __restrict__ wq,
@@ -1413,3 +1661,364 @@ extern "C" __global__ void gemv_q5_0_qkv(
         out[oj] = acc;
     }
 }
+
+// Fused Q+K+V when all three are Q8_0 (global activation quantize once).
+extern "C" __global__ void gemv_q8_0_qkv(
+    const unsigned char* __restrict__ wq,
+    const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wv,
+    const float* __restrict__ x,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int n_rows, int n_q, int n_k, int n_v, int col_bytes,
+    int use_bias,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    const int n_tot = n_q + n_k + n_v;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    const float* bias;
+    int oj;
+    if (j < n_q) {
+        wcol = wq + (size_t)j * (size_t)col_bytes;
+        out = q; bias = bq; oj = j;
+    } else if (j < n_q + n_k) {
+        oj = j - n_q;
+        wcol = wk + (size_t)oj * (size_t)col_bytes;
+        out = k; bias = bk;
+    } else {
+        oj = j - n_q - n_k;
+        wcol = wv + (size_t)oj * (size_t)col_bytes;
+        out = v; bias = bv;
+    }
+    float acc = dot_q8_0_col_q8_range(wcol, xq, xd, 0, n_rows / 32, lane);
+    if (lane == 0) {
+        if (use_bias) acc += bias[oj];
+        out[oj] = acc;
+    }
+}
+
+// Fused 4-way GDN input projections for Q8_0.
+// Matches gemv_q8_0_qkv: quantize x once in shared memory, then DP4A all columns.
+extern "C" __global__ void gemv_q8_0_gdn_4way(
+    const unsigned char* __restrict__ wqkv,
+    const unsigned char* __restrict__ w_gate,
+    const unsigned char* __restrict__ w_beta,
+    const unsigned char* __restrict__ w_alpha,
+    const float* __restrict__ x,
+    float* __restrict__ out_qkv,
+    float* __restrict__ out_gate,
+    float* __restrict__ out_beta,
+    float* __restrict__ out_alpha,
+    int n_rows, int n_qkv, int n_gate, int n_beta, int n_alpha, int col_bytes
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    const int n_tot = n_qkv + n_gate + n_beta + n_alpha;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    int oj;
+    if (j < n_qkv) {
+        wcol = wqkv + (size_t)j * (size_t)col_bytes;
+        out = out_qkv; oj = j;
+    } else if (j < n_qkv + n_gate) {
+        oj = j - n_qkv;
+        wcol = w_gate + (size_t)oj * (size_t)col_bytes;
+        out = out_gate;
+    } else if (j < n_qkv + n_gate + n_beta) {
+        oj = j - n_qkv - n_gate;
+        wcol = w_beta + (size_t)oj * (size_t)col_bytes;
+        out = out_beta;
+    } else {
+        oj = j - n_qkv - n_gate - n_beta;
+        wcol = w_alpha + (size_t)oj * (size_t)col_bytes;
+        out = out_alpha;
+    }
+    float acc = dot_q8_0_col_q8_range(wcol, xq, xd, 0, n_rows / 32, lane);
+    if (lane == 0) {
+        out[oj] = acc;
+    }
+}
+
+// Fused 4-way hybrid: wqkv/beta/alpha Q8_0, w_gate Q4_K. Smem-quantize x once.
+extern "C" __global__ void gemv_hybrid_gdn_4way(
+    const unsigned char* __restrict__ wqkv,
+    const unsigned char* __restrict__ w_gate,
+    const unsigned char* __restrict__ w_beta,
+    const unsigned char* __restrict__ w_alpha,
+    const float* __restrict__ x,
+    float* __restrict__ out_qkv,
+    float* __restrict__ out_gate,
+    float* __restrict__ out_beta,
+    float* __restrict__ out_alpha,
+    int n_rows, int n_qkv, int n_gate, int n_beta, int n_alpha,
+    int col_bytes_q8, int col_bytes_q4
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    const int n_tot = n_qkv + n_gate + n_beta + n_alpha;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    int oj;
+    float acc;
+    if (j < n_qkv) {
+        wcol = wqkv + (size_t)j * (size_t)col_bytes_q8;
+        out = out_qkv; oj = j;
+        acc = dot_q8_0_col_q8_range(wcol, xq, xd, 0, n_rows / 32, lane);
+    } else if (j < n_qkv + n_gate) {
+        oj = j - n_qkv;
+        wcol = w_gate + (size_t)oj * (size_t)col_bytes_q4;
+        out = out_gate;
+        acc = dot_q4_k_col_q8_range(wcol, xq, xd, 0, n_rows / 256, lane);
+    } else if (j < n_qkv + n_gate + n_beta) {
+        oj = j - n_qkv - n_gate;
+        wcol = w_beta + (size_t)oj * (size_t)col_bytes_q8;
+        out = out_beta;
+        acc = dot_q8_0_col_q8_range(wcol, xq, xd, 0, n_rows / 32, lane);
+    } else {
+        oj = j - n_qkv - n_gate - n_beta;
+        wcol = w_alpha + (size_t)oj * (size_t)col_bytes_q8;
+        out = out_alpha;
+        acc = dot_q8_0_col_q8_range(wcol, xq, xd, 0, n_rows / 32, lane);
+    }
+    if (lane == 0) {
+        out[oj] = acc;
+    }
+}
+
+extern "C" __global__ void gemv_q8_0_qkv_splitk(
+    const unsigned char* __restrict__ wq,
+    const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wv,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ partial,
+    int n_rows, int n_q, int n_k, int n_v, int col_bytes, int n_split
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int s = (int)blockIdx.y;
+    if (s >= n_split) return;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    const int n_tot = n_q + n_k + n_v;
+    if (j >= n_tot) return;
+    const int nb = n_rows / 32;
+    const int bi0 = (nb * s) / n_split;
+    const int bi1 = (nb * (s + 1)) / n_split;
+    if (bi0 >= bi1) {
+        if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = 0.f;
+        return;
+    }
+    const unsigned char* wcol;
+    if (j < n_q) {
+        wcol = wq + (size_t)j * (size_t)col_bytes;
+    } else if (j < n_q + n_k) {
+        wcol = wk + (size_t)(j - n_q) * (size_t)col_bytes;
+    } else {
+        wcol = wv + (size_t)(j - n_q - n_k) * (size_t)col_bytes;
+    }
+    float acc = dot_q8_0_col_q8_range(wcol, xq, xd, bi0, bi1, lane);
+    if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = acc;
+}
+
+extern "C" __global__ void gemv_q8_0_gdn_4way_splitk(
+    const unsigned char* __restrict__ wqkv,
+    const unsigned char* __restrict__ w_gate,
+    const unsigned char* __restrict__ w_beta,
+    const unsigned char* __restrict__ w_alpha,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ partial,
+    int n_rows, int n_qkv, int n_gate, int n_beta, int n_alpha, int col_bytes, int n_split
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int s = (int)blockIdx.y;
+    if (s >= n_split) return;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    const int n_tot = n_qkv + n_gate + n_beta + n_alpha;
+    if (j >= n_tot) return;
+    const int nb = n_rows / 32;
+    const int bi0 = (nb * s) / n_split;
+    const int bi1 = (nb * (s + 1)) / n_split;
+    if (bi0 >= bi1) {
+        if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = 0.f;
+        return;
+    }
+    const unsigned char* wcol;
+    if (j < n_qkv) {
+        wcol = wqkv + (size_t)j * (size_t)col_bytes;
+    } else if (j < n_qkv + n_gate) {
+        wcol = w_gate + (size_t)(j - n_qkv) * (size_t)col_bytes;
+    } else if (j < n_qkv + n_gate + n_beta) {
+        wcol = w_beta + (size_t)(j - n_qkv - n_gate) * (size_t)col_bytes;
+    } else {
+        wcol = w_alpha + (size_t)(j - n_qkv - n_gate - n_beta) * (size_t)col_bytes;
+    }
+    float acc = dot_q8_0_col_q8_range(wcol, xq, xd, bi0, bi1, lane);
+    if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = acc;
+}
+
+extern "C" __global__ void gemv_hybrid_gdn_4way_splitk(
+    const unsigned char* __restrict__ wqkv,
+    const unsigned char* __restrict__ w_gate,
+    const unsigned char* __restrict__ w_beta,
+    const unsigned char* __restrict__ w_alpha,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ partial,
+    int n_rows, int n_qkv, int n_gate, int n_beta, int n_alpha,
+    int col_bytes_q8, int col_bytes_q4, int n_split
+) {
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int s = (int)blockIdx.y;
+    if (s >= n_split) return;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    const int n_tot = n_qkv + n_gate + n_beta + n_alpha;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float acc;
+    if (j < n_qkv) {
+        const int nb = n_rows / 32;
+        const int bi0 = (nb * s) / n_split;
+        const int bi1 = (nb * (s + 1)) / n_split;
+        if (bi0 >= bi1) {
+            if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = 0.f;
+            return;
+        }
+        wcol = wqkv + (size_t)j * (size_t)col_bytes_q8;
+        acc = dot_q8_0_col_q8_range(wcol, xq, xd, bi0, bi1, lane);
+    } else if (j < n_qkv + n_gate) {
+        const int nb = n_rows / 256;
+        const int bi0 = (nb * s) / n_split;
+        const int bi1 = (nb * (s + 1)) / n_split;
+        if (bi0 >= bi1) {
+            if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = 0.f;
+            return;
+        }
+        wcol = w_gate + (size_t)(j - n_qkv) * (size_t)col_bytes_q4;
+        acc = dot_q4_k_col_q8_range(wcol, xq, xd, bi0, bi1, lane);
+    } else if (j < n_qkv + n_gate + n_beta) {
+        const int nb = n_rows / 32;
+        const int bi0 = (nb * s) / n_split;
+        const int bi1 = (nb * (s + 1)) / n_split;
+        if (bi0 >= bi1) {
+            if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = 0.f;
+            return;
+        }
+        wcol = w_beta + (size_t)(j - n_qkv - n_gate) * (size_t)col_bytes_q8;
+        acc = dot_q8_0_col_q8_range(wcol, xq, xd, bi0, bi1, lane);
+    } else {
+        const int nb = n_rows / 32;
+        const int bi0 = (nb * s) / n_split;
+        const int bi1 = (nb * (s + 1)) / n_split;
+        if (bi0 >= bi1) {
+            if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = 0.f;
+            return;
+        }
+        wcol = w_alpha + (size_t)(j - n_qkv - n_gate - n_beta) * (size_t)col_bytes_q8;
+        acc = dot_q8_0_col_q8_range(wcol, xq, xd, bi0, bi1, lane);
+    }
+    if (lane == 0) partial[(size_t)s * (size_t)n_tot + j] = acc;
+}
+
+extern "C" __global__ void gemv_splitk_reduce_qkv(
+    const float* __restrict__ partial,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int n_q, int n_k, int n_v,
+    int n_split,
+    int use_bias,
+    const float* __restrict__ bq,
+    const float* __restrict__ bk,
+    const float* __restrict__ bv
+) {
+    int j = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int n_tot = n_q + n_k + n_v;
+    if (j >= n_tot) return;
+    float acc = 0.f;
+    #pragma unroll 4
+    for (int s = 0; s < n_split; s++) {
+        acc += partial[(size_t)s * (size_t)n_tot + j];
+    }
+    float* out;
+    const float* bias;
+    int oj;
+    if (j < n_q) { out = q; bias = bq; oj = j; }
+    else if (j < n_q + n_k) { out = k; bias = bk; oj = j - n_q; }
+    else { out = v; bias = bv; oj = j - n_q - n_k; }
+    if (use_bias) acc += bias[oj];
+    out[oj] = acc;
+}
+
+extern "C" __global__ void gemv_splitk_reduce_gdn_4way(
+    const float* __restrict__ partial,
+    float* __restrict__ out_qkv,
+    float* __restrict__ out_gate,
+    float* __restrict__ out_beta,
+    float* __restrict__ out_alpha,
+    int n_qkv, int n_gate, int n_beta, int n_alpha,
+    int n_split
+) {
+    int j = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int n_tot = n_qkv + n_gate + n_beta + n_alpha;
+    if (j >= n_tot) return;
+    float acc = 0.f;
+    #pragma unroll 4
+    for (int s = 0; s < n_split; s++) {
+        acc += partial[(size_t)s * (size_t)n_tot + j];
+    }
+    float* out;
+    int oj;
+    if (j < n_qkv) { out = out_qkv; oj = j; }
+    else if (j < n_qkv + n_gate) { out = out_gate; oj = j - n_qkv; }
+    else if (j < n_qkv + n_gate + n_beta) { out = out_beta; oj = j - n_qkv - n_gate; }
+    else { out = out_alpha; oj = j - n_qkv - n_gate - n_beta; }
+    out[oj] = acc;
+}
+
+

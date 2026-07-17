@@ -1,0 +1,155 @@
+Warning: Permanently added 'ssh.lightning.ai' (RSA) to the list of known hosts.
+loading /home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf …
+GPU | qwen2 L=36 d=2048 heads=16/2 ff=11008 | 1.79 GiB Q-weights | decode=flash
+GPU device | NVIDIA L4 | compute 8.9 | NVRTC arch=sm_89
+tuning | q4_dual=4way | threads=128 | quantized_warps=4
+weights | Q4_K=216 (1.24 GiB) Q5_0=0 (0.00 GiB) Q6_K=37 (0.55 GiB) Q8_0=0 (0.00 GiB)
+ready | decode=flash | Q4_K×Q8 DP4A | fused projections | CUDA-graph ready
+KV    | f16  max_seq=5000  ~175.8 MiB (all layers K+V)
+flags | cuda_graph=true | decode=flash
+profile mode (multi-turn) | decode=flash | max_new=128 | turns=5 | gpu=NVIDIA L4 (sm_89)
+  turn 1: "hi, who are you?"
+  turn 2: "what can you help me with in one sentence?"
+  turn 3: "ok give me 3 bullet ideas for a weekend project"
+  turn 4: "expand on the second idea a bit more"
+  turn 5: "summarize everything we talked about so far"
+
+—— turn 1/5 ——
+user: hi, who are you?
+assistant: Hello! I am a large language model created by Alibaba Cloud. I'm called Qwen. How can I assist you today?
+[26 tok | prefill 168 ms | decode 104.1 tok/s | ctx 53 | stop=Eos]
+
+—— turn 2/5 ——
+user: what can you help me with in one sentence?
+[25 tok | prefill 134 ms | decode 103.8 tok/s | ctx 98 | stop=Eos]
+assistant: I can assist with a wide range of tasks, from answering questions and generating text to helping with creative writing and solving problems.
+
+—— turn 3/5 ——
+user: ok give me 3 bullet ideas for a weekend project
+assistant: Sure! Here are three bullet ideas for a weekend project:
+
+- Build a simple website or blog using a platform like WordPress or Blogger.
+- Create a digital art piece using online tools like Canva or Adobe Spark.
+- Learn a new skill or language with online courses or apps like Duolingo or Coursera.
+[64 tok | prefill 143 ms | decode 101.9 tok/s | ctx 183 | stop=Eos]
+
+—— turn 4/5 ——
+user: expand on the second idea a bit more
+assistant: Certainly! Here's an expanded version of the second idea:
+
+- Create a digital art piece using online tools like Canva or Adobe Spark. You can start by choosing a theme or subject you're interested in. Then, use the tools' features to create a visually appealing design. You can experiment with different colors, fonts, and layouts. Don't forget to add any text or captions to make your piece more engaging. This project not only allows you to express your creativity but also helps you learn new design techniques.
+[103 tok | prefill 102 ms | decode 99.4 tok/s | ctx 304 | stop=Eos]
+
+—— turn 5/5 ——
+user: summarize everything we talked about so far
+assistant: Sure! Here's a summary of our conversation so far:
+
+- **Introduction**: We had a conversation where you asked about my capabilities and then inquired for ideas for a weekend project.
+- **My Role**: I am Qwen, a large language model created by Alibaba Cloud.
+- **Your Request**: You asked for three bullet ideas for a weekend project.
+- **Expanded Idea**: For the second idea, I provided a more detailed explanation of creating a digital art piece using online tools like Canva or Adobe Spark, including steps to choose a theme, experiment with design elements, and add text or captions.
+
+Let me know if you need
+[128 tok | prefill 139 ms | decode 97.7 tok/s | ctx 450 | stop=MaxNew]
+
+profile log → profile-logs/profile_unix_1784199841_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  unix_1784199841
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     /home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=36  d=2048  heads=16/2  ff=11008  vocab=151936
+    weights   1.79 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    flash — 8-way flash decode + tiled prefill — v0.5 production path
+    gpu       NVIDIA L4  |  compute 8.9  |  NVRTC sm_89
+    gpu+      driver 580.159.03  |  VRAM 23034 MiB  |  pci 00000000:35:00.0  |  uuid GPU-8209d5f9-70fd-d6…
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  35 samples over 4.49s wall (span 4370 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   168ms 104.1t/s   173    25    26     0    53    eos    - hi, who are you?
+     2   134ms 103.8t/s   135    18    25    53    98    eos    - what can you help me with in one sen…
+     3   143ms 101.9t/s   144    19    64    98   183    eos    - ok give me 3 bullet ideas for a week…
+     4   102ms  99.4t/s   103    16   103   183   304    eos    - expand on the second idea a bit more
+     5   139ms  97.7t/s   141    17   128   304   450    max    Y summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 139 ms  min 103  max 173  (user→first token)
+    tokenize  total 10.0 ms  (2.00 ms/turn)
+    ms/token  prefill 7.2  decode 10.0
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill      686 ms |    95 tok |  138.4 tok/s |  15.5% of turn-time
+    decode      3465 ms |   346 tok |   99.9 tok/s |  78.3% of turn-time
+    wall        4426 ms sum turns | wall-clock run 4.49s
+    decode   first-turn 104.1 t/s → last-turn 97.7 t/s  (drop 6%)
+    prefill  first 168 ms | later avg 130 ms
+    est weight BW  192.1 GB/s  (~100% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 450 / 5000  (9.0% full)  avg growth/turn 99 tok
+    VRAM   used avg 2826  min 2820  peak 2826 / 23034 MiB  (12% peak)
+    VRAM   free at peak ~20208 MiB  |  mem-controller util avg 77.2%
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=4  hit_max_new=1  empty=0  / 5 turns
+    ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min   0.0%  avg   0.0%  max   0.0%
+  GPU
+    identity  NVIDIA L4  |  cc 8.9  |  sm_89
+    compute  min  58.0%  avg  96.3%  max 100.0%
+    power    min  29.0 W  avg  64.9 W  max  72.7 W
+    temp     min    47 °C avg    51 °C max    53 °C
+    clocks   core avg 1500 MHz (max 2040)  mem avg 6251 MHz
+    efficiency  1.037 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  1.54 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~20208 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • Raise max_new (or profile cap) if answers look cut off.
+    • High GPU util → optimize matmul/attention bandwidth next.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=unix_1784199841
+    model=Qwen2.5-3B-Instruct-Q4_K_M
+    model_path=/home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    decode_backend=flash
+    mode=multi-turn
+    gpu_name=NVIDIA L4
+    gpu_compute_cap=8.9
+    gpu_nvrtc_arch=sm_89
+    gpu_driver=580.159.03
+    gpu_vram_total_mib=23034
+    gpu_uuid=GPU-8209d5f9-70fd-d650-8499-ef08d2cccd3c
+    gpu_pci=00000000:35:00.0
+    overall_decode_tps=99.866
+    overall_prefill_tps=138.448
+    decode_tps_first=104.125
+    decode_tps_last=97.694
+    decode_drop_pct=6.18
+    total_prefill_ms=686.18
+    total_decode_ms=3464.63
+    total_gen=346
+    total_prompt=95
+    final_ctx=450
+    wall_s=4.494
+    first_prefill_ms=167.83
+    later_prefill_avg_ms=129.59
+════════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════════
+  vs PREVIOUS same model  (Qwen2.5-3B-Instruct-Q4_K_M)
+  (latest_Qwen2.5-3B-Instruct-Q4_K_M.txt)
+────────────────────────────────────────────────────────────────
+    gpu        NVIDIA L4 (sm_89) → NVIDIA L4 (sm_89)
+    overall decode  99.5 → 99.9 t/s   (+0.4  +0%)
+    first-turn      103.3 → 104.1 t/s   (+0.8  +1%)
+    last-turn       97.5 → 97.7 t/s   (+0.2  +0%)
+    decode drop %   6 → 6     (+0.5)
+    final ctx       438 → 450
+════════════════════════════════════════════════════════════════

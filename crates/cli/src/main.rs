@@ -31,11 +31,11 @@ Commands (no model path required):
 Fast path on a new Linux GPU box:
   curl -fsSL .../tarafer-linux-x86_64.tar.gz | tar xz
   ./tarafer install
-  tarafer --download 0.5b
-  tarafer --download 7b          # larger model (~4.7 GiB)
-  tarafer --download large       # 7b + 14b
+  tarafer --download 0.8b
+  tarafer --download 4b          # Qwen3.5-4B Q4_K_M
+  tarafer --download 9b          # larger hybrid (~5.5 GiB)
   tarafer --download list        # show all tags
-  tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+  tarafer models/Qwen3.5-0.8B-Q4_K_M.gguf
 ";
 
 #[derive(Parser, Debug)]
@@ -50,7 +50,7 @@ struct Cli {
     /// Optional if you only pass `--download`, or use `update` / `install`.
     model: Option<PathBuf>,
     /// Download GGUF(s) from Hugging Face into `--models-dir`.
-    /// `list` | `all` (0.5b+3b) | `small` | `large` (7b+14b) | `profile` | `7b` | `14b` | …
+    /// `list` | `all` (0.8b+4b) | `small` | `profile` | `0.8b` | `4b` | `9b` | …
     /// Skip existing unless `--force`.
     #[arg(long, value_name = "WHICH", num_args = 0..=1, default_missing_value = "all")]
     download: Option<String>,
@@ -77,6 +77,11 @@ struct Cli {
     /// Benchmark: multi-turn chat + CPU/GPU sampling + rich report.
     #[arg(long, default_value_t = false)]
     profile: bool,
+    /// Enable Qwen3 / Qwen3.5 thinking mode (open `<think>` block).
+    /// Small Qwen3.5 models (0.8B–9B) default to non-thinking; pass this to
+    /// get chain-of-thought before the answer.
+    #[arg(long, default_value_t = false)]
+    think: bool,
     /// Start OpenAI-compatible HTTP server on PORT (default 8787). One GGUF = one model.
     #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "8787")]
     serve: Option<u16>,
@@ -143,8 +148,8 @@ fn main() -> Result<()> {
             "missing model path.\n  \
              update:   tarafer update\n  \
              install:  tarafer install\n  \
-             download: tarafer --download 0.5b\n  \
-             then run: tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+             download: tarafer --download 0.8b\n  \
+             then run: tarafer models/Qwen3.5-0.8B-Q4_K_M.gguf"
         ),
     };
 
@@ -168,13 +173,36 @@ fn main() -> Result<()> {
     if cli.profile {
         run_profile(&mut engine, &cli, &model)?;
     } else {
-        let opts = SessionOptions::interactive(cli.max_new);
+        let mut opts = SessionOptions::interactive(cli.max_new);
+        opts.enable_thinking = cli.think;
+        if cli.think {
+            eprintln!("thinking | enabled (generation prompt opens <think>)");
+        }
         let mut session = engine.session(opts);
         if let Some(p) = cli.prompt {
             // Explicit --prompt is a raw completion prompt. Interactive input
             // remains chat-templated; raw mode is also the reproducible path
             // for base-model speed/quality showcases.
-            session.complete_prompt(&p)?;
+            //
+            // If --think is set and the prompt already ends at assistant start
+            // without a think prefill, append the official Qwen3.5 open-think
+            // suffix so chain-of-thought runs.
+            let prompt = if cli.think && !p.contains("<think>") {
+                let mut s = p;
+                if !s.ends_with("<|im_start|>assistant\n") && !s.ends_with("<|im_start|>assistant") {
+                    if !s.ends_with('\n') {
+                        s.push('\n');
+                    }
+                    s.push_str("<|im_start|>assistant\n");
+                } else if s.ends_with("<|im_start|>assistant") {
+                    s.push('\n');
+                }
+                s.push_str("<think>\n");
+                s
+            } else {
+                p
+            };
+            session.complete_prompt(&prompt)?;
         } else {
             session.run_repl()?;
         }

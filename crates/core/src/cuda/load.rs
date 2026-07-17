@@ -3,7 +3,10 @@
 use super::decode::DecodeBackend;
 use super::kernels::SOURCE;
 use super::model::CudaModel;
-use super::types::{GpuLayer, GpuMat, Kernels, WType, MAX_BATCH};
+use super::types::{
+    FullAttnWeights, GpuLayer, GpuMat, Kernels, LayerAttn, LinearAttnWeights, WType, MAX_BATCH,
+};
+use crate::config::LayerKind;
 use crate::config::ModelConfig;
 use crate::quant::dequant_f32;
 use anyhow::{anyhow, bail, Context, Result};
@@ -275,8 +278,19 @@ impl CudaModel {
         } else {
             "gemv_q4_k_ffn"
         };
+        let q4_ffn_smem_symbol = if q4_dual_4way {
+            "gemv_q4_k_ffn_4way_smem"
+        } else {
+            "gemv_q4_k_ffn"
+        };
         let q4_dual_threads = if q4_dual_4way { 128 } else { 64 };
-        let gemv_quantized_warps = if cc_major >= 8 { 4 } else { 32 };
+        // Ampere+: keep modest warps for high-register Q4 DP4A paths; Turing
+        // prefers fat blocks. Override with TARAFER_GEMV_WARPS.
+        let gemv_quantized_warps = std::env::var("TARAFER_GEMV_WARPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&w: &u32| (1..=32).contains(&w))
+            .unwrap_or(if cc_major >= 8 { 16 } else { 32 });
         eprintln!(
             "tuning | q4_dual={} | threads={} | quantized_warps={}",
             if q4_dual_4way { "4way" } else { "2way" },
@@ -294,7 +308,10 @@ impl CudaModel {
             gemv_q6_repack_global: module.load_function("gemv_q6_k_repack_global")?,
             gemv_q6_compact_global: module.load_function("gemv_q6_k_compact_global")?,
             gemv_q6_compact_global_4way: module.load_function("gemv_q6_k_compact_global_4way")?,
+            gemv_q6_compact_global_8way: module.load_function("gemv_q6_k_compact_global_8way")?,
+            gemv_q6_compact_global_mcol: module.load_function("gemv_q6_k_compact_global_mcol")?,
             gemv_q8: module.load_function("gemv_q8_0")?,
+            gemv_q8_global: module.load_function("gemv_q8_0_global")?,
             gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
             gemv_q4_global_splitk: module.load_function("gemv_q4_k_global_splitk")?,
             gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,
@@ -305,15 +322,27 @@ impl CudaModel {
             gemv_q6_compact_global_splitk: module
                 .load_function("gemv_q6_k_compact_global_splitk")?,
             gemv_q8_splitk: module.load_function("gemv_q8_0_splitk")?,
+            gemv_q8_global_splitk: module.load_function("gemv_q8_0_global_splitk")?,
             gemv_splitk_reduce: module.load_function("gemv_splitk_reduce")?,
             gemv_q5_qk: module.load_function("gemv_q5_0_qk")?,
             gemv_q5_qkv: module.load_function("gemv_q5_0_qkv")?,
             gemv_q4_pair: module.load_function("gemv_q4_k_pair")?,
             gemv_q4_dual: module.load_function(q4_dual_symbol)?,
             gemv_q4_ffn: module.load_function(q4_ffn_symbol)?,
+            gemv_q4_ffn_8way: module.load_function("gemv_q4_k_ffn_8way")?,
+            gemv_q4_ffn_mcol: module.load_function("gemv_q4_k_ffn_mcol")?,
+            gemv_q4_ffn_smem: module.load_function(q4_ffn_smem_symbol)?,
             gemv_q4_dual_threads: q4_dual_threads,
             gemv_quantized_warps,
             gemv_q4_qkv: module.load_function("gemv_q4_k_qkv")?,
+            gemv_q8_qkv: module.load_function("gemv_q8_0_qkv")?,
+            gemv_q8_gdn_4way: module.load_function("gemv_q8_0_gdn_4way")?,
+            gemv_hybrid_gdn_4way: module.load_function("gemv_hybrid_gdn_4way")?,
+            gemv_q8_qkv_splitk: module.load_function("gemv_q8_0_qkv_splitk")?,
+            gemv_q8_gdn_4way_splitk: module.load_function("gemv_q8_0_gdn_4way_splitk")?,
+            gemv_hybrid_gdn_4way_splitk: module.load_function("gemv_hybrid_gdn_4way_splitk")?,
+            gemv_splitk_reduce_qkv: module.load_function("gemv_splitk_reduce_qkv")?,
+            gemv_splitk_reduce_gdn_4way: module.load_function("gemv_splitk_reduce_gdn_4way")?,
             gemm_q4: module.load_function("gemm_q4_k")?,
             gemm_q5: module.load_function("gemm_q5_0")?,
             gemm_q5k: module.load_function("gemm_q5_k")?,
@@ -342,6 +371,30 @@ impl CudaModel {
             rope_d: module.load_function("rope_neox_f32_d")?,
             qk_norm_rope: module.load_function("qk_rms_norm_rope_neox_f32")?,
             qk_norm_rope_d: module.load_function("qk_rms_norm_rope_neox_f32_d")?,
+            qk_norm_partial_rope: module.load_function("qk_rms_norm_partial_rope_neox_f32")?,
+            qk_norm_partial_rope_d: module.load_function("qk_rms_norm_partial_rope_neox_f32_d")?,
+            sigmoid: module.load_function("sigmoid_f32")?,
+            softplus_bias_scale: module.load_function("softplus_bias_scale_f32")?,
+            softplus_bias_scale_rows: module.load_function("softplus_bias_scale_rows_f32")?,
+            gdn_prep_decay_beta: module.load_function("gdn_prep_decay_beta_f32")?,
+            copy_f32: module.load_function("copy_f32")?,
+            exp_f: module.load_function("exp_f32")?,
+            l2_norm_heads: module.load_function("l2_norm_heads_f32")?,
+            gated_rms_norm: module.load_function("gated_rms_norm_f32")?,
+            split_q_gate: module.load_function("split_q_gate_interleaved_f32")?,
+            mul_sigmoid: module.load_function("mul_sigmoid_f32")?,
+            causal_conv1d: module.load_function("causal_conv1d_f32")?,
+            causal_conv1d_one: module.load_function("causal_conv1d_one_f32")?,
+            gated_delta_seq: module.load_function("gated_delta_rule_seq_f32")?,
+            gated_delta_one: module.load_function("gated_delta_rule_one_f32")?,
+            gdn_conv_qkvl2_one: module.load_function("gdn_conv_qkvl2_one_f32")?,
+            gdn_delta_gated_one: module.load_function("gdn_delta_gated_one_f32")?,
+            gdn_delta_gated_one_d128: module.load_function("gdn_delta_gated_one_d128_f32")?,
+            gdn_split_l2_seq: module.load_function("gdn_split_l2_seq_f32")?,
+            gdn_delta_gated_seq: module.load_function("gdn_delta_gated_seq_f32")?,
+            split_qkv_conv: module.load_function("split_qkv_from_conv_f32")?,
+            split_qkv_l2_one: module.load_function("split_qkv_l2_one_f32")?,
+            zero_f32: module.load_function("zero_f32")?,
             attn: {
                 // Load only symbols listed in decode::REGISTRY (easy add/remove).
                 let mut map = std::collections::HashMap::new();
@@ -362,7 +415,17 @@ impl CudaModel {
             copy_last: module.load_function("copy_last_row")?,
         };
 
-        let q5k_fallback = std::env::var_os("TARAFER_Q5K_TRANSCODE").is_some();
+        // Q5_K f32-dot GEMV is much slower than Q8_0 on sm_86 decode.
+        // Hybrid Qwen3.5 puts Q5_K on the hot path (attn_qkv / ssm_out) — auto
+        // transcode unless the user forces native Q5_K.
+        // Override: TARAFER_Q5K_TRANSCODE=1 always; TARAFER_Q5K_NATIVE=1 never.
+        let q5k_fallback = if std::env::var_os("TARAFER_Q5K_NATIVE").is_some() {
+            false
+        } else if std::env::var_os("TARAFER_Q5K_TRANSCODE").is_some() {
+            true
+        } else {
+            cfg.is_hybrid()
+        };
         let q5k_transcoded = std::cell::Cell::new(0usize);
         let q5_1_transcoded = std::cell::Cell::new(0usize);
         let upload_mat = |name: &str| -> Result<GpuMat> {
@@ -423,19 +486,47 @@ impl CudaModel {
                 wtype,
             })
         };
-        let upload_vec =
-            |name: &str| -> Result<_> { Ok(stream.clone_htod(&f32_host(gguf, name)?)?) };
+        // Default: plain RMS weights (GGUF stores usable scales for llama.cpp).
+        // Set TARAFER_RMS_ONE_PLUS=1 to bake (1+w) if a convert left raw HF weights.
+        let one_plus = cfg.is_hybrid() && std::env::var_os("TARAFER_RMS_ONE_PLUS").is_some();
+        if one_plus {
+            eprintln!("approx | RMSNorm bake (1+w) for qwen35");
+        }
+        let upload_vec = |name: &str| -> Result<_> {
+            let mut v = f32_host(gguf, name)?;
+            if one_plus {
+                for x in &mut v {
+                    *x += 1.0;
+                }
+            }
+            Ok(stream.clone_htod(&v)?)
+        };
+        let upload_vec_plain = |name: &str| -> Result<_> {
+            Ok(stream.clone_htod(&f32_host(gguf, name)?)?)
+        };
 
         let mut token_embd = upload_mat("token_embd.weight")?;
         let output_norm = upload_vec("output_norm.weight")?;
         let mut output = upload_mat("output.weight").ok();
         let mut output_special = None;
         let mut output_special_id = None;
-        if let Some(limit) = std::env::var("TARAFER_VOCAB_LIMIT")
+        // Hybrid + huge vocab (Qwen3.5) pays a full-head GEMV every token. Default
+        // a generous active shortlist for speed; full vocab with TARAFER_FULL_VOCAB=1.
+        let vocab_limit = std::env::var("TARAFER_VOCAB_LIMIT")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 1024 && n < cfg.n_vocab)
-        {
+            .or_else(|| {
+                if cfg.is_hybrid()
+                    && cfg.n_vocab > 100_000
+                    && std::env::var_os("TARAFER_FULL_VOCAB").is_none()
+                {
+                    // Aggressive shortlist for single-stream decode speed on 4GB.
+                    Some(49_152)
+                } else {
+                    None
+                }
+            });
+        if let Some(limit) = vocab_limit.filter(|&n| n >= 1024 && n < cfg.n_vocab) {
             let eos = gguf
                 .meta_u32("tokenizer.ggml.eos_token_id")
                 .or_else(|| {
@@ -491,18 +582,61 @@ impl CudaModel {
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
             let p = format!("blk.{i}");
+            let ffn_norm = upload_vec(&format!("{p}.ffn_norm.weight"))
+                .or_else(|_| upload_vec(&format!("{p}.post_attention_norm.weight")))?;
+            let kind = cfg
+                .layer_kinds
+                .get(i)
+                .copied()
+                .unwrap_or(LayerKind::FullAttention);
+            let attn = match kind {
+                LayerKind::FullAttention => LayerAttn::Full(FullAttnWeights {
+                    wq: upload_mat(&format!("{p}.attn_q.weight"))?,
+                    bq: upload_vec(&format!("{p}.attn_q.bias")).ok(),
+                    wk: upload_mat(&format!("{p}.attn_k.weight"))?,
+                    bk: upload_vec(&format!("{p}.attn_k.bias")).ok(),
+                    wv: upload_mat(&format!("{p}.attn_v.weight"))?,
+                    bv: upload_vec(&format!("{p}.attn_v.bias")).ok(),
+                    wo: upload_mat(&format!("{p}.attn_output.weight"))?,
+                    attn_q_norm: upload_vec(&format!("{p}.attn_q_norm.weight")).ok(),
+                    attn_k_norm: upload_vec(&format!("{p}.attn_k_norm.weight")).ok(),
+                    fused_q_gate: cfg.fused_q_gate,
+                }),
+                LayerKind::LinearAttention => {
+                    let conv_t = gguf
+                        .tensor(&format!("{p}.ssm_conv1d.weight"))
+                        .ok_or_else(|| anyhow!("missing {p}.ssm_conv1d.weight"))?;
+                    // GGUF dims [kernel, channels] for f32.
+                    let conv_kernel = conv_t.dims[0] as usize;
+                    let conv_channels = conv_t.dims.get(1).copied().unwrap_or(0) as usize;
+                    let conv_raw = gguf.tensor_data(conv_t);
+                    let conv_f32: Vec<f32> = conv_raw
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    LayerAttn::Linear(LinearAttnWeights {
+                        wqkv: upload_mat(&format!("{p}.attn_qkv.weight"))?,
+                        w_gate: upload_mat(&format!("{p}.attn_gate.weight"))?,
+                        conv1d: stream.clone_htod(&conv_f32)?,
+                        conv_kernel,
+                        conv_channels,
+                        ssm_a: upload_vec_plain(&format!("{p}.ssm_a"))?,
+                        ssm_dt: upload_vec_plain(&format!("{p}.ssm_dt.bias"))?,
+                        ssm_alpha: upload_mat(&format!("{p}.ssm_alpha.weight"))?,
+                        ssm_beta: upload_mat(&format!("{p}.ssm_beta.weight"))?,
+                        // Gated RMSNorm uses plain weight (not 1+w).
+                        ssm_norm: upload_vec_plain(&format!("{p}.ssm_norm.weight"))?,
+                        ssm_out: upload_mat(&format!("{p}.ssm_out.weight"))?,
+                        n_k_heads: cfg.ssm_n_k_heads,
+                        n_v_heads: cfg.ssm_n_v_heads,
+                        state_size: cfg.ssm_state_size,
+                    })
+                }
+            };
             layers.push(GpuLayer {
                 attn_norm: upload_vec(&format!("{p}.attn_norm.weight"))?,
-                attn_q_norm: upload_vec(&format!("{p}.attn_q_norm.weight")).ok(),
-                attn_k_norm: upload_vec(&format!("{p}.attn_k_norm.weight")).ok(),
-                wq: upload_mat(&format!("{p}.attn_q.weight"))?,
-                bq: upload_vec(&format!("{p}.attn_q.bias")).ok(),
-                wk: upload_mat(&format!("{p}.attn_k.weight"))?,
-                bk: upload_vec(&format!("{p}.attn_k.bias")).ok(),
-                wv: upload_mat(&format!("{p}.attn_v.weight"))?,
-                bv: upload_vec(&format!("{p}.attn_v.bias")).ok(),
-                wo: upload_mat(&format!("{p}.attn_output.weight"))?,
-                ffn_norm: upload_vec(&format!("{p}.ffn_norm.weight"))?,
+                ffn_norm,
+                attn,
                 gate: upload_mat(&format!("{p}.ffn_gate.weight"))?,
                 up: upload_mat(&format!("{p}.ffn_up.weight"))?,
                 down: upload_mat(&format!("{p}.ffn_down.weight"))?,
@@ -510,7 +644,7 @@ impl CudaModel {
         }
         if q5k_transcoded.get() != 0 || q5_1_transcoded.get() != 0 {
             eprintln!(
-                "load compatibility | Q5_K -> Q8_0={} Q5_1 -> Q8_0={} tensors",
+                "load fast-path | Q5_K -> Q8_0={} Q5_1 -> Q8_0={} tensors (hybrid decode; set TARAFER_Q5K_NATIVE=1 to keep Q5_K)",
                 q5k_transcoded.get(),
                 q5_1_transcoded.get()
             );
@@ -533,17 +667,39 @@ impl CudaModel {
             count_mat(m);
         }
         for layer in &layers {
-            for m in [
-                &layer.wq,
-                &layer.wk,
-                &layer.wv,
-                &layer.wo,
-                &layer.gate,
-                &layer.up,
-                &layer.down,
-            ] {
-                count_mat(m);
+            count_mat(&layer.gate);
+            count_mat(&layer.up);
+            count_mat(&layer.down);
+            match &layer.attn {
+                LayerAttn::Full(a) => {
+                    count_mat(&a.wq);
+                    count_mat(&a.wk);
+                    count_mat(&a.wv);
+                    count_mat(&a.wo);
+                }
+                LayerAttn::Linear(a) => {
+                    count_mat(&a.wqkv);
+                    count_mat(&a.w_gate);
+                    count_mat(&a.ssm_alpha);
+                    count_mat(&a.ssm_beta);
+                    count_mat(&a.ssm_out);
+                }
             }
+        }
+        if cfg.is_hybrid() {
+            let n_full = cfg
+                .layer_kinds
+                .iter()
+                .filter(|k| matches!(k, LayerKind::FullAttention))
+                .count();
+            let n_lin = cfg.n_layer - n_full;
+            eprintln!(
+                "hybrid | qwen35  full_attn={n_full}  linear_gdn={n_lin}  rope_dim={}  ssm d_k={} heads_k/v={}/{}",
+                cfg.rope_dim,
+                cfg.ssm_state_size,
+                cfg.ssm_n_k_heads,
+                cfg.ssm_n_v_heads
+            );
         }
         eprintln!(
             "weights | Q4_K={} ({:.2} GiB) Q5_K={} ({:.2} GiB) Q5_0={} ({:.2} GiB) Q6_K={} ({:.2} GiB) Q8_0={} ({:.2} GiB)",
@@ -564,39 +720,83 @@ impl CudaModel {
         let n_kv = cfg.n_head_kv * cfg.head_dim();
         let head_dim = cfg.head_dim();
         let n_q = cfg.n_head * head_dim;
+        let n_q_proj = cfg.q_proj_dim();
+        let ssm_qkv = if cfg.is_hybrid() {
+            cfg.ssm_conv_channels().max(1)
+        } else {
+            1
+        };
+        let ssm_key = if cfg.is_hybrid() {
+            cfg.ssm_key_dim().max(1)
+        } else {
+            1
+        };
+        let ssm_val = if cfg.is_hybrid() {
+            cfg.ssm_value_dim().max(1)
+        } else {
+            1
+        };
+        let ssm_nv = cfg.ssm_n_v_heads.max(1);
         let b = MAX_BATCH;
+        // Active vocab may be shortlisted (hybrid speed path).
+        let active_vocab = output
+            .as_ref()
+            .map(|m| m.n_cols)
+            .unwrap_or(token_embd.n_cols)
+            + usize::from(output_special.is_some());
         // Split-K partials: enough for largest single-token GEMV (usually vocab).
-        let gemv_partial_stride = cfg.n_vocab.max(cfg.n_ff).max(n_embd).max(n_kv);
+        let gemv_partial_stride = active_vocab
+            .max(cfg.n_ff)
+            .max(n_embd)
+            .max(n_kv)
+            .max(n_q_proj)
+            .max(ssm_qkv)
+            .max(ssm_val);
         const GEMV_SPLIT_MAX: usize = 8;
         use super::decode::FLASH_MAX_SPLIT;
         let flash_partial_stride = 2 + head_dim;
         let flash_partial_n = cfg.n_head * FLASH_MAX_SPLIT as usize * flash_partial_stride;
+        // Hybrid GDN updates fixed device buffers in-place — CUDA graphs work
+        // when capture saves/restores recurrent state (see try_capture_decode_graph).
+        if cfg.is_hybrid() {
+            eprintln!("CUDA graph | hybrid ok (GDN/conv state fixed pointers; capture saves/restores)");
+        }
         Ok(Self {
             x: stream.alloc_zeros(b * n_embd)?,
             // Qwen3 can have n_head*head_dim > n_embd; xb is reused for
             // normalized hidden state and the attention result.
-            xb: stream.alloc_zeros(b * n_embd.max(n_q))?,
-            xb2: stream.alloc_zeros(b * n_embd)?,
-            q: stream.alloc_zeros(b * n_q)?,
-            k_buf: stream.alloc_zeros(b * n_kv)?,
-            v_buf: stream.alloc_zeros(b * n_kv)?,
+            xb: stream.alloc_zeros(b * n_embd.max(n_q).max(ssm_val))?,
+            xb2: stream.alloc_zeros(b * n_embd.max(ssm_val))?,
+            q: stream.alloc_zeros(b * n_q_proj.max(ssm_qkv))?,
+            k_buf: stream.alloc_zeros(b * n_kv.max(ssm_key))?,
+            v_buf: stream.alloc_zeros(b * n_kv.max(ssm_val))?,
             hb: stream.alloc_zeros(b * cfg.n_ff)?,
             hb2: stream.alloc_zeros(b * cfg.n_ff)?,
             x1: stream.alloc_zeros(n_embd)?,
             xb1: stream.alloc_zeros(n_embd)?,
-            logits: stream.alloc_zeros(cfg.n_vocab)?,
+            logits: stream.alloc_zeros(active_vocab)?,
             special_logit: stream.alloc_zeros(1)?,
-            logits_batch: stream.alloc_zeros(super::types::MAX_VERIFY_TOKENS * cfg.n_vocab)?,
+            logits_batch: stream
+                .alloc_zeros(super::types::MAX_VERIFY_TOKENS * active_vocab)?,
             argmax_buf: stream.alloc_zeros(1)?,
             argmax_batch: stream.alloc_zeros(super::types::MAX_VERIFY_TOKENS)?,
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,
-            q8_x: stream.alloc_zeros(cfg.n_ff.max(n_embd))?,
-            q8_d: stream.alloc_zeros((cfg.n_ff.max(n_embd) + 31) / 32)?,
+            q8_x: stream.alloc_zeros(cfg.n_ff.max(n_embd).max(ssm_qkv).max(ssm_val))?,
+            q8_d: stream.alloc_zeros((cfg.n_ff.max(n_embd).max(ssm_qkv).max(ssm_val) + 31) / 32)?,
             gemv_partial: stream.alloc_zeros(GEMV_SPLIT_MAX * gemv_partial_stride)?,
             gemv_partial_stride,
             d_pos0: stream.alloc_zeros(1)?,
             d_token: stream.alloc_zeros(1)?,
             flash_partial: stream.alloc_zeros(flash_partial_n)?,
+            gate_buf: stream.alloc_zeros(b * n_q.max(ssm_val))?,
+            gdn_q: stream.alloc_zeros(b * ssm_key)?,
+            gdn_k: stream.alloc_zeros(b * ssm_key)?,
+            gdn_v: stream.alloc_zeros(b * ssm_val)?,
+            gdn_z: stream.alloc_zeros(b * ssm_val)?,
+            gdn_alpha: stream.alloc_zeros(b * ssm_nv)?,
+            gdn_beta: stream.alloc_zeros(b * ssm_nv)?,
+            gdn_conv: stream.alloc_zeros(b * ssm_qkv)?,
+            gdn_out: stream.alloc_zeros(b * ssm_val)?,
             decode_graph: None,
             graph_tried: false,
             cuda_graph: true,

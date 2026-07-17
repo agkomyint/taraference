@@ -1,0 +1,153 @@
+Warning: Permanently added 'ssh.lightning.ai' (RSA) to the list of known hosts.
+loading /home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf …
+GPU | qwen2 L=36 d=2048 heads=16/2 ff=11008 | 1.79 GiB Q-weights | decode=flash
+GPU device | NVIDIA L4 | compute 8.9 | NVRTC arch=sm_89
+tuning | q4_dual=4way | threads=128 | quantized_warps=4
+weights | Q4_K=216 (1.24 GiB) Q5_0=0 (0.00 GiB) Q6_K=37 (0.55 GiB) Q8_0=0 (0.00 GiB)
+ready | decode=flash | Q4_K×Q8 DP4A | fused projections | CUDA-graph ready
+KV    | f16  max_seq=5000  ~175.8 MiB (all layers K+V)
+flags | cuda_graph=true | decode=flash
+profile mode (multi-turn) | decode=flash | max_new=128 | turns=5 | gpu=NVIDIA L4 (sm_89)
+  turn 1: "hi, who are you?"
+  turn 2: "what can you help me with in one sentence?"
+  turn 3: "ok give me 3 bullet ideas for a weekend project"
+  turn 4: "expand on the second idea a bit more"
+  turn 5: "summarize everything we talked about so far"
+
+—— turn 1/5 ——
+user: hi, who are you?
+[26 tok | prefill 167 ms | decode 104.0 tok/s | ctx 53 | stop=Eos]
+
+—— turn 2/5 ——
+user: what can you help me with in one sentence?
+assistant: Hello! I am a large language model created by Alibaba Cloud. I'm called Qwen. How can I assist you today?
+assistant: I can assist with a variety of tasks, from answering questions and generating text to helping with programming and solving problems.
+[23 tok | prefill 134 ms | decode 103.8 tok/s | ctx 96 | stop=Eos]
+
+—— turn 3/5 ——
+user: ok give me 3 bullet ideas for a weekend project
+assistant: Sure! Here are three bullet ideas for a weekend project:
+
+- Build a simple web application using a framework like Flask or Django.
+- Create a personal productivity tracker using a programming language like Python.
+- Develop a basic chatbot using natural language processing techniques.
+[51 tok | prefill 143 ms | decode 102.0 tok/s | ctx 168 | stop=Eos]
+
+—— turn 4/5 ——
+user: expand on the second idea a bit more
+assistant: Certainly! Here's a more detailed expansion on the second idea:
+
+- Create a personal productivity tracker using a programming language like Python. This project can help you manage your daily tasks, set goals, and track your progress. You can use libraries such as `pandas` for data manipulation and `matplotlib` for visualizing your data. Additionally, you might consider integrating a database like `SQLite` to store your productivity data securely. This project not only helps you stay organized but also provides insights into your daily routines and productivity patterns.
+[106 tok | prefill 100 ms | decode 99.7 tok/s | ctx 292 | stop=Eos]
+
+—— turn 5/5 ——
+user: summarize everything we talked about so far
+assistant: Sure! Here’s a summary of our conversation so far:
+
+- **Introduction**: We had a conversation where you asked about my capabilities and then inquired about ideas for a weekend project.
+- **My Role**: I am Qwen, a large language model created by Alibaba Cloud.
+- **Your Request**: You asked for three bullet ideas for a weekend project.
+- **Detailed Expansion**: I provided a more detailed expansion on the second idea, which is to create a personal productivity tracker using Python. This project involves using libraries like `pandas` and `matplotlib` for data manipulation and visualization, and potentially integrating a database like `SQLite`
+[128 tok | prefill 139 ms | decode 97.9 tok/s | ctx 438 | stop=MaxNew]
+
+profile log → profile-logs/profile_unix_1784199674_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  unix_1784199674
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     /home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=36  d=2048  heads=16/2  ff=11008  vocab=151936
+    weights   1.79 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    flash — 8-way flash decode + tiled prefill — v0.5 production path
+    gpu       NVIDIA L4  |  compute 8.9  |  NVRTC sm_89
+    gpu+      driver 580.159.03  |  VRAM 23034 MiB  |  pci 00000000:35:00.0  |  uuid GPU-8209d5f9-70fd-d6…
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  34 samples over 4.38s wall (span 4251 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   167ms 104.0t/s   172    25    26     0    53    eos    - hi, who are you?
+     2   134ms 103.8t/s   136    18    23    53    96    eos    - what can you help me with in one sen…
+     3   143ms 102.0t/s   144    19    51    96   168    eos    - ok give me 3 bullet ideas for a week…
+     4   100ms  99.7t/s   102    16   106   168   292    eos    - expand on the second idea a bit more
+     5   139ms  97.9t/s   140    17   128   292   438    max    Y summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 139 ms  min 102  max 172  (user→first token)
+    tokenize  total 9.6 ms  (1.93 ms/turn)
+    ms/token  prefill 7.2  decode 10.0
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill      683 ms |    95 tok |  139.1 tok/s |  15.9% of turn-time
+    decode      3343 ms |   334 tok |   99.9 tok/s |  77.7% of turn-time
+    wall        4301 ms sum turns | wall-clock run 4.38s
+    decode   first-turn 104.0 t/s → last-turn 97.9 t/s  (drop 6%)
+    prefill  first 167 ms | later avg 129 ms
+    est weight BW  192.2 GB/s  (~100% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 438 / 5000  (8.8% full)  avg growth/turn 96 tok
+    VRAM   used avg 2826  min 2820  peak 2826 / 23034 MiB  (12% peak)
+    VRAM   free at peak ~20208 MiB  |  mem-controller util avg 72.7%
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=4  hit_max_new=1  empty=0  / 5 turns
+    ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min   0.0%  avg   0.0%  max   0.0%
+  GPU
+    identity  NVIDIA L4  |  cc 8.9  |  sm_89
+    compute  min  33.0%  avg  95.7%  max 100.0%
+    power    min  24.4 W  avg  65.8 W  max  73.8 W
+    temp     min    46 °C avg    51 °C max    53 °C
+    clocks   core avg 1504 MHz (max 2040)  mem avg 6251 MHz
+    efficiency  1.044 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  1.52 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~20208 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • Raise max_new (or profile cap) if answers look cut off.
+    • High GPU util → optimize matmul/attention bandwidth next.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=unix_1784199674
+    model=Qwen2.5-3B-Instruct-Q4_K_M
+    model_path=/home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    decode_backend=flash
+    mode=multi-turn
+    gpu_name=NVIDIA L4
+    gpu_compute_cap=8.9
+    gpu_nvrtc_arch=sm_89
+    gpu_driver=580.159.03
+    gpu_vram_total_mib=23034
+    gpu_uuid=GPU-8209d5f9-70fd-d650-8499-ef08d2cccd3c
+    gpu_pci=00000000:35:00.0
+    overall_decode_tps=99.903
+    overall_prefill_tps=139.067
+    decode_tps_first=104.026
+    decode_tps_last=97.876
+    decode_drop_pct=5.91
+    total_prefill_ms=683.12
+    total_decode_ms=3343.25
+    total_gen=334
+    total_prompt=95
+    final_ctx=438
+    wall_s=4.375
+    first_prefill_ms=166.96
+    later_prefill_avg_ms=129.04
+════════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════════
+  vs PREVIOUS same model  (Qwen2.5-3B-Instruct-Q4_K_M)
+  (latest_Qwen2.5-3B-Instruct-Q4_K_M.txt)
+────────────────────────────────────────────────────────────────
+    gpu        NVIDIA L4 (sm_89) → NVIDIA L4 (sm_89)
+    overall decode  100.0 → 99.9 t/s   (-0.1  -0%)
+    first-turn      104.0 → 104.0 t/s   (-0.0  -0%)
+    last-turn       97.9 → 97.9 t/s   (-0.1  -0%)
+    decode drop %   6 → 6     (+0.1)
+    final ctx       438 → 438
+════════════════════════════════════════════════════════════════

@@ -1,0 +1,91 @@
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  2026-07-16_01-42-07
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     models\Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=24  d=896  heads=14/2  ff=4864  vocab=151936
+    weights   0.36 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    fastv2 — v2: f16 KV + tiled online attn + CUDA-graph path — recommended
+    gpu       NVIDIA GeForce RTX 3050 Ti Laptop GPU  |  compute 8.6  |  NVRTC sm_86
+    gpu+      driver 596.36  |  VRAM 4096 MiB  |  pci 00000000:01:00.0  |  uuid GPU-3d2db70e-289c-9a…
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  4 samples over 5.28s wall (span 3940 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   307ms 132.1t/s   309    25    64     0    91    eos    - hi, who are you?
+     2   187ms  95.9t/s   189    18    12    91   123    eos    - what can you help me with in one sen…
+     3   192ms 108.9t/s   194    19    59   123   203    eos    - ok give me 3 bullet ideas for a week…
+     4   143ms  92.2t/s   146    16   128   203   348    max    Y expand on the second idea a bit more
+     5   192ms  78.9t/s   194    17    58   348   425    eos    - summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 206 ms  min 146  max 309  (user→first token)
+    tokenize  total 10.9 ms  (2.18 ms/turn)
+    ms/token  prefill 10.8  decode 10.2
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill     1022 ms |    95 tok |   93.0 tok/s |  23.7% of turn-time
+    decode      3274 ms |   321 tok |   98.0 tok/s |  76.0% of turn-time
+    wall        4307 ms sum turns | wall-clock run 5.28s
+    decode   first-turn 132.1 t/s → last-turn 78.9 t/s  (drop 40%)
+    prefill  first 307 ms | later avg 179 ms
+    est weight BW  38.4 GB/s  (~20% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 425 / 5000  (8.5% full)  avg growth/turn 84 tok
+    VRAM   used avg 555  min 555  peak 555 / 4096 MiB  (14% peak)
+    VRAM   free at peak ~3541 MiB  |  mem-controller util avg 15.2%
+    host RAM  ~13445 / 16048 MiB used (system snapshot)
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=4  hit_max_new=1  empty=0  / 5 turns
+    ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min  26.0%  avg  50.0%  max  70.0%
+  GPU
+    identity  NVIDIA GeForce RTX 3050 Ti Laptop GPU  |  cc 8.6  |  sm_86
+    compute  min   3.0%  avg  73.8%  max  99.0%
+    power    min  11.7 W  avg  31.0 W  max  43.4 W
+    temp     min    74 °C avg    83 °C max    87 °C
+    clocks   core avg 1500 MHz (max 1687)  mem avg 5501 MHz
+    efficiency  1.329 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  3.17 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~3541 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • Decode dropped 40% as ctx grew → attention/KV path dominates long chats.
+    • CPU elevated → host launch/sync/copy may steal decode tok/s.
+    • GPU hot (87°C) — possible thermal throttle; watch clocks.
+    • Raise max_new (or profile cap) if answers look cut off.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=2026-07-16_01-42-07
+    model=Qwen2.5-0.5B-Instruct-Q4_K_M
+    model_path=models\Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    decode_backend=fastv2
+    mode=multi-turn
+    gpu_name=NVIDIA GeForce RTX 3050 Ti Laptop GPU
+    gpu_compute_cap=8.6
+    gpu_nvrtc_arch=sm_86
+    gpu_driver=596.36
+    gpu_vram_total_mib=4096
+    gpu_uuid=GPU-3d2db70e-289c-9a11-3bb1-73c48f2abd8e
+    gpu_pci=00000000:01:00.0
+    overall_decode_tps=98.035
+    overall_prefill_tps=93.000
+    decode_tps_first=132.149
+    decode_tps_last=78.901
+    decode_drop_pct=40.29
+    total_prefill_ms=1021.51
+    total_decode_ms=3274.36
+    total_gen=321
+    total_prompt=95
+    final_ctx=425
+    wall_s=5.276
+    first_prefill_ms=307.45
+    later_prefill_avg_ms=178.52
+════════════════════════════════════════════════════════════════

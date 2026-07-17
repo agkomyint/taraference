@@ -1,0 +1,88 @@
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  unix_1784137809
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     /tmp/tara-models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=28  d=3584  heads=28/4  ff=18944  vocab=152064
+    weights   4.36 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    fastv2 — v2: f16 KV + tiled online attn (fixed smem) — recommended
+    gpu       Tesla T4  |  compute 7.5  |  NVRTC sm_75
+    gpu+      driver 580.159.03  |  VRAM 15360 MiB  |  pci 00000000:00:1E.0  |  uuid GPU-15675086-01be-aa…
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  208 samples over 29.18s wall (span 29045 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   804ms  14.2t/s   810    25    26     0    53    eos    - hi, who are you?
+     2   614ms  14.0t/s   617    18    25    53    98    eos    - what can you help me with in one sen…
+     3   625ms  15.3t/s   629    19    82    98   201    eos    - ok give me 3 bullet ideas for a week…
+     4   448ms  15.3t/s   451    16   128   201   347    max    Y expand on the second idea a bit more
+     5   634ms  14.8t/s   637    17   128   347   494    max    Y summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 629 ms  min 451  max 810  (user→first token)
+    tokenize  total 18.6 ms  (3.71 ms/turn)
+    ms/token  prefill 32.9  decode 66.9
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill     3125 ms |    95 tok |   30.4 tok/s |  10.7% of turn-time
+    decode     26007 ms |   389 tok |   15.0 tok/s |  89.2% of turn-time
+    wall       29150 ms sum turns | wall-clock run 29.18s
+    decode   first-turn 14.2 t/s → last-turn 14.8 t/s  (drop -4%)
+    prefill  first 804 ms | later avg 580 ms
+    est weight BW  70.0 GB/s  (~36% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 494 / 5000  (9.9% full)  avg growth/turn 110 tok
+    VRAM   used avg 4907  min 4907  peak 4907 / 15360 MiB  (32% peak)
+    VRAM   free at peak ~10453 MiB  |  mem-controller util avg 43.8%
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=3  hit_max_new=2  empty=0  / 5 turns
+    ⚠ 2 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min   0.0%  avg   0.0%  max   0.0%
+  GPU
+    identity  Tesla T4  |  cc 7.5  |  sm_75
+    compute  min  31.0%  avg  99.2%  max 100.0%
+    power    min  54.5 W  avg  69.2 W  max  92.9 W
+    temp     min    39 °C avg    45 °C max    49 °C
+    clocks   core avg 1077 MHz (max 1590)  mem avg 5000 MHz
+    efficiency  0.151 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  0.22 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~10453 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • Raise max_new (or profile cap) if answers look cut off.
+    • High GPU util → optimize matmul/attention bandwidth next.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=unix_1784137809
+    model=Qwen2.5-7B-Instruct-Q4_K_M
+    model_path=/tmp/tara-models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+    decode_backend=fastv2
+    mode=multi-turn
+    gpu_name=Tesla T4
+    gpu_compute_cap=7.5
+    gpu_nvrtc_arch=sm_75
+    gpu_driver=580.159.03
+    gpu_vram_total_mib=15360
+    gpu_uuid=GPU-15675086-01be-aac2-212e-5f15c4274736
+    gpu_pci=00000000:00:1E.0
+    overall_decode_tps=14.958
+    overall_prefill_tps=30.405
+    decode_tps_first=14.209
+    decode_tps_last=14.830
+    decode_drop_pct=-4.37
+    total_prefill_ms=3124.51
+    total_decode_ms=26006.54
+    total_gen=389
+    total_prompt=95
+    final_ctx=494
+    wall_s=29.183
+    first_prefill_ms=803.76
+    later_prefill_avg_ms=580.19
+════════════════════════════════════════════════════════════════

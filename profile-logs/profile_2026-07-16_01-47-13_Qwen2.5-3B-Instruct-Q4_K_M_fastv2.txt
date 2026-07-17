@@ -1,0 +1,92 @@
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  2026-07-16_01-47-13
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     models\Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=36  d=2048  heads=16/2  ff=11008  vocab=151936
+    weights   1.79 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    fastv2 — v2: f16 KV + tiled online attn + CUDA-graph path — recommended
+    gpu       NVIDIA GeForce RTX 3050 Ti Laptop GPU  |  compute 8.6  |  NVRTC sm_86
+    gpu+      driver 596.36  |  VRAM 4096 MiB  |  pci 00000000:01:00.0  |  uuid GPU-3d2db70e-289c-9a…
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  22 samples over 27.89s wall (span 26651 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   653ms  18.4t/s   656    25    26     0    53    eos    - hi, who are you?
+     2   533ms  15.8t/s   534    18    25    53    98    eos    - what can you help me with in one sen…
+     3   611ms  16.1t/s   613    19    64    98   183    eos    - ok give me 3 bullet ideas for a week…
+     4   465ms  14.2t/s   467    16   103   183   304    eos    - expand on the second idea a bit more
+     5   724ms  12.9t/s   726    17   128   304   450    max    Y summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 599 ms  min 467  max 726  (user→first token)
+    tokenize  total 9.7 ms  (1.94 ms/turn)
+    ms/token  prefill 31.4  decode 69.8
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill     2986 ms |    95 tok |   31.8 tok/s |  11.0% of turn-time
+    decode     24155 ms |   346 tok |   14.3 tok/s |  89.0% of turn-time
+    wall       27151 ms sum turns | wall-clock run 27.89s
+    decode   first-turn 18.4 t/s → last-turn 12.9 t/s  (drop 30%)
+    prefill  first 653 ms | later avg 583 ms
+    est weight BW  27.6 GB/s  (~14% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 450 / 5000  (9.0% full)  avg growth/turn 99 tok
+    VRAM   used avg 2127  min 2123  peak 2127 / 4096 MiB  (52% peak)
+    VRAM   free at peak ~1969 MiB  |  mem-controller util avg 18.9%
+    host RAM  ~12183 / 16048 MiB used (system snapshot)
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=4  hit_max_new=1  empty=0  / 5 turns
+    ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min   6.0%  avg  18.9%  max  32.0%
+  GPU
+    identity  NVIDIA GeForce RTX 3050 Ti Laptop GPU  |  cc 8.6  |  sm_86
+    compute  min   0.0%  avg  95.5%  max 100.0%
+    power    min  12.8 W  avg  28.2 W  max  38.2 W
+    temp     min    80 °C avg    87 °C max    88 °C
+    clocks   core avg 823 MHz (max 1267)  mem avg 5501 MHz
+    efficiency  0.150 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  0.51 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~1969 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • GPU util high but est weight BW low vs peak → kernels busy but not streaming weights efficiently (or util metric saturated).
+    • Later-turn prefill still heavy → each new token pays attention over long KV (expected) or rework batching.
+    • GPU hot (88°C) — possible thermal throttle; watch clocks.
+    • Raise max_new (or profile cap) if answers look cut off.
+    • High GPU util → optimize matmul/attention bandwidth next.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=2026-07-16_01-47-13
+    model=Qwen2.5-3B-Instruct-Q4_K_M
+    model_path=models\Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    decode_backend=fastv2
+    mode=multi-turn
+    gpu_name=NVIDIA GeForce RTX 3050 Ti Laptop GPU
+    gpu_compute_cap=8.6
+    gpu_nvrtc_arch=sm_86
+    gpu_driver=596.36
+    gpu_vram_total_mib=4096
+    gpu_uuid=GPU-3d2db70e-289c-9a11-3bb1-73c48f2abd8e
+    gpu_pci=00000000:01:00.0
+    overall_decode_tps=14.324
+    overall_prefill_tps=31.817
+    decode_tps_first=18.403
+    decode_tps_last=12.902
+    decode_drop_pct=29.89
+    total_prefill_ms=2985.78
+    total_decode_ms=24155.34
+    total_gen=346
+    total_prompt=95
+    final_ctx=450
+    wall_s=27.893
+    first_prefill_ms=653.41
+    later_prefill_avg_ms=583.09
+════════════════════════════════════════════════════════════════

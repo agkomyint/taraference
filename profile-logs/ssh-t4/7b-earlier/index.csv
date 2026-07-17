@@ -1,0 +1,2 @@
+stamp,model,decode,gpu_name,gpu_compute_cap,gpu_nvrtc_arch,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx
+unix_1784137809,Qwen2.5-7B-Instruct-Q4_K_M,fastv2,"Tesla T4",7.5,sm_75,profile_unix_1784137809_Qwen2.5-7B-Instruct-Q4_K_M_fastv2.txt,14.958,14.209,14.830,-4.37,494

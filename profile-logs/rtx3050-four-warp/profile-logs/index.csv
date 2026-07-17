@@ -1,0 +1,3 @@
+stamp,model,decode,gpu_name,gpu_compute_cap,gpu_nvrtc_arch,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx
+2026-07-16_17-19-36,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-16_17-19-36_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,40.748,61.828,34.440,44.30,438
+2026-07-16_17-19-56,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-16_17-19-56_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,30.444,39.407,25.524,35.23,438

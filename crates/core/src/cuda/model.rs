@@ -70,6 +70,16 @@ pub struct CudaModel {
     pub(crate) d_token: CudaSlice<i32>,
     /// Flash-decoding partial workspace: n_head * n_split * (2 + head_dim).
     pub(crate) flash_partial: CudaSlice<f32>,
+    /// Qwen3.5: fused Q-gate half / linear z / GDN scratch.
+    pub(crate) gate_buf: CudaSlice<f32>,
+    pub(crate) gdn_q: CudaSlice<f32>,
+    pub(crate) gdn_k: CudaSlice<f32>,
+    pub(crate) gdn_v: CudaSlice<f32>,
+    pub(crate) gdn_z: CudaSlice<f32>,
+    pub(crate) gdn_alpha: CudaSlice<f32>,
+    pub(crate) gdn_beta: CudaSlice<f32>,
+    pub(crate) gdn_conv: CudaSlice<f32>,
+    pub(crate) gdn_out: CudaSlice<f32>,
     /// Captured single-token decode graph (replay after updating d_pos0/d_token).
     pub(crate) decode_graph: Option<SendCudaGraph>,
     /// Graph capture attempted (success or permanent fail).
@@ -99,19 +109,81 @@ impl CudaModel {
         let slot = max_seq * stride;
         let mut k = Vec::with_capacity(self.cfg.n_layer);
         let mut v = Vec::with_capacity(self.cfg.n_layer);
-        // f16 KV: half the VRAM/BW of f32 (stored as u16 bit patterns).
-        for _ in 0..self.cfg.n_layer {
-            k.push(self.stream.alloc_zeros::<u16>(slot)?);
-            v.push(self.stream.alloc_zeros::<u16>(slot)?);
+        let mut ssm = Vec::with_capacity(self.cfg.n_layer);
+        let mut conv = Vec::with_capacity(self.cfg.n_layer);
+        let mut is_full = Vec::with_capacity(self.cfg.n_layer);
+        let mut full_bytes = 0usize;
+        let mut ssm_bytes = 0usize;
+        for li in 0..self.cfg.n_layer {
+            if self.cfg.is_linear_layer(li) {
+                is_full.push(false);
+                // Minimal 1-element placeholders so index is always valid.
+                k.push(self.stream.alloc_zeros::<u16>(1)?);
+                v.push(self.stream.alloc_zeros::<u16>(1)?);
+                let se = self.cfg.ssm_state_elems().max(1);
+                let ce = self.cfg.ssm_conv_state_elems().max(1);
+                ssm.push(self.stream.alloc_zeros::<f32>(se)?);
+                conv.push(self.stream.alloc_zeros::<f32>(ce)?);
+                ssm_bytes += (se + ce) * 4;
+            } else {
+                is_full.push(true);
+                k.push(self.stream.alloc_zeros::<u16>(slot)?);
+                v.push(self.stream.alloc_zeros::<u16>(slot)?);
+                ssm.push(self.stream.alloc_zeros::<f32>(1)?);
+                conv.push(self.stream.alloc_zeros::<f32>(1)?);
+                full_bytes += slot * 2 * 2;
+            }
         }
-        let kv_mib = (self.cfg.n_layer * slot * 2 * 2) as f64 / (1024.0 * 1024.0);
-        eprintln!("KV    | f16  max_seq={max_seq}  ~{kv_mib:.1} MiB (all layers K+V)");
+        let kv_mib = full_bytes as f64 / (1024.0 * 1024.0);
+        let ssm_mib = ssm_bytes as f64 / (1024.0 * 1024.0);
+        if self.cfg.is_hybrid() {
+            eprintln!(
+                "KV    | hybrid f16 full-attn ~{kv_mib:.1} MiB + GDN state ~{ssm_mib:.1} MiB  max_seq={max_seq}"
+            );
+        } else {
+            eprintln!("KV    | f16  max_seq={max_seq}  ~{kv_mib:.1} MiB (all layers K+V)");
+        }
         Ok(CudaKv {
             k,
             v,
+            ssm,
+            conv,
+            is_full,
             len: 0,
             max_seq,
         })
+    }
+
+    /// Zero recurrent (GDN + conv) state for all linear layers.
+    pub fn zero_recurrent(&mut self, cache: &mut CudaKv) -> anyhow::Result<()> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        for li in 0..self.cfg.n_layer {
+            if !self.cfg.is_linear_layer(li) {
+                continue;
+            }
+            let se = self.cfg.ssm_state_elems() as i32;
+            let ce = self.cfg.ssm_conv_state_elems() as i32;
+            if se > 0 {
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.zero_f32)
+                        .arg(&mut cache.ssm[li])
+                        .arg(&se)
+                        .launch(LaunchConfig::for_num_elems(se as u32))?;
+                }
+            }
+            if ce > 0 {
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.zero_f32)
+                        .arg(&mut cache.conv[li])
+                        .arg(&ce)
+                        .launch(LaunchConfig::for_num_elems(ce as u32))?;
+                }
+            }
+        }
+        self.stream.synchronize()?;
+        Ok(())
     }
 
     /// Drop CUDA graph (e.g. after backend switch — not used mid-session).

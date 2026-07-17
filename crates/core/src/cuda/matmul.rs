@@ -36,11 +36,11 @@ fn lc_q5_gemv(n_cols: u32, n_rows: u32) -> LaunchConfig {
     }
 }
 
-fn lc_gemv_quantized(n_cols: u32, warps: u32) -> LaunchConfig {
+fn lc_gemv_quantized(n_cols: u32, n_rows: u32, warps: u32) -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((n_cols + warps - 1) / warps, 1, 1),
         block_dim: (warps * 32, 1, 1),
-        shared_mem_bytes: 0,
+        shared_mem_bytes: n_rows + (n_rows / 32) * 4,
     }
 }
 
@@ -155,6 +155,8 @@ pub(crate) fn try_gemv_global_q8(
     let n_split = gemv_n_split(w.n_rows);
     let (f, data, col_bytes) = match w.wtype {
         WType::Q4K => (&k.gemv_q4_global, &w.data, w.col_bytes),
+        // Q5→Q8 hybrid path lands here — critical for Qwen3.5-4B decode.
+        WType::Q8_0 => (&k.gemv_q8_global, &w.data, w.col_bytes),
         WType::Q6K if w.compact_data.is_some() => (
             &k.gemv_q6_compact_global,
             w.compact_data.as_ref().unwrap(),
@@ -186,10 +188,16 @@ pub(crate) fn try_gemv_global_q8(
         if w.n_cols > partial_stride {
             return Ok(false);
         }
-        if w.wtype == WType::Q6K && w.compact_data.is_some() && n_split == 4 {
+        if w.wtype == WType::Q6K && w.compact_data.is_some() && n_split >= 4 {
+            // Tall K (FFN down n_rows=9k): cooperative 8-warp split-K per column.
+            let use_8 = w.n_rows >= 4096;
             unsafe {
                 stream
-                    .launch_builder(&k.gemv_q6_compact_global_4way)
+                    .launch_builder(if use_8 {
+                        &k.gemv_q6_compact_global_8way
+                    } else {
+                        &k.gemv_q6_compact_global_4way
+                    })
                     .arg(data)
                     .arg(&*q8_x)
                     .arg(&*q8_d)
@@ -203,7 +211,7 @@ pub(crate) fn try_gemv_global_q8(
                     .arg(residual_ptr)
                     .launch(LaunchConfig {
                         grid_dim: (w.n_cols as u32, 1, 1),
-                        block_dim: (128, 1, 1),
+                        block_dim: (if use_8 { 256 } else { 128 }, 1, 1),
                         shared_mem_bytes: 0,
                     })?;
             }
@@ -214,6 +222,11 @@ pub(crate) fn try_gemv_global_q8(
                 &k.gemv_q4_global_splitk,
                 (w.n_cols as u32, n_split, 1),
                 (64, 1, 1),
+            ),
+            WType::Q8_0 => (
+                &k.gemv_q8_global_splitk,
+                ((w.n_cols as u32 + GEMV_WARPS - 1) / GEMV_WARPS, n_split, 1),
+                (GEMV_THREADS, 1, 1),
             ),
             WType::Q6K if w.compact_data.is_some() => (
                 &k.gemv_q6_compact_global_splitk,
@@ -276,7 +289,7 @@ pub(crate) fn try_gemv_global_q8(
             .arg(bias_ptr)
             .arg(&use_res)
             .arg(residual_ptr)
-            .launch(lc_gemv_quantized(w.n_cols as u32, k.gemv_quantized_warps))?;
+            .launch(lc_gemv_quantized(w.n_cols as u32, w.n_rows as u32, k.gemv_quantized_warps))?;
     }
     Ok(true)
 }
@@ -335,6 +348,8 @@ fn gemv_baseline(
         }
         let lc = if matches!(w.wtype, WType::Q5K | WType::Q5_0 | WType::Q6K) {
             lc_q5_gemv(w.n_cols as u32, w.n_rows as u32)
+        } else if matches!(w.wtype, WType::Q8_0) {
+            lc_gemv_quantized(w.n_cols as u32, w.n_rows as u32, k.gemv_quantized_warps)
         } else {
             lc_gemv(w.n_cols as u32, w.n_rows as u32)
         };
@@ -521,23 +536,51 @@ pub(crate) fn try_gemv_q4_ffn(
     let n_rows = gate.n_rows as i32;
     let n_cols = gate.n_cols as i32;
     let col_bytes = gate.col_bytes as i32;
-    quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
-    unsafe {
-        stream
-            .launch_builder(&k.gemv_q4_ffn)
-            .arg(&gate.data)
-            .arg(&up.data)
-            .arg(q8_x)
-            .arg(q8_d)
-            .arg(out)
-            .arg(&n_rows)
-            .arg(&n_cols)
-            .arg(&col_bytes)
-            .launch(LaunchConfig {
-                grid_dim: (gate.n_cols as u32, 1, 1),
-                block_dim: (k.gemv_q4_dual_threads, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
+    // Always quantize x ONCE globally for wide FFN. (Per-column smem re-quantize
+    // is a footgun at n_cols=9k.) Prefer multi-col when smem fits; else 4/8-way.
+    let smem_q8 = gate.n_rows + (gate.n_rows / 32) * 4;
+    if gate.n_cols >= 1024 && smem_q8 <= 48 * 1024 {
+        unsafe {
+            stream
+                .launch_builder(&k.gemv_q4_ffn_mcol)
+                .arg(&gate.data)
+                .arg(&up.data)
+                .arg(x)
+                .arg(out)
+                .arg(&n_rows)
+                .arg(&n_cols)
+                .arg(&col_bytes)
+                .launch(LaunchConfig {
+                    grid_dim: ((gate.n_cols as u32 + 31) / 32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: smem_q8 as u32,
+                })?;
+        }
+    } else {
+        quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+        let n_blocks = gate.n_rows / 256;
+        let (ffn_fn, threads) = if n_blocks >= 16 {
+            (&k.gemv_q4_ffn_8way, 256u32)
+        } else {
+            (&k.gemv_q4_ffn, k.gemv_q4_dual_threads)
+        };
+        unsafe {
+            stream
+                .launch_builder(ffn_fn)
+                .arg(&gate.data)
+                .arg(&up.data)
+                .arg(q8_x)
+                .arg(q8_d)
+                .arg(out)
+                .arg(&n_rows)
+                .arg(&n_cols)
+                .arg(&col_bytes)
+                .launch(LaunchConfig {
+                    grid_dim: (gate.n_cols as u32, 1, 1),
+                    block_dim: (threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
     }
     Ok(true)
 }
@@ -671,6 +714,8 @@ pub(crate) fn try_gemv_qkv(
     bv: Option<&CudaSlice<f32>>,
     q8_x: &mut CudaSlice<i8>,
     q8_d: &mut CudaSlice<f32>,
+    partial: &mut CudaSlice<f32>,
+    partial_stride: usize,
 ) -> Result<bool> {
     let same_shape = wq.n_rows == wk.n_rows
         && wq.n_rows == wv.n_rows
@@ -715,7 +760,91 @@ pub(crate) fn try_gemv_qkv(
                 .arg(bq_p)
                 .arg(bk_p)
                 .arg(bv_p)
-                .launch(lc_gemv_quantized(n_tot, k.gemv_quantized_warps))?;
+                .launch(lc_gemv_quantized(n_tot, wq.n_rows as u32, k.gemv_quantized_warps))?;
+        }
+        return Ok(true);
+    }
+    if wq.wtype == WType::Q8_0
+        && wk.wtype == WType::Q8_0
+        && wv.wtype == WType::Q8_0
+        && same_shape
+        && (all_bias || no_bias)
+    {
+        let n_rows = wq.n_rows as i32;
+        let n_q = wq.n_cols as i32;
+        let n_k = wk.n_cols as i32;
+        let n_v = wv.n_cols as i32;
+        let col_bytes = wq.col_bytes as i32;
+        let use_bias = if all_bias { 1i32 } else { 0i32 };
+        let bq_p = bq.unwrap_or(x);
+        let bk_p = bk.unwrap_or(x);
+        let bv_p = bv.unwrap_or(x);
+        let n_tot = (wq.n_cols + wk.n_cols + wv.n_cols) as u32;
+        let n_split = gemv_n_split(wq.n_rows);
+        if n_split > 1 && (n_tot as usize) <= partial_stride {
+            quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+            unsafe {
+                stream
+                    .launch_builder(&k.gemv_q8_qkv_splitk)
+                    .arg(&wq.data)
+                    .arg(&wk.data)
+                    .arg(&wv.data)
+                    .arg(q8_x)
+                    .arg(q8_d)
+                    .arg(&mut *partial)
+                    .arg(&n_rows)
+                    .arg(&n_q)
+                    .arg(&n_k)
+                    .arg(&n_v)
+                    .arg(&col_bytes)
+                    .arg(&(n_split as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (((n_tot + GEMV_WARPS - 1) / GEMV_WARPS), n_split, 1),
+                        block_dim: (GEMV_THREADS, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                stream
+                    .launch_builder(&k.gemv_splitk_reduce_qkv)
+                    .arg(&*partial)
+                    .arg(q)
+                    .arg(k_out)
+                    .arg(v_out)
+                    .arg(&n_q)
+                    .arg(&n_k)
+                    .arg(&n_v)
+                    .arg(&(n_split as i32))
+                    .arg(&use_bias)
+                    .arg(bq_p)
+                    .arg(bk_p)
+                    .arg(bv_p)
+                    .launch(LaunchConfig {
+                        grid_dim: ((n_tot + 255) / 256, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        } else {
+            unsafe {
+                stream
+                    .launch_builder(&k.gemv_q8_qkv)
+                    .arg(&wq.data)
+                    .arg(&wk.data)
+                    .arg(&wv.data)
+                    .arg(x)
+                    .arg(q)
+                    .arg(k_out)
+                    .arg(v_out)
+                    .arg(&n_rows)
+                    .arg(&n_q)
+                    .arg(&n_k)
+                    .arg(&n_v)
+                    .arg(&col_bytes)
+                    .arg(&use_bias)
+                    .arg(bq_p)
+                    .arg(bk_p)
+                    .arg(bv_p)
+                    .launch(lc_gemv_quantized(n_tot, wq.n_rows as u32, k.gemv_quantized_warps))?;
+            }
         }
         return Ok(true);
     }
@@ -762,6 +891,141 @@ pub(crate) fn try_gemv_qkv(
             .arg(bk_p)
             .arg(bv_p)
             .launch(lc_q5_gemv(n_tot, wq.n_rows as u32))?;
+    }
+    Ok(true)
+}
+
+pub(crate) fn try_gemv_gdn_4way(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    wqkv: &GpuMat,
+    w_gate: &GpuMat,
+    w_beta: &GpuMat,
+    w_alpha: &GpuMat,
+    x: &CudaSlice<f32>,
+    out_qkv: &mut CudaSlice<f32>,
+    out_gate: &mut CudaSlice<f32>,
+    out_beta: &mut CudaSlice<f32>,
+    out_alpha: &mut CudaSlice<f32>,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
+    partial: &mut CudaSlice<f32>,
+    partial_stride: usize,
+) -> Result<bool> {
+    // Debug escape: force 4× separate GEMV (correctness baseline).
+    if std::env::var_os("TARAFER_GDN_NO_4WAY").is_some() {
+        return Ok(false);
+    }
+    let is_all_q8 = wqkv.wtype == WType::Q8_0
+        && w_gate.wtype == WType::Q8_0
+        && w_beta.wtype == WType::Q8_0
+        && w_alpha.wtype == WType::Q8_0
+        && wqkv.col_bytes == w_gate.col_bytes
+        && wqkv.col_bytes == w_beta.col_bytes
+        && wqkv.col_bytes == w_alpha.col_bytes;
+
+    let is_hybrid = wqkv.wtype == WType::Q8_0
+        && w_gate.wtype == WType::Q4K
+        && w_beta.wtype == WType::Q8_0
+        && w_alpha.wtype == WType::Q8_0
+        && wqkv.col_bytes == w_beta.col_bytes
+        && wqkv.col_bytes == w_alpha.col_bytes;
+
+    if (!is_all_q8 && !is_hybrid)
+        || wqkv.n_rows != w_gate.n_rows
+        || wqkv.n_rows != w_beta.n_rows
+        || wqkv.n_rows != w_alpha.n_rows
+    {
+        return Ok(false);
+    }
+    let n_rows = wqkv.n_rows as i32;
+    let n_qkv = wqkv.n_cols as i32;
+    let n_gate = w_gate.n_cols as i32;
+    let n_beta = w_beta.n_cols as i32;
+    let n_alpha = w_alpha.n_cols as i32;
+    let col_bytes = wqkv.col_bytes as i32;
+    let col_bytes_q4 = w_gate.col_bytes as i32;
+    let n_tot = (wqkv.n_cols + w_gate.n_cols + w_beta.n_cols + w_alpha.n_cols) as u32;
+    let n_split = gemv_n_split(wqkv.n_rows);
+    let warps = k.gemv_quantized_warps.max(1);
+    // Prefer smem-quantize fused kernel for typical GDN widths (d_model ≤ 4k).
+    // Split-K uses global Q8 and is reserved for tall mats (FFN-class rows).
+    if n_split > 1 && (n_tot as usize) <= partial_stride {
+        quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
+        unsafe {
+            let mut b = if is_hybrid {
+                stream.launch_builder(&k.gemv_hybrid_gdn_4way_splitk)
+            } else {
+                stream.launch_builder(&k.gemv_q8_gdn_4way_splitk)
+            };
+            b.arg(&wqkv.data)
+                .arg(&w_gate.data)
+                .arg(&w_beta.data)
+                .arg(&w_alpha.data)
+                .arg(&*q8_x)
+                .arg(&*q8_d)
+                .arg(&mut *partial)
+                .arg(&n_rows)
+                .arg(&n_qkv)
+                .arg(&n_gate)
+                .arg(&n_beta)
+                .arg(&n_alpha)
+                .arg(&col_bytes);
+            if is_hybrid {
+                b.arg(&col_bytes_q4);
+            }
+            b.arg(&(n_split as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (((n_tot + warps - 1) / warps), n_split, 1),
+                    block_dim: (warps * 32, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            stream
+                .launch_builder(&k.gemv_splitk_reduce_gdn_4way)
+                .arg(&*partial)
+                .arg(out_qkv)
+                .arg(out_gate)
+                .arg(out_beta)
+                .arg(out_alpha)
+                .arg(&n_qkv)
+                .arg(&n_gate)
+                .arg(&n_beta)
+                .arg(&n_alpha)
+                .arg(&(n_split as i32))
+                .launch(LaunchConfig {
+                    grid_dim: ((n_tot + 255) / 256, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+    } else {
+        // Smem path: f32 x → Q8 once per block (same math as gemv_q8_0_qkv).
+        unsafe {
+            let mut b = if is_hybrid {
+                stream.launch_builder(&k.gemv_hybrid_gdn_4way)
+            } else {
+                stream.launch_builder(&k.gemv_q8_gdn_4way)
+            };
+            b.arg(&wqkv.data)
+                .arg(&w_gate.data)
+                .arg(&w_beta.data)
+                .arg(&w_alpha.data)
+                .arg(x)
+                .arg(out_qkv)
+                .arg(out_gate)
+                .arg(out_beta)
+                .arg(out_alpha)
+                .arg(&n_rows)
+                .arg(&n_qkv)
+                .arg(&n_gate)
+                .arg(&n_beta)
+                .arg(&n_alpha)
+                .arg(&col_bytes);
+            if is_hybrid {
+                b.arg(&col_bytes_q4);
+            }
+            b.launch(lc_gemv_quantized(n_tot, wqkv.n_rows as u32, warps))?;
+        }
     }
     Ok(true)
 }

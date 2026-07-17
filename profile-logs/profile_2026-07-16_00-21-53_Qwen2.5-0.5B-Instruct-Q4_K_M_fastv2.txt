@@ -1,0 +1,80 @@
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  2026-07-16_00-21-53
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=24  d=896  heads=14/2  ff=4864  vocab=151936
+    weights   0.36 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    fastv2 — v2: f16 KV + tiled online attn (fixed smem) — recommended
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  3 samples over 5.42s wall (span 4027 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   337ms 113.5t/s   340    25    64     0    91    eos    - hi, who are you?
+     2   187ms  89.0t/s   189    18    12    91   123    eos    - what can you help me with in one sen…
+     3   191ms 101.7t/s   194    19    59   123   203    eos    - ok give me 3 bullet ideas for a week…
+     4   143ms  91.5t/s   146    16   128   203   349    max    Y expand on the second idea a bit more
+     5   188ms  78.1t/s   191    17    81   349   449    eos    - summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 212 ms  min 146  max 340  (user→first token)
+    tokenize  total 14.1 ms  (2.81 ms/turn)
+    ms/token  prefill 11.0  decode 10.8
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill     1045 ms |    95 tok |   90.9 tok/s |  21.9% of turn-time
+    decode      3714 ms |   344 tok |   92.6 tok/s |  77.8% of turn-time
+    wall        4774 ms sum turns | wall-clock run 5.42s
+    decode   first-turn 113.5 t/s → last-turn 78.1 t/s  (drop 31%)
+    prefill  first 337 ms | later avg 177 ms
+    est weight BW  36.3 GB/s  (~19% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 449 / 5000  (9.0% full)  avg growth/turn 90 tok
+    VRAM   used avg 555  min 555  peak 555 / 4096 MiB  (14% peak)
+    VRAM   free at peak ~3541 MiB  |  mem-controller util avg 17.7%
+    host RAM  ~14214 / 16048 MiB used (system snapshot)
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=4  hit_max_new=1  empty=0  / 5 turns
+    ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min  45.0%  avg  60.3%  max  74.0%
+  GPU
+    compute  min  11.0%  avg  68.0%  max  97.0%
+    power    min  11.5 W  avg  29.2 W  max  40.7 W
+    temp     min    72 °C avg    79 °C max    83 °C
+    clocks   core avg 1475 MHz (max 1695)  mem avg 5501 MHz
+    efficiency  1.362 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  3.18 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~3541 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • Decode dropped 31% as ctx grew → attention/KV path dominates long chats.
+    • CPU elevated → host launch/sync/copy may steal decode tok/s.
+    • Raise max_new (or profile cap) if answers look cut off.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=2026-07-16_00-21-53
+    model=Qwen2.5-0.5B-Instruct-Q4_K_M
+    model_path=models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    decode_backend=fastv2
+    mode=multi-turn
+    overall_decode_tps=92.625
+    overall_prefill_tps=90.871
+    decode_tps_first=113.495
+    decode_tps_last=78.138
+    decode_drop_pct=31.15
+    total_prefill_ms=1045.44
+    total_decode_ms=3713.91
+    total_gen=344
+    total_prompt=95
+    final_ctx=449
+    wall_s=5.416
+    first_prefill_ms=336.72
+    later_prefill_avg_ms=177.18
+════════════════════════════════════════════════════════════════

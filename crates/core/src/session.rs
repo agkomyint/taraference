@@ -46,6 +46,11 @@ pub struct SessionOptions {
     pub print_stream: bool,
     /// Print the `[n tok | …]` line after a turn.
     pub print_stats: bool,
+    /// Qwen3 / Qwen3.5 thinking mode. When true, the generation prompt opens
+    /// an unclosed `<think>` block so the model writes chain-of-thought.
+    /// When false (default, matches Qwen3.5-0.8B/2B/4B/9B), an empty
+    /// `<think></think>` pair is prefilled so the model answers directly.
+    pub enable_thinking: bool,
 }
 
 impl Default for SessionOptions {
@@ -55,6 +60,7 @@ impl Default for SessionOptions {
             system: "You are a helpful assistant.".into(),
             print_stream: true,
             print_stats: true,
+            enable_thinking: false,
         }
     }
 }
@@ -88,6 +94,7 @@ pub struct Session<'a> {
     system: String,
     print_stream: bool,
     print_stats: bool,
+    enable_thinking: bool,
     primed: bool,
     /// Tokens whose KV entries are committed. Used as the draft source for
     /// prompt-lookup decoding; it never changes model acceptance semantics.
@@ -111,6 +118,7 @@ impl<'a> Session<'a> {
             system: opts.system,
             print_stream: opts.print_stream,
             print_stats: opts.print_stats,
+            enable_thinking: opts.enable_thinking,
             primed,
             history: Vec::new(),
         }
@@ -128,6 +136,8 @@ impl<'a> Session<'a> {
         self.cache.clear();
         self.history.clear();
         self.primed = false;
+        // Hybrid (Qwen3.5) keeps GDN/conv state in the KV arena; wipe it too.
+        let _ = self.model.zero_recurrent(self.cache);
     }
 
     /// Find a continuation that followed the longest recent token suffix at an
@@ -178,7 +188,7 @@ impl<'a> Session<'a> {
         s.push_str("<|im_start|>user\n");
         s.push_str(user);
         s.push_str("<|im_end|>\n");
-        s.push_str("<|im_start|>assistant\n");
+        s.push_str(crate::chat::assistant_generation_prompt(self.enable_thinking));
         s
     }
 

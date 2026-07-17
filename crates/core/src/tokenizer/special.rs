@@ -5,7 +5,12 @@ use std::collections::HashMap;
 pub fn split_special(text: &str, vocab: &HashMap<String, u32>) -> Vec<String> {
     let mut specials: Vec<&str> = vocab
         .keys()
-        .filter(|t| t.starts_with("<|") && t.ends_with("|>"))
+        .filter(|t| {
+            (t.starts_with("<|") && t.ends_with("|>"))
+                // Qwen3 / Qwen3.5 thinking delimiters (not ChatML-style).
+                || *t == "<think>"
+                || *t == "</think>"
+        })
         .map(|s| s.as_str())
         .collect();
     specials.sort_by_key(|s| std::cmp::Reverse(s.len()));

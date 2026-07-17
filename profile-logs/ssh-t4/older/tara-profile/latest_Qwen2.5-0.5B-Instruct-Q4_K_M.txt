@@ -1,0 +1,80 @@
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  unix_1784134448
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     /tmp/tara-v012/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=24  d=896  heads=14/2  ff=4864  vocab=151936
+    weights   0.36 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    fastv2 — v2: f16 KV + tiled online attn (fixed smem) — recommended
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  32 samples over 4.28s wall (span 4146 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   225ms 133.4t/s   231    25    64     0    91    eos    - hi, who are you?
+     2   166ms  98.1t/s   168    18    12    91   123    eos    - what can you help me with in one sen…
+     3   174ms 111.5t/s   177    19    59   123   203    eos    - ok give me 3 bullet ideas for a week…
+     4   146ms  98.8t/s   148    16   128   203   349    max    Y expand on the second idea a bit more
+     5   163ms  84.5t/s   165    17    81   349   449    eos    - summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 178 ms  min 148  max 231  (user→first token)
+    tokenize  total 14.7 ms  (2.94 ms/turn)
+    ms/token  prefill 9.2  decode 9.8
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill      874 ms |    95 tok |  108.7 tok/s |  20.4% of turn-time
+    decode      3386 ms |   344 tok |  101.6 tok/s |  79.2% of turn-time
+    wall        4274 ms sum turns | wall-clock run 4.28s
+    decode   first-turn 133.4 t/s → last-turn 84.5 t/s  (drop 37%)
+    prefill  first 225 ms | later avg 162 ms
+    est weight BW  39.8 GB/s  (~21% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 449 / 5000  (9.0% full)  avg growth/turn 90 tok
+    VRAM   used avg 587  min 587  peak 587 / 15360 MiB  (4% peak)
+    VRAM   free at peak ~14773 MiB  |  mem-controller util avg 15.8%
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=4  hit_max_new=1  empty=0  / 5 turns
+    ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min   0.0%  avg   0.0%  max   0.0%
+  GPU
+    compute  min   0.0%  avg  94.9%  max 100.0%
+    power    min  34.3 W  avg  57.3 W  max  68.0 W
+    temp     min    37 °C avg    39 °C max    40 °C
+    clocks   core avg 1590 MHz (max 1590)  mem avg 5000 MHz
+    efficiency  1.071 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  1.77 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~14773 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • GPU util high but est weight BW low vs peak → kernels busy but not streaming weights efficiently (or util metric saturated).
+    • Decode dropped 37% as ctx grew → attention/KV path dominates long chats.
+    • Raise max_new (or profile cap) if answers look cut off.
+    • High GPU util → optimize matmul/attention bandwidth next.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=unix_1784134448
+    model=Qwen2.5-0.5B-Instruct-Q4_K_M
+    model_path=/tmp/tara-v012/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    decode_backend=fastv2
+    mode=multi-turn
+    overall_decode_tps=101.605
+    overall_prefill_tps=108.716
+    decode_tps_first=133.356
+    decode_tps_last=84.510
+    decode_drop_pct=36.63
+    total_prefill_ms=873.83
+    total_decode_ms=3385.65
+    total_gen=344
+    total_prompt=95
+    final_ctx=449
+    wall_s=4.282
+    first_prefill_ms=225.32
+    later_prefill_avg_ms=162.13
+════════════════════════════════════════════════════════════════

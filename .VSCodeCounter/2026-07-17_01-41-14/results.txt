@@ -1,0 +1,133 @@
+Date : 2026-07-17 01:41:14
+Directory : d:\taraference
+Total : 71 files,  13182 codes, 692 comments, 1278 blanks, all 15152 lines
+
+Languages
++------------------+------------+------------+------------+------------+------------+
+| language         | files      | code       | comment    | blank      | total      |
++------------------+------------+------------+------------+------------+------------+
+| Rust             |         39 |      8,081 |        435 |        523 |      9,039 |
+| CUDA C++         |          8 |      3,308 |        171 |        213 |      3,692 |
+| Markdown         |         12 |      1,094 |          0 |        424 |      1,518 |
+| Python           |          3 |        295 |         18 |         44 |        357 |
+| Shell Script     |          2 |        166 |         35 |         32 |        233 |
+| YAML             |          1 |        117 |         13 |         22 |        152 |
+| PowerShell       |          1 |         96 |         20 |         15 |        131 |
+| JSON Lines       |          4 |         24 |          0 |          4 |         28 |
+| pip requirements |          1 |          1 |          0 |          1 |          2 |
++------------------+------------+------------+------------+------------+------------+
+
+Directories
++--------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                         | files      | code       | comment    | blank      | total      |
++--------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                            |         71 |     13,182 |        692 |      1,278 |     15,152 |
+| . (Files)                                                    |          7 |        753 |          0 |        314 |      1,067 |
+| .github                                                      |          1 |        117 |         13 |         22 |        152 |
+| .github\workflows                                            |          1 |        117 |         13 |         22 |        152 |
+| benchmarks                                                   |          1 |         77 |          1 |         12 |         90 |
+| crates                                                       |         47 |     11,389 |        606 |        736 |     12,731 |
+| crates\cli                                                   |          6 |      2,165 |        113 |        166 |      2,444 |
+| crates\cli\src                                               |          6 |      2,165 |        113 |        166 |      2,444 |
+| crates\cli\src (Files)                                       |          4 |      1,690 |        101 |        116 |      1,907 |
+| crates\cli\src\serve                                         |          2 |        475 |         12 |         50 |        537 |
+| crates\core                                                  |         27 |      8,378 |        462 |        493 |      9,333 |
+| crates\core\src                                              |         27 |      8,378 |        462 |        493 |      9,333 |
+| crates\core\src (Files)                                      |          6 |        851 |         77 |         91 |      1,019 |
+| crates\core\src\cuda                                         |         18 |      7,212 |        374 |        374 |      7,960 |
+| crates\core\src\cuda (Files)                                 |          9 |      3,894 |        196 |        159 |      4,249 |
+| crates\core\src\cuda\kernels                                 |          9 |      3,318 |        178 |        215 |      3,711 |
+| crates\core\src\cuda\kernels (Files)                         |          7 |      2,939 |        153 |        164 |      3,256 |
+| crates\core\src\cuda\kernels\attn                            |          2 |        379 |         25 |         51 |        455 |
+| crates\core\src\tokenizer                                    |          3 |        315 |         11 |         28 |        354 |
+| crates\cuda_probe                                            |          1 |         10 |          0 |          1 |         11 |
+| crates\cuda_probe\src                                        |          1 |         10 |          0 |          1 |         11 |
+| crates\gguf                                                  |         13 |        836 |         31 |         76 |        943 |
+| crates\gguf\examples                                         |          8 |        157 |          6 |          9 |        172 |
+| crates\gguf\src                                              |          5 |        679 |         25 |         67 |        771 |
+| openai-test-python                                           |          3 |        172 |         17 |         36 |        225 |
+| profile-logs                                                 |          5 |         96 |          0 |         12 |        108 |
+| profile-logs\ollama-l4                                       |          5 |         96 |          0 |         12 |        108 |
+| review-by                                                    |          3 |        273 |          0 |         79 |        352 |
+| review-by (Files)                                            |          2 |        180 |          0 |         56 |        236 |
+| review-by\placetoimporve                                     |          1 |         93 |          0 |         23 |        116 |
+| scripts                                                      |          4 |        305 |         55 |         67 |        427 |
++--------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++--------------------------------------------------------------+------------------+------------+------------+------------+------------+
+| filename                                                     | language         | code       | comment    | blank      | total      |
++--------------------------------------------------------------+------------------+------------+------------+------------+------------+
+| d:\taraference\.github\workflows\release.yml                 | YAML             |        117 |         13 |         22 |        152 |
+| d:\taraference\AGENTS.md                                     | Markdown         |         10 |          0 |          6 |         16 |
+| d:\taraference\GOAL.md                                       | Markdown         |         74 |          0 |         31 |        105 |
+| d:\taraference\LOCAL_3050TI_MILESTONE.md                     | Markdown         |         32 |          0 |         15 |         47 |
+| d:\taraference\OLLAMA_LOCAL_COMPARISON.md                    | Markdown         |         54 |          0 |         20 |         74 |
+| d:\taraference\README.md                                     | Markdown         |        225 |          0 |         87 |        312 |
+| d:\taraference\VLLM_LLAMA_CPP_RESEARCH.md                    | Markdown         |        299 |          0 |        133 |        432 |
+| d:\taraference\WORKFLOW.md                                   | Markdown         |         59 |          0 |         22 |         81 |
+| d:\taraference\benchmarks\ollama_chat_bench.py               | Python           |         77 |          1 |         12 |         90 |
+| d:\taraference\crates\cli\src\download.rs                    | Rust             |        285 |         19 |         20 |        324 |
+| d:\taraference\crates\cli\src\main.rs                        | Rust             |        249 |         38 |         27 |        314 |
+| d:\taraference\crates\cli\src\profile.rs                     | Rust             |        970 |         35 |         45 |      1,050 |
+| d:\taraference\crates\cli\src\self_update.rs                 | Rust             |        186 |          9 |         24 |        219 |
+| d:\taraference\crates\cli\src\serve\mod.rs                   | Rust             |        384 |          7 |         36 |        427 |
+| d:\taraference\crates\cli\src\serve\openai.rs                | Rust             |         91 |          5 |         14 |        110 |
+| d:\taraference\crates\core\src\chat.rs                       | Rust             |         98 |         15 |         17 |        130 |
+| d:\taraference\crates\core\src\config.rs                     | Rust             |        207 |         13 |         18 |        238 |
+| d:\taraference\crates\core\src\cuda\decode.rs                | Rust             |        202 |         42 |         29 |        273 |
+| d:\taraference\crates\core\src\cuda\forward.rs               | Rust             |        340 |         17 |         24 |        381 |
+| d:\taraference\crates\core\src\cuda\kernels\attn\fast_v2.cu  | CUDA C++         |        160 |          9 |         24 |        193 |
+| d:\taraference\crates\core\src\cuda\kernels\attn\flash.cu    | CUDA C++         |        219 |         16 |         27 |        262 |
+| d:\taraference\crates\core\src\cuda\kernels\common.cu        | CUDA C++         |        165 |         12 |         10 |        187 |
+| d:\taraference\crates\core\src\cuda\kernels\deltanet.cu      | CUDA C++         |        515 |         79 |         30 |        624 |
+| d:\taraference\crates\core\src\cuda\kernels\embed.cu         | CUDA C++         |        300 |          3 |         16 |        319 |
+| d:\taraference\crates\core\src\cuda\kernels\gemm.cu          | CUDA C++         |        279 |          6 |          6 |        291 |
+| d:\taraference\crates\core\src\cuda\kernels\gemv.cu          | CUDA C++         |      1,374 |         38 |         82 |      1,494 |
+| d:\taraference\crates\core\src\cuda\kernels\mod.rs           | Rust             |         10 |          7 |          2 |         19 |
+| d:\taraference\crates\core\src\cuda\kernels\ops.cu           | CUDA C++         |        296 |          8 |         18 |        322 |
+| d:\taraference\crates\core\src\cuda\kv.rs                    | Rust             |         23 |         15 |          5 |         43 |
+| d:\taraference\crates\core\src\cuda\layer.rs                 | Rust             |      1,414 |         21 |         27 |      1,462 |
+| d:\taraference\crates\core\src\cuda\load.rs                  | Rust             |        728 |         28 |         20 |        776 |
+| d:\taraference\crates\core\src\cuda\matmul.rs                | Rust             |        855 |         28 |         30 |        913 |
+| d:\taraference\crates\core\src\cuda\mod.rs                   | Rust             |         12 |          1 |          3 |         16 |
+| d:\taraference\crates\core\src\cuda\model.rs                 | Rust             |        158 |         27 |         10 |        195 |
+| d:\taraference\crates\core\src\cuda\types.rs                 | Rust             |        162 |         17 |         11 |        190 |
+| d:\taraference\crates\core\src\engine.rs                     | Rust             |        162 |         16 |         19 |        197 |
+| d:\taraference\crates\core\src\lib.rs                        | Rust             |         13 |          5 |          3 |         21 |
+| d:\taraference\crates\core\src\quant.rs                      | Rust             |          6 |          2 |          2 |         10 |
+| d:\taraference\crates\core\src\session.rs                    | Rust             |        365 |         26 |         32 |        423 |
+| d:\taraference\crates\core\src\tokenizer\bytes.rs            | Rust             |         49 |          4 |          6 |         59 |
+| d:\taraference\crates\core\src\tokenizer\mod.rs              | Rust             |        224 |          5 |         18 |        247 |
+| d:\taraference\crates\core\src\tokenizer\special.rs          | Rust             |         42 |          2 |          4 |         48 |
+| d:\taraference\crates\cuda_probe\src\main.rs                 | Rust             |         10 |          0 |          1 |         11 |
+| d:\taraference\crates\gguf\examples\list_types.rs            | Rust             |         22 |          0 |          2 |         24 |
+| d:\taraference\crates\gguf\examples\probe.rs                 | Rust             |         38 |          0 |          1 |         39 |
+| d:\taraference\crates\gguf\examples\probe2.rs                | Rust             |         23 |          3 |          1 |         27 |
+| d:\taraference\crates\gguf\examples\probe3.rs                | Rust             |         19 |          1 |          1 |         21 |
+| d:\taraference\crates\gguf\examples\probe4.rs                | Rust             |         10 |          1 |          1 |         12 |
+| d:\taraference\crates\gguf\examples\probe5.rs                | Rust             |          5 |          0 |          1 |          6 |
+| d:\taraference\crates\gguf\examples\probe_norm.rs            | Rust             |         24 |          0 |          1 |         25 |
+| d:\taraference\crates\gguf\examples\probe_ssm.rs             | Rust             |         16 |          1 |          1 |         18 |
+| d:\taraference\crates\gguf\src\error.rs                      | Rust             |         29 |          0 |         12 |         41 |
+| d:\taraference\crates\gguf\src\lib.rs                        | Rust             |          8 |          6 |          3 |         17 |
+| d:\taraference\crates\gguf\src\reader.rs                     | Rust             |        187 |          8 |         28 |        223 |
+| d:\taraference\crates\gguf\src\types.rs                      | Rust             |        184 |          8 |         10 |        202 |
+| d:\taraference\crates\gguf\src\value.rs                      | Rust             |        271 |          3 |         14 |        288 |
+| d:\taraference\openai-test-python\README.md                  | Markdown         |         25 |          0 |         11 |         36 |
+| d:\taraference\openai-test-python\assistant.py               | Python           |        146 |         17 |         24 |        187 |
+| d:\taraference\openai-test-python\requirements.txt           | pip requirements |          1 |          0 |          1 |          2 |
+| d:\taraference\profile-logs\ollama-l4\bench_chat.py          | Python           |         72 |          0 |          8 |         80 |
+| d:\taraference\profile-logs\ollama-l4\ollama-run1.jsonl      | JSON Lines       |          6 |          0 |          1 |          7 |
+| d:\taraference\profile-logs\ollama-l4\ollama-run2.jsonl      | JSON Lines       |          6 |          0 |          1 |          7 |
+| d:\taraference\profile-logs\ollama-l4\ollama-warm-run2.jsonl | JSON Lines       |          6 |          0 |          1 |          7 |
+| d:\taraference\profile-logs\ollama-l4\ollama-warm-run3.jsonl | JSON Lines       |          6 |          0 |          1 |          7 |
+| d:\taraference\review-by\core_inference_engine_review.md     | Markdown         |         87 |          0 |         33 |        120 |
+| d:\taraference\review-by\placetoimporve.md                   | Markdown         |         93 |          0 |         23 |        116 |
+| d:\taraference\review-by\placetoimporve\README.md            | Markdown         |         93 |          0 |         23 |        116 |
+| d:\taraference\scripts\README.md                             | Markdown         |         43 |          0 |         20 |         63 |
+| d:\taraference\scripts\get-binary.sh                         | Shell Script     |         71 |         19 |         14 |        104 |
+| d:\taraference\scripts\install.ps1                           | PowerShell       |         96 |         20 |         15 |        131 |
+| d:\taraference\scripts\install.sh                            | Shell Script     |         95 |         16 |         18 |        129 |
+| Total                                                        |                  |     13,182 |        692 |      1,278 |     15,152 |
++--------------------------------------------------------------+------------------+------------+------------+------------+------------+

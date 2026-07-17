@@ -1,0 +1,4 @@
+stamp,model,decode,gpu_name,gpu_compute_cap,gpu_nvrtc_arch,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_drop_pct,final_ctx
+unix_1784137839,Qwen2.5-0.5B-Instruct-Q4_K_M,fastv2,"Tesla T4",7.5,sm_75,profile_unix_1784137839_Qwen2.5-0.5B-Instruct-Q4_K_M_fastv2.txt,102.434,135.102,85.040,37.06,449
+unix_1784137856,Qwen2.5-3B-Instruct-Q4_K_M,fastv2,"Tesla T4",7.5,sm_75,profile_unix_1784137856_Qwen2.5-3B-Instruct-Q4_K_M_fastv2.txt,30.991,32.115,29.605,7.81,451
+unix_1784137892,Qwen2.5-7B-Instruct-Q4_K_M,fastv2,"Tesla T4",7.5,sm_75,profile_unix_1784137892_Qwen2.5-7B-Instruct-Q4_K_M_fastv2.txt,14.672,13.865,14.586,-5.20,494

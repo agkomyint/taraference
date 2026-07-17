@@ -115,7 +115,10 @@ impl Tokenizer {
             return ids;
         }
         for piece in split_special(text, &self.token_to_id) {
-            if piece.starts_with("<|") && piece.ends_with("|>") {
+            if (piece.starts_with("<|") && piece.ends_with("|>"))
+                || piece == "<think>"
+                || piece == "</think>"
+            {
                 if let Some(&id) = self.token_to_id.get(&piece) {
                     ids.push(id);
                     continue;

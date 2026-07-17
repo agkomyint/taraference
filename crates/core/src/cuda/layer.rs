@@ -3,16 +3,46 @@
 use super::decode::{find_by_name, AttnLaunch};
 use super::kv::CudaKv;
 use super::matmul::{
-    gemm, gemv, try_gemv_global_q8, try_gemv_pair, try_gemv_q4_dual, try_gemv_q4_ffn, try_gemv_qkv,
+    gemm, gemv, try_gemv_gdn_4way, try_gemv_global_q8, try_gemv_pair, try_gemv_q4_dual, try_gemv_q4_ffn, try_gemv_qkv,
     GemvResidual,
 };
 use super::model::CudaModel;
+use super::types::{FullAttnWeights, LayerAttn, LinearAttnWeights};
 use anyhow::Result;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 fn layer_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("TARAFER_LAYER_TIMING").is_some())
+}
+
+fn flag_identity() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TARAFER_IDENTITY").is_some())
+}
+fn flag_skip_linear() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TARAFER_SKIP_LINEAR").is_some())
+}
+fn flag_no_out_gate() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TARAFER_NO_OUT_GATE").is_some())
+}
+fn flag_q_gate_half() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TARAFER_Q_GATE_HALF").is_some())
+}
+fn flag_no_rope() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TARAFER_NO_ROPE").is_some())
+}
+fn flag_full_rope() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TARAFER_FULL_ROPE").is_some())
+}
+fn flag_gdn_legacy() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TARAFER_GDN_LEGACY").is_some())
 }
 
 fn decode_should_skip_ffn(layer: usize, n_layer: usize) -> bool {
@@ -75,29 +105,36 @@ impl CudaModel {
         } else {
             None
         };
-        self.attn_block(li, d, cache)?;
-        let middle = if timing {
-            Some(
-                self.stream
-                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
-            )
-        } else {
-            None
-        };
-        let skip_ffn = d.n_tok == 1 && decode_should_skip_ffn(li, self.layers.len());
-        if !skip_ffn {
-            self.ffn_block(li, d)?;
+        // Debug: skip entire transformer body (identity residual).
+        if !flag_identity() {
+            self.attn_block(li, d, cache)?;
+            let middle = if timing {
+                Some(
+                    self.stream.record_event(Some(
+                        cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+                    ))?,
+                )
+            } else {
+                None
+            };
+            let skip_ffn = d.n_tok == 1 && decode_should_skip_ffn(li, self.layers.len());
+            if !skip_ffn {
+                self.ffn_block(li, d)?;
+            }
+            if let (Some(start), Some(middle)) = (start, middle) {
+                let end = self.stream.record_event(Some(
+                    cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+                ))?;
+                eprintln!(
+                    "layer_timing | layer={li} attn_ms={:.4} ffn_ms={:.4}",
+                    start.elapsed_ms(&middle)?,
+                    middle.elapsed_ms(&end)?
+                );
+            }
+            return Ok(());
         }
-        if let (Some(start), Some(middle)) = (start, middle) {
-            let end = self
-                .stream
-                .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-            eprintln!(
-                "layer_timing | layer={li} attn_ms={:.4} ffn_ms={:.4}",
-                start.elapsed_ms(&middle)?,
-                middle.elapsed_ms(&end)?
-            );
-        }
+        // identity path: leave residual stream unchanged
+        let _ = (li, d, cache, start);
         Ok(())
     }
 
@@ -117,47 +154,67 @@ impl CudaModel {
                     shared_mem_bytes: 0,
                 })?;
         }
+        // Layer storage is stable for this call; raw pointer avoids borrow conflicts
+        // with gemv/gemm mutably borrowing `self`.
+        let layer_ptr = &self.layers[li] as *const super::types::GpuLayer;
+        match unsafe { &(*layer_ptr).attn } {
+            LayerAttn::Full(full) => self.attn_block_full(li, d, cache, full),
+            LayerAttn::Linear(lin) => self.attn_block_linear(li, d, cache, lin),
+        }
+    }
 
-        // Decode: fuse bias into GEMV. Prefill: GEMM + bias.
-        // Prefer Q5_0 Q+K+V fuse; else Q+K pair + separate V; else three GEMVs.
+    fn attn_block_full(
+        &mut self,
+        li: usize,
+        d: &ChunkDims,
+        cache: &mut CudaKv,
+        full: &FullAttnWeights,
+    ) -> Result<()> {
+        let fused = full.fused_q_gate;
+        let apply_out_gate = fused && !flag_no_out_gate();
+
         if d.n_tok == 1 {
             if try_gemv_qkv(
-                &self.stream,
-                &self.k,
-                &self.layers[li].wq,
-                &self.layers[li].wk,
-                &self.layers[li].wv,
-                &self.xb,
-                &mut self.q,
-                &mut self.k_buf,
-                &mut self.v_buf,
-                self.layers[li].bq.as_ref(),
-                self.layers[li].bk.as_ref(),
-                self.layers[li].bv.as_ref(),
-                &mut self.q8_x,
-                &mut self.q8_d,
-            )? {
+                    &self.stream,
+                    &self.k,
+                    &full.wq,
+                    &full.wk,
+                    &full.wv,
+                    &self.xb,
+                    &mut self.q,
+                    &mut self.k_buf,
+                    &mut self.v_buf,
+                    full.bq.as_ref(),
+                    full.bk.as_ref(),
+                    full.bv.as_ref(),
+                    &mut self.q8_x,
+                    &mut self.q8_d,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?
+            {
                 // fused Q+K+V
             } else if try_gemv_pair(
-                &self.stream,
-                &self.k,
-                &self.layers[li].wq,
-                &self.layers[li].wk,
-                &self.xb,
-                &mut self.q,
-                &mut self.k_buf,
-                self.layers[li].bq.as_ref(),
-                self.layers[li].bk.as_ref(),
-                &mut self.q8_x,
-                &mut self.q8_d,
-            )? {
+                    &self.stream,
+                    &self.k,
+                    &full.wq,
+                    &full.wk,
+                    &self.xb,
+                    &mut self.q,
+                    &mut self.k_buf,
+                    full.bq.as_ref(),
+                    full.bk.as_ref(),
+                    &mut self.q8_x,
+                    &mut self.q8_d,
+                )?
+            {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].wv,
+                    &full.wv,
                     &self.xb,
                     &mut self.v_buf,
-                    self.layers[li].bv.as_ref(),
+                    full.bv.as_ref(),
                     GemvResidual::None,
                     &mut self.gemv_partial,
                     self.gemv_partial_stride,
@@ -166,10 +223,10 @@ impl CudaModel {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].wq,
+                    &full.wq,
                     &self.xb,
                     &mut self.q,
-                    self.layers[li].bq.as_ref(),
+                    full.bq.as_ref(),
                     GemvResidual::None,
                     &mut self.gemv_partial,
                     self.gemv_partial_stride,
@@ -177,10 +234,10 @@ impl CudaModel {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].wk,
+                    &full.wk,
                     &self.xb,
                     &mut self.k_buf,
-                    self.layers[li].bk.as_ref(),
+                    full.bk.as_ref(),
                     GemvResidual::None,
                     &mut self.gemv_partial,
                     self.gemv_partial_stride,
@@ -188,10 +245,10 @@ impl CudaModel {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].wv,
+                    &full.wv,
                     &self.xb,
                     &mut self.v_buf,
-                    self.layers[li].bv.as_ref(),
+                    full.bv.as_ref(),
                     GemvResidual::None,
                     &mut self.gemv_partial,
                     self.gemv_partial_stride,
@@ -201,15 +258,15 @@ impl CudaModel {
             gemm(
                 &self.stream,
                 &self.k,
-                &self.layers[li].wq,
+                &full.wq,
                 &self.xb,
                 &mut self.q,
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
             )?;
-            if let Some(ref b) = self.layers[li].bq {
-                let feat = d.n_embd;
+            if let Some(ref b) = full.bq {
+                let feat = full.wq.n_cols as i32;
                 unsafe {
                     self.stream
                         .launch_builder(&self.k.add_bias)
@@ -217,20 +274,22 @@ impl CudaModel {
                         .arg(b)
                         .arg(&feat)
                         .arg(&d.n_tok)
-                        .launch(LaunchConfig::for_num_elems((d.n_embd_u * d.n_tok_u) as u32))?;
+                        .launch(LaunchConfig::for_num_elems(
+                            (full.wq.n_cols * d.n_tok_u) as u32,
+                        ))?;
                 }
             }
             gemm(
                 &self.stream,
                 &self.k,
-                &self.layers[li].wk,
+                &full.wk,
                 &self.xb,
                 &mut self.k_buf,
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
             )?;
-            if let Some(ref b) = self.layers[li].bk {
+            if let Some(ref b) = full.bk {
                 let feat = (d.n_kv_heads * d.head_dim) as i32;
                 unsafe {
                     self.stream
@@ -247,14 +306,14 @@ impl CudaModel {
             gemm(
                 &self.stream,
                 &self.k,
-                &self.layers[li].wv,
+                &full.wv,
                 &self.xb,
                 &mut self.v_buf,
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
             )?;
-            if let Some(ref b) = self.layers[li].bv {
+            if let Some(ref b) = full.bv {
                 let feat = (d.n_kv_heads * d.head_dim) as i32;
                 unsafe {
                     self.stream
@@ -270,18 +329,118 @@ impl CudaModel {
             }
         }
 
+        // Fused Q|gate → compact Q in `q`, gate in `gate_buf`.
+        if fused {
+            let n_q = (d.n_head_u * d.head_dim * d.n_tok_u) as i32;
+            let mode = if flag_q_gate_half() { 1i32 } else { 0i32 };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.split_q_gate)
+                    .arg(&self.q)
+                    .arg(&mut self.gdn_out)
+                    .arg(&mut self.gate_buf)
+                    .arg(&d.n_head)
+                    .arg(&d.hd)
+                    .arg(&d.n_tok)
+                    .arg(&mode)
+                    .launch(LaunchConfig {
+                        grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                self.stream
+                    .launch_builder(&self.k.copy_f32)
+                    .arg(&self.gdn_out)
+                    .arg(&mut self.q)
+                    .arg(&n_q)
+                    .launch(LaunchConfig::for_num_elems(n_q as u32))?;
+            }
+        }
+
         unsafe {
-            let q_norm = self.layers[li].attn_q_norm.as_ref();
-            let k_norm = self.layers[li].attn_k_norm.as_ref();
-            let use_rope = self.cfg.no_rope_layer_interval == 0
-                || (li + 1) % self.cfg.no_rope_layer_interval != 0;
+            let q_norm = full.attn_q_norm.as_ref();
+            let k_norm = full.attn_k_norm.as_ref();
+            let use_rope = (self.cfg.no_rope_layer_interval == 0
+                || (li + 1) % self.cfg.no_rope_layer_interval != 0)
+                && !flag_no_rope();
+            let force_full_rope = flag_full_rope();
+            let partial =
+                !force_full_rope && self.cfg.rope_dim > 0 && self.cfg.rope_dim < d.head_dim;
+            let n_rot = if !use_rope {
+                0i32 // rms only (debug / no-rope)
+            } else if partial {
+                self.cfg.rope_dim as i32
+            } else {
+                d.hd
+            };
+
             if let (Some(qw), Some(kw)) = (q_norm, k_norm) {
                 let launch = LaunchConfig {
                     grid_dim: (d.n_head_u as u32, d.n_tok_u as u32, 1),
                     block_dim: (128, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                if d.use_device_pos {
+                // Always use partial-rope kernel when we have an explicit n_rot
+                // (including 0 = norm only, or rope_dim < head_dim).
+                if partial || !use_rope || n_rot != d.hd {
+                    if d.use_device_pos {
+                        self.stream
+                            .launch_builder(&self.k.qk_norm_partial_rope_d)
+                            .arg(&mut self.q)
+                            .arg(qw)
+                            .arg(&d.n_head)
+                            .arg(&d.hd)
+                            .arg(&n_rot)
+                            .arg(&self.d_pos0)
+                            .arg(&d.n_tok)
+                            .arg(&d.theta)
+                            .arg(&d.eps)
+                            .launch(launch)?;
+                        self.stream
+                            .launch_builder(&self.k.qk_norm_partial_rope_d)
+                            .arg(&mut self.k_buf)
+                            .arg(kw)
+                            .arg(&d.n_kv)
+                            .arg(&d.hd)
+                            .arg(&n_rot)
+                            .arg(&self.d_pos0)
+                            .arg(&d.n_tok)
+                            .arg(&d.theta)
+                            .arg(&d.eps)
+                            .launch(LaunchConfig {
+                                grid_dim: (d.n_kv_heads as u32, d.n_tok_u as u32, 1),
+                                ..launch
+                            })?;
+                    } else {
+                        self.stream
+                            .launch_builder(&self.k.qk_norm_partial_rope)
+                            .arg(&mut self.q)
+                            .arg(qw)
+                            .arg(&d.n_head)
+                            .arg(&d.hd)
+                            .arg(&n_rot)
+                            .arg(&d.pos0_i)
+                            .arg(&d.n_tok)
+                            .arg(&d.theta)
+                            .arg(&d.eps)
+                            .launch(launch)?;
+                        self.stream
+                            .launch_builder(&self.k.qk_norm_partial_rope)
+                            .arg(&mut self.k_buf)
+                            .arg(kw)
+                            .arg(&d.n_kv)
+                            .arg(&d.hd)
+                            .arg(&n_rot)
+                            .arg(&d.pos0_i)
+                            .arg(&d.n_tok)
+                            .arg(&d.theta)
+                            .arg(&d.eps)
+                            .launch(LaunchConfig {
+                                grid_dim: (d.n_kv_heads as u32, d.n_tok_u as u32, 1),
+                                ..launch
+                            })?;
+                    }
+                } else if d.use_device_pos {
                     self.stream
                         .launch_builder(&self.k.qk_norm_rope_d)
                         .arg(&mut self.q)
@@ -334,8 +493,8 @@ impl CudaModel {
                             ..launch
                         })?;
                 }
-            } else if d.use_device_pos {
-                if use_rope {
+            } else if use_rope {
+                if d.use_device_pos {
                     self.stream
                         .launch_builder(&self.k.rope_d)
                         .arg(&mut self.q)
@@ -362,9 +521,7 @@ impl CudaModel {
                             block_dim: (32, 1, 1),
                             shared_mem_bytes: 0,
                         })?;
-                }
-            } else {
-                if use_rope {
+                } else {
                     self.stream
                         .launch_builder(&self.k.rope)
                         .arg(&mut self.q)
@@ -435,12 +592,23 @@ impl CudaModel {
 
         self.launch_attn(li, d, cache)?;
 
+        if apply_out_gate {
+            let n = (d.n_head_u * d.head_dim * d.n_tok_u) as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.mul_sigmoid)
+                    .arg(&mut self.xb)
+                    .arg(&self.gate_buf)
+                    .arg(&n)
+                    .launch(LaunchConfig::for_num_elems(n as u32))?;
+            }
+        }
+
         if d.n_tok == 1 {
-            // Decode: x = x + Wo·attn  (fuse residual add into GEMV).
             if !try_gemv_global_q8(
                 &self.stream,
                 &self.k,
-                &self.layers[li].wo,
+                &full.wo,
                 &self.xb,
                 &mut self.x,
                 None,
@@ -453,7 +621,7 @@ impl CudaModel {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.layers[li].wo,
+                    &full.wo,
                     &self.xb,
                     &mut self.x,
                     None,
@@ -466,7 +634,497 @@ impl CudaModel {
             gemm(
                 &self.stream,
                 &self.k,
-                &self.layers[li].wo,
+                &full.wo,
+                &self.xb,
+                &mut self.xb2,
+                d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )?;
+            let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.add)
+                    .arg(&mut self.x)
+                    .arg(&self.xb2)
+                    .arg(&residual_n)
+                    .launch(LaunchConfig::for_num_elems((d.n_embd_u * d.n_tok_u) as u32))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn attn_block_linear(
+        &mut self,
+        li: usize,
+        d: &ChunkDims,
+        cache: &mut CudaKv,
+        lin: &LinearAttnWeights,
+    ) -> Result<()> {
+        // Debug: skip GDN and leave residual stream unchanged (identity mixer).
+        if flag_skip_linear() {
+            let _ = (li, d, cache, lin);
+            return Ok(());
+        }
+        let n_k = lin.n_k_heads as i32;
+        let n_v = lin.n_v_heads as i32;
+        let d_k = lin.state_size as i32;
+        let d_v = lin.state_size as i32;
+        let conv_ch = lin.conv_channels as i32;
+        let kernel = lin.conv_kernel as i32;
+        let n_v_elems = (lin.n_v_heads * d.n_tok_u) as i32;
+        // Qwen3.5: d_k == d_v == state_size (typically 128). Enables fused decode/prefill.
+        let square_state = d_k == d_v
+            && lin.state_size > 0
+            && lin.state_size <= 256
+            && !flag_gdn_legacy();
+
+        if d.n_tok == 1 {
+            if !try_gemv_gdn_4way(
+                &self.stream,
+                &self.k,
+                &lin.wqkv,
+                &lin.w_gate,
+                &lin.ssm_beta,
+                &lin.ssm_alpha,
+                &self.xb,
+                &mut self.q,
+                &mut self.gdn_z,
+                &mut self.gdn_beta,
+                &mut self.gdn_alpha,
+                &mut self.q8_x,
+                &mut self.q8_d,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )? {
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &lin.wqkv,
+                    &self.xb,
+                    &mut self.q,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &lin.w_gate,
+                    &self.xb,
+                    &mut self.gdn_z,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &lin.ssm_beta,
+                    &self.xb,
+                    &mut self.gdn_beta,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &lin.ssm_alpha,
+                    &self.xb,
+                    &mut self.gdn_alpha,
+                    None,
+                    GemvResidual::None,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+            }
+        } else {
+            gemm(
+                &self.stream,
+                &self.k,
+                &lin.wqkv,
+                &self.xb,
+                &mut self.q,
+                d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )?;
+            gemm(
+                &self.stream,
+                &self.k,
+                &lin.w_gate,
+                &self.xb,
+                &mut self.gdn_z,
+                d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )?;
+            gemm(
+                &self.stream,
+                &self.k,
+                &lin.ssm_beta,
+                &self.xb,
+                &mut self.gdn_beta,
+                d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )?;
+            gemm(
+                &self.stream,
+                &self.k,
+                &lin.ssm_alpha,
+                &self.xb,
+                &mut self.gdn_alpha,
+                d.n_tok,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )?;
+        }
+
+        unsafe {
+            if d.n_tok == 1 && square_state {
+                // Fast path: 2 launches after projections
+                //   1) conv + split + L2(Q/K)
+                //   2) prep(α,β) + delta rule + gated RMS → xb
+                let blk = 128u32;
+                self.stream
+                    .launch_builder(&self.k.gdn_conv_qkvl2_one)
+                    .arg(&self.q)
+                    .arg(&lin.conv1d)
+                    .arg(&mut cache.conv[li])
+                    .arg(&mut self.gdn_q)
+                    .arg(&mut self.gdn_k)
+                    .arg(&mut self.gdn_v)
+                    .arg(&n_k)
+                    .arg(&n_v)
+                    .arg(&d_k)
+                    .arg(&kernel)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (lin.n_k_heads as u32, 1, 1),
+                        block_dim: (blk, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                if lin.state_size == 128 {
+                    self.stream
+                        .launch_builder(&self.k.gdn_delta_gated_one_d128)
+                        .arg(&self.gdn_q)
+                        .arg(&self.gdn_k)
+                        .arg(&self.gdn_v)
+                        .arg(&self.gdn_alpha)
+                        .arg(&self.gdn_beta)
+                        .arg(&lin.ssm_dt)
+                        .arg(&lin.ssm_a)
+                        .arg(&mut cache.ssm[li])
+                        .arg(&lin.ssm_norm)
+                        .arg(&self.gdn_z)
+                        .arg(&mut self.xb)
+                        .arg(&n_k)
+                        .arg(&n_v)
+                        .arg(&d.eps)
+                        .launch(LaunchConfig {
+                            grid_dim: (lin.n_v_heads as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                } else {
+                    self.stream
+                        .launch_builder(&self.k.gdn_delta_gated_one)
+                        .arg(&self.gdn_q)
+                        .arg(&self.gdn_k)
+                        .arg(&self.gdn_v)
+                        .arg(&mut self.gdn_alpha)
+                        .arg(&mut self.gdn_beta)
+                        .arg(&lin.ssm_dt)
+                        .arg(&lin.ssm_a)
+                        .arg(&mut cache.ssm[li])
+                        .arg(&lin.ssm_norm)
+                        .arg(&self.gdn_z)
+                        .arg(&mut self.xb)
+                        .arg(&n_k)
+                        .arg(&n_v)
+                        .arg(&d_k)
+                        .arg(&d.eps)
+                        .launch(LaunchConfig {
+                            grid_dim: (lin.n_v_heads as u32, 1, 1),
+                            block_dim: (blk, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+            } else if d.n_tok > 1 && square_state {
+                // Prefill: prep → conv → fused split+L2 → fused delta+gated_rms
+                self.stream
+                    .launch_builder(&self.k.gdn_prep_decay_beta)
+                    .arg(&mut self.gdn_alpha)
+                    .arg(&mut self.gdn_beta)
+                    .arg(&lin.ssm_dt)
+                    .arg(&lin.ssm_a)
+                    .arg(&n_v)
+                    .arg(&d.n_tok)
+                    .launch(LaunchConfig::for_num_elems(n_v_elems as u32))?;
+                self.stream
+                    .launch_builder(&self.k.causal_conv1d)
+                    .arg(&self.q)
+                    .arg(&lin.conv1d)
+                    .arg(&mut cache.conv[li])
+                    .arg(&mut self.gdn_conv)
+                    .arg(&conv_ch)
+                    .arg(&kernel)
+                    .arg(&d.n_tok)
+                    .launch(LaunchConfig {
+                        grid_dim: ((lin.conv_channels as u32 + 255) / 256, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                self.stream
+                    .launch_builder(&self.k.gdn_split_l2_seq)
+                    .arg(&self.gdn_conv)
+                    .arg(&mut self.gdn_q)
+                    .arg(&mut self.gdn_k)
+                    .arg(&mut self.gdn_v)
+                    .arg(&n_k)
+                    .arg(&n_v)
+                    .arg(&d_k)
+                    .arg(&d_v)
+                    .arg(&d.n_tok)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (lin.n_k_heads as u32, d.n_tok_u as u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                self.stream
+                    .launch_builder(&self.k.gdn_delta_gated_seq)
+                    .arg(&self.gdn_q)
+                    .arg(&self.gdn_k)
+                    .arg(&self.gdn_v)
+                    .arg(&self.gdn_alpha)
+                    .arg(&self.gdn_beta)
+                    .arg(&mut cache.ssm[li])
+                    .arg(&lin.ssm_norm)
+                    .arg(&self.gdn_z)
+                    .arg(&mut self.xb)
+                    .arg(&n_k)
+                    .arg(&n_v)
+                    .arg(&d_k)
+                    .arg(&d.n_tok)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (lin.n_v_heads as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            } else {
+                // Generic fallback (non-square state or debug).
+                self.stream
+                    .launch_builder(&self.k.gdn_prep_decay_beta)
+                    .arg(&mut self.gdn_alpha)
+                    .arg(&mut self.gdn_beta)
+                    .arg(&lin.ssm_dt)
+                    .arg(&lin.ssm_a)
+                    .arg(&n_v)
+                    .arg(&d.n_tok)
+                    .launch(LaunchConfig::for_num_elems(n_v_elems as u32))?;
+
+                if d.n_tok == 1 {
+                    self.stream
+                        .launch_builder(&self.k.causal_conv1d_one)
+                        .arg(&self.q)
+                        .arg(&lin.conv1d)
+                        .arg(&mut cache.conv[li])
+                        .arg(&mut self.gdn_conv)
+                        .arg(&conv_ch)
+                        .arg(&kernel)
+                        .launch(LaunchConfig {
+                            grid_dim: ((lin.conv_channels as u32 + 255) / 256, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    self.stream
+                        .launch_builder(&self.k.split_qkv_l2_one)
+                        .arg(&self.gdn_conv)
+                        .arg(&mut self.gdn_q)
+                        .arg(&mut self.gdn_k)
+                        .arg(&mut self.gdn_v)
+                        .arg(&n_k)
+                        .arg(&n_v)
+                        .arg(&d_k)
+                        .arg(&d_v)
+                        .arg(&d.eps)
+                        .launch(LaunchConfig {
+                            grid_dim: (lin.n_k_heads as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    if d_k == d_v {
+                        self.stream
+                            .launch_builder(&self.k.gated_delta_one)
+                            .arg(&self.gdn_q)
+                            .arg(&self.gdn_k)
+                            .arg(&self.gdn_v)
+                            .arg(&self.gdn_alpha)
+                            .arg(&self.gdn_beta)
+                            .arg(&mut cache.ssm[li])
+                            .arg(&mut self.gdn_out)
+                            .arg(&n_k)
+                            .arg(&n_v)
+                            .arg(&d_k)
+                            .launch(LaunchConfig {
+                                grid_dim: (lin.n_v_heads as u32, 1, 1),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    } else {
+                        self.stream
+                            .launch_builder(&self.k.gated_delta_seq)
+                            .arg(&self.gdn_q)
+                            .arg(&self.gdn_k)
+                            .arg(&self.gdn_v)
+                            .arg(&self.gdn_alpha)
+                            .arg(&self.gdn_beta)
+                            .arg(&mut cache.ssm[li])
+                            .arg(&mut self.gdn_out)
+                            .arg(&n_k)
+                            .arg(&n_v)
+                            .arg(&d_k)
+                            .arg(&d_v)
+                            .arg(&d.n_tok)
+                            .launch(LaunchConfig {
+                                grid_dim: (lin.n_v_heads as u32, 1, 1),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                } else {
+                    self.stream
+                        .launch_builder(&self.k.causal_conv1d)
+                        .arg(&self.q)
+                        .arg(&lin.conv1d)
+                        .arg(&mut cache.conv[li])
+                        .arg(&mut self.gdn_conv)
+                        .arg(&conv_ch)
+                        .arg(&kernel)
+                        .arg(&d.n_tok)
+                        .launch(LaunchConfig {
+                            grid_dim: ((lin.conv_channels as u32 + 255) / 256, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    self.stream
+                        .launch_builder(&self.k.split_qkv_conv)
+                        .arg(&self.gdn_conv)
+                        .arg(&mut self.gdn_q)
+                        .arg(&mut self.gdn_k)
+                        .arg(&mut self.gdn_v)
+                        .arg(&n_k)
+                        .arg(&n_v)
+                        .arg(&d_k)
+                        .arg(&d_v)
+                        .arg(&d.n_tok)
+                        .launch(LaunchConfig {
+                            grid_dim: (d.n_tok_u as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    self.stream
+                        .launch_builder(&self.k.l2_norm_heads)
+                        .arg(&mut self.gdn_q)
+                        .arg(&n_k)
+                        .arg(&d_k)
+                        .arg(&d.n_tok)
+                        .arg(&d.eps)
+                        .launch(LaunchConfig {
+                            grid_dim: (lin.n_k_heads as u32, d.n_tok_u as u32, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    self.stream
+                        .launch_builder(&self.k.l2_norm_heads)
+                        .arg(&mut self.gdn_k)
+                        .arg(&n_k)
+                        .arg(&d_k)
+                        .arg(&d.n_tok)
+                        .arg(&d.eps)
+                        .launch(LaunchConfig {
+                            grid_dim: (lin.n_k_heads as u32, d.n_tok_u as u32, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    self.stream
+                        .launch_builder(&self.k.gated_delta_seq)
+                        .arg(&self.gdn_q)
+                        .arg(&self.gdn_k)
+                        .arg(&self.gdn_v)
+                        .arg(&self.gdn_alpha)
+                        .arg(&self.gdn_beta)
+                        .arg(&mut cache.ssm[li])
+                        .arg(&mut self.gdn_out)
+                        .arg(&n_k)
+                        .arg(&n_v)
+                        .arg(&d_k)
+                        .arg(&d_v)
+                        .arg(&d.n_tok)
+                        .launch(LaunchConfig {
+                            grid_dim: (lin.n_v_heads as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+
+                self.stream
+                    .launch_builder(&self.k.gated_rms_norm)
+                    .arg(&self.gdn_out)
+                    .arg(&lin.ssm_norm)
+                    .arg(&self.gdn_z)
+                    .arg(&mut self.xb)
+                    .arg(&n_v)
+                    .arg(&d_v)
+                    .arg(&d.n_tok)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (lin.n_v_heads as u32, d.n_tok_u as u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        }
+
+        if d.n_tok == 1 {
+            // Project gated-RMS result in xb onto residual stream.
+            if !try_gemv_global_q8(
+                &self.stream,
+                &self.k,
+                &lin.ssm_out,
+                &self.xb,
+                &mut self.x,
+                None,
+                GemvResidual::InPlace,
+                &mut self.q8_x,
+                &mut self.q8_d,
+                &mut self.gemv_partial,
+                self.gemv_partial_stride,
+            )? {
+                gemv(
+                    &self.stream,
+                    &self.k,
+                    &lin.ssm_out,
+                    &self.xb,
+                    &mut self.x,
+                    None,
+                    GemvResidual::InPlace,
+                    &mut self.gemv_partial,
+                    self.gemv_partial_stride,
+                )?;
+            }
+        } else {
+            gemm(
+                &self.stream,
+                &self.k,
+                &lin.ssm_out,
                 &self.xb,
                 &mut self.xb2,
                 d.n_tok,

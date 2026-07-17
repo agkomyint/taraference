@@ -58,7 +58,20 @@ impl InferenceEngine {
         let tok = Tokenizer::from_gguf(&gguf)?;
         let mut model = CudaModel::load_with(&gguf, cfg.decode)?;
         model.set_cuda_graph(cfg.cuda_graph);
-        let max_seq = cfg.max_seq.min(model.cfg.n_ctx);
+        // Hybrid Qwen3.5 on small VRAM: long max_seq + Q5→Q8 inflate leaves almost
+        // no free memory and collapses clocks. Cap default-sized contexts unless the
+        // user opts into long context.
+        let mut max_seq = cfg.max_seq.min(model.cfg.n_ctx);
+        if model.cfg.is_hybrid()
+            && weight_gib > 2.0
+            && max_seq > 1024
+            && std::env::var_os("TARAFER_LONG_CTX").is_none()
+        {
+            eprintln!(
+                "hybrid | max_seq {max_seq} → 1024 (weights {weight_gib:.2} GiB; set TARAFER_LONG_CTX=1 to keep)"
+            );
+            max_seq = 1024;
+        }
         let kv = model.alloc_kv(max_seq)?;
         let model_id = path
             .file_stem()
@@ -178,12 +191,16 @@ impl InferenceEngine {
             anyhow::bail!("messages must not be empty");
         }
         let max_new = max_tokens.unwrap_or(self.max_new).max(1);
-        let prompt = format_chatml(messages, Some(&self.default_system));
+        // Server defaults to non-thinking (Qwen3.5 small default). Pass
+        // enable_thinking via a dedicated API later if needed.
+        let enable_thinking = false;
+        let prompt = format_chatml(messages, Some(&self.default_system), enable_thinking);
         let opts = SessionOptions {
             max_new,
             system: self.default_system.clone(),
             print_stream: false,
             print_stats: false,
+            enable_thinking,
         };
         self.kv.clear();
         let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);

@@ -153,6 +153,34 @@ impl CudaModel {
             return Ok(());
         }
 
+        // Hybrid GDN/conv state is a single recurrent buffer (not per-position).
+        // Capture runs a dummy token that would corrupt live state — snapshot first.
+        let hybrid = self.cfg.is_hybrid();
+        let mut ssm_snap: Vec<cudarc::driver::CudaSlice<f32>> = Vec::new();
+        let mut conv_snap: Vec<cudarc::driver::CudaSlice<f32>> = Vec::new();
+        if hybrid {
+            for li in 0..self.cfg.n_layer {
+                if !self.cfg.is_linear_layer(li) {
+                    ssm_snap.push(self.stream.alloc_zeros::<f32>(1)?);
+                    conv_snap.push(self.stream.alloc_zeros::<f32>(1)?);
+                    continue;
+                }
+                let se = self.cfg.ssm_state_elems().max(1);
+                let ce = self.cfg.ssm_conv_state_elems().max(1);
+                let mut ss = self.stream.alloc_zeros::<f32>(se)?;
+                let mut cs = self.stream.alloc_zeros::<f32>(ce)?;
+                self.stream
+                    .memcpy_dtod(&cache.ssm[li], &mut ss)
+                    .context("snapshot ssm")?;
+                self.stream
+                    .memcpy_dtod(&cache.conv[li], &mut cs)
+                    .context("snapshot conv")?;
+                ssm_snap.push(ss);
+                conv_snap.push(cs);
+            }
+            self.stream.synchronize().context("snapshot sync")?;
+        }
+
         // Full single-token decode capture (device-pos kernels read d_pos0/d_token).
         self._ctx.synchronize().ok();
         if let Err(e) = self
@@ -184,6 +212,25 @@ impl CudaModel {
             cuda_graph_debug(&format!(
                 "CUDA graph | full capture failed: {e:#} (eager decode continues)"
             ));
+        }
+
+        // Restore recurrent state so the next real decode continues correctly.
+        if hybrid {
+            for li in 0..self.cfg.n_layer {
+                if !self.cfg.is_linear_layer(li) {
+                    continue;
+                }
+                self.stream
+                    .memcpy_dtod(&ssm_snap[li], &mut cache.ssm[li])
+                    .context("restore ssm")?;
+                self.stream
+                    .memcpy_dtod(&conv_snap[li], &mut cache.conv[li])
+                    .context("restore conv")?;
+            }
+            self.stream.synchronize().context("restore sync")?;
+            if self.graph_active {
+                cuda_graph_debug("CUDA graph | hybrid recurrent state restored after capture");
+            }
         }
         Ok(())
     }

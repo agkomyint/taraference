@@ -1,0 +1,152 @@
+loading /home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf …
+GPU | qwen2 L=36 d=2048 heads=16/2 ff=11008 | 1.79 GiB Q-weights | decode=flash
+GPU device | NVIDIA L4 | compute 8.9 | NVRTC arch=sm_89
+tuning | q4_dual=4way | threads=128 | quantized_warps=4
+weights | Q4_K=216 (1.24 GiB) Q5_0=0 (0.00 GiB) Q6_K=37 (0.55 GiB) Q8_0=0 (0.00 GiB)
+ready | decode=flash | Q4_K×Q8 DP4A | fused projections | CUDA-graph ready
+KV    | f16  max_seq=5000  ~175.8 MiB (all layers K+V)
+flags | cuda_graph=true | decode=flash
+profile mode (multi-turn) | decode=flash | max_new=128 | turns=5 | gpu=NVIDIA L4 (sm_89)
+  turn 1: "hi, who are you?"
+  turn 2: "what can you help me with in one sentence?"
+  turn 3: "ok give me 3 bullet ideas for a weekend project"
+  turn 4: "expand on the second idea a bit more"
+  turn 5: "summarize everything we talked about so far"
+
+—— turn 1/5 ——
+user: hi, who are you?
+assistant: Hello! I am a large language model created by Alibaba Cloud. I'm called Qwen. How can I assist you today?
+[26 tok | prefill 165 ms | decode 94.2 tok/s | ctx 53 | stop=Eos]
+
+—— turn 2/5 ——
+user: what can you help me with in one sentence?
+assistant: I can assist with a variety of tasks, from answering questions and generating text to helping with programming and solving problems.
+[23 tok | prefill 133 ms | decode 93.5 tok/s | ctx 96 | stop=Eos]
+
+—— turn 3/5 ——
+user: ok give me 3 bullet ideas for a weekend project
+assistant: Sure! Here are three bullet ideas for a weekend project:
+
+- Build a simple web application using a framework like Flask or Django.
+- Create a personal productivity tracker using a programming language like Python.
+- Develop a basic chatbot using natural language processing techniques.
+[51 tok | prefill 141 ms | decode 92.1 tok/s | ctx 168 | stop=Eos]
+
+—— turn 4/5 ——
+user: expand on the second idea a bit more
+assistant: Certainly! Here's a more detailed expansion on the second idea:
+
+- Create a personal productivity tracker using a programming language like Python. This project can help you manage your daily tasks, set goals, and track your progress. You can use libraries such as `pandas` for data manipulation and `matplotlib` for visualizing your data. Additionally, you might consider integrating a database like `SQLite` to store your productivity data securely. This project not only helps you stay organized but also provides insights into your daily routines and productivity patterns.
+[106 tok | prefill 100 ms | decode 89.6 tok/s | ctx 292 | stop=Eos]
+
+—— turn 5/5 ——
+user: summarize everything we talked about so far
+assistant: Sure! Here’s a summary of our conversation so far:
+
+- **Introduction**: We had a conversation where you asked about my capabilities and then inquired about ideas for a weekend project.
+- **My Role**: I am Qwen, a large language model created by Alibaba Cloud.
+- **Your Request**: You asked for three bullet ideas for a weekend project.
+- **Detailed Expansion**: I provided a more detailed expansion on the second idea, which is to create a personal productivity tracker using Python. This project involves using libraries like `pandas` and `matplotlib` for data manipulation and visualization, and potentially integrating a database like `SQLite`
+[128 tok | prefill 136 ms | decode 88.1 tok/s | ctx 438 | stop=MaxNew]
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  unix_1784197038
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     /home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=36  d=2048  heads=16/2  ff=11008  vocab=151936
+    weights   1.79 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    flash — 8-way flash decode + tiled prefill — v0.5 production path
+    gpu       NVIDIA L4  |  compute 8.9  |  NVRTC sm_89
+    gpu+      driver 580.159.03  |  VRAM 23034 MiB  |  pci 00000000:35:00.0  |  uuid GPU-8209d5f9-70fd-d6…
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  38 samples over 4.79s wall (span 4665 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   165ms  94.2t/s   170    25    26     0    53    eos    - hi, who are you?
+     2   133ms  93.5t/s   134    18    23    53    96    eos    - what can you help me with in one sen…
+     3   141ms  92.1t/s   142    19    51    96   168    eos    - ok give me 3 bullet ideas for a week…
+     4   100ms  89.6t/s   102    16   106   168   292    eos    - expand on the second idea a bit more
+     5   136ms  88.1t/s   137    17   128   292   438    max    Y summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 137 ms  min 102  max 170  (user→first token)
+    tokenize  total 10.7 ms  (2.15 ms/turn)
+    ms/token  prefill 7.1  decode 11.1
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill      675 ms |    95 tok |  140.8 tok/s |  14.4% of turn-time
+    decode      3712 ms |   334 tok |   90.0 tok/s |  79.4% of turn-time
+    wall        4673 ms sum turns | wall-clock run 4.79s
+    decode   first-turn 94.2 t/s → last-turn 88.1 t/s  (drop 6%)
+    prefill  first 165 ms | later avg 127 ms
+    est weight BW  173.1 GB/s  (~90% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 438 / 5000  (8.8% full)  avg growth/turn 96 tok
+    VRAM   used avg 2826  min 2820  peak 2826 / 23034 MiB  (12% peak)
+    VRAM   free at peak ~20208 MiB  |  mem-controller util avg 73.5%
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=4  hit_max_new=1  empty=0  / 5 turns
+    ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min   0.0%  avg   0.0%  max   0.0%
+  GPU
+    identity  NVIDIA L4  |  cc 8.9  |  sm_89
+    compute  min  46.0%  avg  96.7%  max 100.0%
+    power    min  33.7 W  avg  67.1 W  max  74.5 W
+    temp     min    45 °C avg    50 °C max    52 °C
+    clocks   core avg 1531 MHz (max 2040)  mem avg 6251 MHz
+    efficiency  0.930 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  1.34 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~20208 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • Raise max_new (or profile cap) if answers look cut off.
+    • High GPU util → optimize matmul/attention bandwidth next.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=unix_1784197038
+    model=Qwen2.5-3B-Instruct-Q4_K_M
+    model_path=/home/zeus/content/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
+    decode_backend=flash
+    mode=multi-turn
+    gpu_name=NVIDIA L4
+    gpu_compute_cap=8.9
+    gpu_nvrtc_arch=sm_89
+    gpu_driver=580.159.03
+    gpu_vram_total_mib=23034
+    gpu_uuid=GPU-8209d5f9-70fd-d650-8499-ef08d2cccd3c
+    gpu_pci=00000000:35:00.0
+    overall_decode_tps=89.985
+    overall_prefill_tps=140.762
+    decode_tps_first=94.195
+    decode_tps_last=88.095
+    decode_drop_pct=6.48
+    total_prefill_ms=674.90
+    total_decode_ms=3711.71
+    total_gen=334
+    total_prompt=95
+    final_ctx=438
+    wall_s=4.786
+    first_prefill_ms=164.92
+    later_prefill_avg_ms=127.50
+════════════════════════════════════════════════════════════════
+
+profile log → profile-logs/profile_unix_1784197038_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt
+
+════════════════════════════════════════════════════════════════
+  vs PREVIOUS same model  (Qwen2.5-3B-Instruct-Q4_K_M)
+  (latest_Qwen2.5-3B-Instruct-Q4_K_M.txt)
+────────────────────────────────────────────────────────────────
+    gpu        NVIDIA L4 (sm_89) → NVIDIA L4 (sm_89)
+    overall decode  90.1 → 90.0 t/s   (-0.1  -0%)
+    first-turn      94.3 → 94.2 t/s   (-0.1  -0%)
+    last-turn       88.3 → 88.1 t/s   (-0.2  -0%)
+    decode drop %   6 → 6     (+0.1)
+    final ctx       438 → 438
+════════════════════════════════════════════════════════════════

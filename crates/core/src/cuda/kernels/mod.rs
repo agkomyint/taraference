@@ -11,6 +11,7 @@ pub const SOURCE: &str = concat!(
     include_str!("gemv.cu"),
     include_str!("embed.cu"),
     include_str!("ops.cu"),
+    include_str!("deltanet.cu"),
     // ── attn backends (order free; symbols must match REGISTRY) ──
     include_str!("attn/fast_v2.cu"),
     include_str!("attn/flash.cu"),

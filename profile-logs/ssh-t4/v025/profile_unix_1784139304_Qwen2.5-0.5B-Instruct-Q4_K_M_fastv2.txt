@@ -1,0 +1,90 @@
+
+════════════════════════════════════════════════════════════════
+  PROFILE REPORT  (multi-turn)
+  saved_at  unix_1784139304
+════════════════════════════════════════════════════════════════
+  CONFIG
+    model     /tmp/tara-models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    arch      qwen2  L=24  d=896  heads=14/2  ff=4864  vocab=151936
+    weights   0.36 GiB Q  |  model n_ctx=32768  session max_seq=5000  max_new=128
+    decode    fastv2 — v2: f16 KV + tiled online attn (fixed smem) — recommended
+    gpu       Tesla T4  |  compute 7.5  |  NVRTC sm_75
+    gpu+      driver 580.159.03  |  VRAM 15360 MiB  |  pci 00000000:00:1E.0  |  uuid GPU-15675086-01be-aa…
+    kv        f16 (half bandwidth vs f32)
+    sample    every 100 ms  |  32 samples over 4.33s wall (span 4198 ms)
+────────────────────────────────────────────────────────────────
+  PER-TURN
+  turn prefill  decode   ttft  pTok  gTok  ctx0   ctx   stop  cap user
+     1   225ms 138.1t/s   235    25    64     0    91    eos    - hi, who are you?
+     2   165ms 100.0t/s   169    18    12    91   123    eos    - what can you help me with in one sen…
+     3   173ms 114.3t/s   177    19    59   123   203    eos    - ok give me 3 bullet ideas for a week…
+     4   145ms 101.0t/s   147    16   128   203   349    max    Y expand on the second idea a bit more
+     5   162ms  86.3t/s   164    17    81   349   449    eos    - summarize everything we talked about…
+────────────────────────────────────────────────────────────────
+  LATENCY
+    TTFT      avg 178 ms  min 147  max 235  (user→first token)
+    tokenize  total 21.2 ms  (4.25 ms/turn)
+    ms/token  prefill 9.2  decode 9.6
+────────────────────────────────────────────────────────────────
+  THROUGHPUT
+    prefill      871 ms |    95 tok |  109.1 tok/s |  20.7% of turn-time
+    decode      3306 ms |   344 tok |  104.1 tok/s |  78.7% of turn-time
+    wall        4198 ms sum turns | wall-clock run 4.33s
+    decode   first-turn 138.1 t/s → last-turn 86.3 t/s  (drop 38%)
+    prefill  first 225 ms | later avg 161 ms
+    est weight BW  40.8 GB/s  (~21% of 192 GB/s ref)  [decode × model size]
+────────────────────────────────────────────────────────────────
+  CONTEXT / MEMORY
+    ctx final 449 / 5000  (9.0% full)  avg growth/turn 90 tok
+    VRAM   used avg 587  min 587  peak 587 / 15360 MiB  (4% peak)
+    VRAM   free at peak ~14773 MiB  |  mem-controller util avg 16.0%
+────────────────────────────────────────────────────────────────
+  GENERATION QUALITY FLAGS
+    stop: eos=4  hit_max_new=1  empty=0  / 5 turns
+    ⚠ 1 turn(s) hit max_new=128 — reply may be truncated mid-sentence
+────────────────────────────────────────────────────────────────
+  CPU
+    util   min   0.0%  avg   0.0%  max   0.0%
+  GPU
+    identity  Tesla T4  |  cc 7.5  |  sm_75
+    compute  min  32.0%  avg  94.4%  max 100.0%
+    power    min  33.7 W  avg  58.8 W  max  69.4 W
+    temp     min    37 °C avg    39 °C max    40 °C
+    clocks   core avg 1590 MHz (max 1590)  mem avg 5000 MHz
+    efficiency  1.102 decode_tok/s per GPU%   (higher = more tokens for same util)
+    tok/J (rough)  1.77 decode tok per joule  [gen_tok / (avg_W × decode_s)]
+────────────────────────────────────────────────────────────────
+  READOUT / HINTS
+    • VRAM headroom ~14773 MiB — not memory-capacity bound; speed ≠ fill VRAM.
+    • GPU util high but est weight BW low vs peak → kernels busy but not streaming weights efficiently (or util metric saturated).
+    • Decode dropped 38% as ctx grew → attention/KV path dominates long chats.
+    • Raise max_new (or profile cap) if answers look cut off.
+    • High GPU util → optimize matmul/attention bandwidth next.
+════════════════════════════════════════════════════════════════
+  SUMMARY_KV
+    stamp=unix_1784139304
+    model=Qwen2.5-0.5B-Instruct-Q4_K_M
+    model_path=/tmp/tara-models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+    decode_backend=fastv2
+    mode=multi-turn
+    gpu_name=Tesla T4
+    gpu_compute_cap=7.5
+    gpu_nvrtc_arch=sm_75
+    gpu_driver=580.159.03
+    gpu_vram_total_mib=15360
+    gpu_uuid=GPU-15675086-01be-aac2-212e-5f15c4274736
+    gpu_pci=00000000:00:1E.0
+    overall_decode_tps=104.060
+    overall_prefill_tps=109.107
+    decode_tps_first=138.104
+    decode_tps_last=86.307
+    decode_drop_pct=37.51
+    total_prefill_ms=870.70
+    total_decode_ms=3305.78
+    total_gen=344
+    total_prompt=95
+    final_ctx=449
+    wall_s=4.326
+    first_prefill_ms=225.34
+    later_prefill_avg_ms=161.34
+════════════════════════════════════════════════════════════════

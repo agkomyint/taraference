@@ -12,7 +12,7 @@ pub mod quant;
 pub mod session;
 pub mod tokenizer;
 
-pub use chat::{format_chatml, ChatMessage, ChatRole};
+pub use chat::{assistant_generation_prompt, format_chatml, ChatMessage, ChatRole};
 pub use config::ModelConfig;
 pub use cuda::{CudaKv, CudaModel, DecodeBackend};
 pub use engine::{EngineConfig, InferenceEngine};

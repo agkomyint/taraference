@@ -32,12 +32,8 @@ pub struct GpuMat {
     pub wtype: WType,
 }
 
-pub struct GpuLayer {
-    pub attn_norm: CudaSlice<f32>,
-    /// Qwen3 applies an RMS norm independently to every projected Q head.
-    pub attn_q_norm: Option<CudaSlice<f32>>,
-    /// Qwen3 applies an RMS norm independently to every projected K head.
-    pub attn_k_norm: Option<CudaSlice<f32>>,
+/// Full softmax-attention weights (Qwen2 / Qwen3 / Qwen3.5 full layers).
+pub struct FullAttnWeights {
     pub wq: GpuMat,
     pub bq: Option<CudaSlice<f32>>,
     pub wk: GpuMat,
@@ -45,7 +41,43 @@ pub struct GpuLayer {
     pub wv: GpuMat,
     pub bv: Option<CudaSlice<f32>>,
     pub wo: GpuMat,
+    pub attn_q_norm: Option<CudaSlice<f32>>,
+    pub attn_k_norm: Option<CudaSlice<f32>>,
+    /// Qwen3.5: Q projection is 2× wide (interleaved Q|gate per head).
+    pub fused_q_gate: bool,
+}
+
+/// Gated DeltaNet linear-attention weights (Qwen3.5).
+pub struct LinearAttnWeights {
+    pub wqkv: GpuMat,
+    /// Output gate z projection (value_dim).
+    pub w_gate: GpuMat,
+    /// Depthwise conv1d weight [kernel, channels] as f32 flat.
+    pub conv1d: CudaSlice<f32>,
+    pub conv_kernel: usize,
+    pub conv_channels: usize,
+    /// Already -exp(A_log); length = n_v_heads.
+    pub ssm_a: CudaSlice<f32>,
+    pub ssm_dt: CudaSlice<f32>,
+    pub ssm_alpha: GpuMat,
+    pub ssm_beta: GpuMat,
+    pub ssm_norm: CudaSlice<f32>,
+    pub ssm_out: GpuMat,
+    pub n_k_heads: usize,
+    pub n_v_heads: usize,
+    pub state_size: usize,
+}
+
+pub enum LayerAttn {
+    Full(FullAttnWeights),
+    Linear(LinearAttnWeights),
+}
+
+pub struct GpuLayer {
+    pub attn_norm: CudaSlice<f32>,
+    /// Pre-FFN norm (`ffn_norm` or Qwen3.5 `post_attention_norm`).
     pub ffn_norm: CudaSlice<f32>,
+    pub attn: LayerAttn,
     pub gate: GpuMat,
     pub up: GpuMat,
     pub down: GpuMat,
@@ -62,7 +94,11 @@ pub struct Kernels {
     pub gemv_q6_repack_global: CudaFunction,
     pub gemv_q6_compact_global: CudaFunction,
     pub gemv_q6_compact_global_4way: CudaFunction,
+    pub gemv_q6_compact_global_8way: CudaFunction,
+    #[allow(dead_code)]
+    pub gemv_q6_compact_global_mcol: CudaFunction,
     pub gemv_q8: CudaFunction,
+    pub gemv_q8_global: CudaFunction,
     pub gemv_q4_splitk: CudaFunction,
     pub gemv_q4_global_splitk: CudaFunction,
     pub gemv_q5_splitk: CudaFunction,
@@ -72,6 +108,7 @@ pub struct Kernels {
     pub gemv_q6_repack_global_splitk: CudaFunction,
     pub gemv_q6_compact_global_splitk: CudaFunction,
     pub gemv_q8_splitk: CudaFunction,
+    pub gemv_q8_global_splitk: CudaFunction,
     pub gemv_splitk_reduce: CudaFunction,
     /// Fused dual single-token GEMV for Q5_0 (Q+K or gate+up; stage x once).
     pub gemv_q5_qk: CudaFunction,
@@ -81,9 +118,21 @@ pub struct Kernels {
     pub gemv_q4_pair: CudaFunction,
     pub gemv_q4_dual: CudaFunction,
     pub gemv_q4_ffn: CudaFunction,
+    pub gemv_q4_ffn_8way: CudaFunction,
+    pub gemv_q4_ffn_mcol: CudaFunction,
+    #[allow(dead_code)]
+    pub gemv_q4_ffn_smem: CudaFunction,
     pub gemv_q4_dual_threads: u32,
     pub gemv_quantized_warps: u32,
     pub gemv_q4_qkv: CudaFunction,
+    pub gemv_q8_qkv: CudaFunction,
+    pub gemv_q8_gdn_4way: CudaFunction,
+    pub gemv_hybrid_gdn_4way: CudaFunction,
+    pub gemv_q8_qkv_splitk: CudaFunction,
+    pub gemv_q8_gdn_4way_splitk: CudaFunction,
+    pub gemv_hybrid_gdn_4way_splitk: CudaFunction,
+    pub gemv_splitk_reduce_qkv: CudaFunction,
+    pub gemv_splitk_reduce_gdn_4way: CudaFunction,
     pub gemm_q4: CudaFunction,
     pub gemm_q5: CudaFunction,
     pub gemm_q5k: CudaFunction,
@@ -112,6 +161,39 @@ pub struct Kernels {
     pub rope_d: CudaFunction,
     pub qk_norm_rope: CudaFunction,
     pub qk_norm_rope_d: CudaFunction,
+    pub qk_norm_partial_rope: CudaFunction,
+    pub qk_norm_partial_rope_d: CudaFunction,
+    #[allow(dead_code)]
+    pub sigmoid: CudaFunction,
+    #[allow(dead_code)]
+    pub softplus_bias_scale: CudaFunction,
+    #[allow(dead_code)]
+    pub softplus_bias_scale_rows: CudaFunction,
+    pub gdn_prep_decay_beta: CudaFunction,
+    pub copy_f32: CudaFunction,
+    #[allow(dead_code)]
+    pub exp_f: CudaFunction,
+    pub l2_norm_heads: CudaFunction,
+    pub gated_rms_norm: CudaFunction,
+    pub split_q_gate: CudaFunction,
+    pub mul_sigmoid: CudaFunction,
+    pub causal_conv1d: CudaFunction,
+    pub causal_conv1d_one: CudaFunction,
+    pub gated_delta_seq: CudaFunction,
+    pub gated_delta_one: CudaFunction,
+    /// Fused decode: conv1d + SiLU + split Q/K/V + L2(Q,K).
+    pub gdn_conv_qkvl2_one: CudaFunction,
+    /// Fused decode: prep(α,β) + delta rule + gated RMSNorm.
+    pub gdn_delta_gated_one: CudaFunction,
+    /// d_state==128 specialized variant.
+    pub gdn_delta_gated_one_d128: CudaFunction,
+    /// Prefill: split conv buffer + L2(Q,K) in one launch.
+    pub gdn_split_l2_seq: CudaFunction,
+    /// Prefill: delta rule + gated RMSNorm (token-serial, head-parallel).
+    pub gdn_delta_gated_seq: CudaFunction,
+    pub split_qkv_conv: CudaFunction,
+    pub split_qkv_l2_one: CudaFunction,
+    pub zero_f32: CudaFunction,
     /// Attention symbols from [`crate::cuda::decode::REGISTRY`] (CUDA name → fn).
     pub attn: HashMap<&'static str, CudaFunction>,
     pub copy_kv: CudaFunction,

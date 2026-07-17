@@ -49,11 +49,32 @@ impl ChatMessage {
     }
 }
 
+/// Qwen3 / Qwen3.5 generation-prompt suffix for thinking vs non-thinking.
+///
+/// Matches the official chat template:
+/// - thinking on:  `<|im_start|>assistant\n<think>\n`  (model fills reasoning)
+/// - thinking off: `<|im_start|>assistant\n<think>\n\n</think>\n\n` (skip think)
+pub fn assistant_generation_prompt(enable_thinking: bool) -> &'static str {
+    if enable_thinking {
+        "<|im_start|>assistant\n<think>\n"
+    } else {
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    }
+}
+
 /// Build a Qwen2 / ChatML prompt from OpenAI-style messages.
 ///
-/// Ends with `<|im_start|>assistant\n` so the model continues as assistant.
-/// If there is no system message, a default is injected when `default_system` is set.
-pub fn format_chatml(messages: &[ChatMessage], default_system: Option<&str>) -> String {
+/// Ends with the Qwen3.5 assistant generation prompt (see
+/// [`assistant_generation_prompt`]). If there is no system message, a default
+/// is injected when `default_system` is set.
+///
+/// `enable_thinking` selects thinking vs non-thinking mode (Qwen3.5 small
+/// models default to non-thinking).
+pub fn format_chatml(
+    messages: &[ChatMessage],
+    default_system: Option<&str>,
+    enable_thinking: bool,
+) -> String {
     let has_system = messages.iter().any(|m| m.role == ChatRole::System);
     let mut out = String::new();
 
@@ -79,7 +100,7 @@ pub fn format_chatml(messages: &[ChatMessage], default_system: Option<&str>) -> 
         .map(|m| m.role != ChatRole::Assistant)
         .unwrap_or(true)
     {
-        out.push_str("<|im_start|>assistant\n");
+        out.push_str(assistant_generation_prompt(enable_thinking));
     }
 
     out
@@ -92,9 +113,17 @@ mod tests {
     #[test]
     fn chatml_injects_default_system() {
         let msgs = [ChatMessage::user("hi")];
-        let s = format_chatml(&msgs, Some("You are helpful."));
+        let s = format_chatml(&msgs, Some("You are helpful."), false);
         assert!(s.starts_with("<|im_start|>system\nYou are helpful."));
         assert!(s.contains("<|im_start|>user\nhi"));
-        assert!(s.ends_with("<|im_start|>assistant\n"));
+        assert!(s.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn chatml_thinking_opens_think_block() {
+        let msgs = [ChatMessage::user("hi")];
+        let s = format_chatml(&msgs, None, true);
+        assert!(s.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(!s.contains("</think>"));
     }
 }
