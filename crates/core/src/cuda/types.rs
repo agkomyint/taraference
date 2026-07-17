@@ -129,6 +129,10 @@ pub struct Kernels {
     pub gemv_q4_0_global: CudaFunction,
     /// Packed MoE expert GEMV for Q4_0.
     pub gemv_q4_0_expert_slot: CudaFunction,
+    pub gemv_q4_0_expert_gate_up: CudaFunction,
+    pub gemv_q4_0_expert_down_scale: CudaFunction,
+    pub gemv_q8_expert_gate_up: CudaFunction,
+    pub gemv_q8_expert_down_scale: CudaFunction,
     pub gemv_q4_splitk: CudaFunction,
     pub gemv_q4_global_splitk: CudaFunction,
     pub gemv_q5_splitk: CudaFunction,

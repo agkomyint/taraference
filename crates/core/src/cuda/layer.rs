@@ -1462,26 +1462,34 @@ impl CudaModel {
                 })?;
         }
 
-        let (n_experts, top_k, expert_ff, gate_col_bytes, up_col_bytes, down_col_bytes) =
+        let (n_experts, mut top_k, expert_ff, gate_col_bytes, down_col_bytes, is_q4) =
             match &self.layers[li].ffn {
                 super::types::LayerFfn::Moe(m) => (
                     m.n_experts,
                     m.top_k,
                     m.expert_ff,
                     m.gate_all.col_bytes,
-                    m.up_all.col_bytes,
                     m.down_all.col_bytes,
+                    m.gate_all.wtype == super::types::WType::Q4_0,
                 ),
                 _ => unreachable!(),
             };
+        // Speed ladder (still real router, not fixed experts):
+        //   TARAFER_MOE_TOPK=1  → ~half expert BW (recommended for 750 on laptop)
+        //   TARAFER_SPEED=1     → same as topk=1
+        if let Ok(v) = std::env::var("TARAFER_MOE_TOPK") {
+            if let Ok(k) = v.parse::<usize>() {
+                top_k = k.clamp(1, n_experts);
+            }
+        } else if std::env::var_os("TARAFER_SPEED").is_some() {
+            top_k = 1;
+        }
         let n_exp_i = n_experts as i32;
         let n_embd_i = d.n_embd;
         let top_k_i = top_k as i32;
         let expert_ff_i = expert_ff as i32;
         let gate_cb = gate_col_bytes as i32;
-        let up_cb = up_col_bytes as i32;
         let down_cb = down_col_bytes as i32;
-        let zero_res = 0i32;
 
         // Device router top-k → moe_idx / moe_w (no host sync; CUDA-graph safe).
         {
@@ -1521,7 +1529,8 @@ impl CudaModel {
             )?;
         }
 
-        let warps = self.k.gemv_quantized_warps.max(1);
+        // Fat blocks for expert GEMVs (1536 cols → fewer launches, high occupancy).
+        let warps = if is_q4 { 32u32 } else { self.k.gemv_quantized_warps.max(1) };
         let threads = warps * 32;
         let grid_gate = ((expert_ff as u32) + warps - 1) / warps;
         let grid_down = ((d.n_embd_u as u32) + warps - 1) / warps;
@@ -1540,61 +1549,39 @@ impl CudaModel {
             let up_all = unsafe { &*up_all };
             let down_all = unsafe { &*down_all };
 
-            let expert_slot_k = match gate_all.wtype {
-                super::types::WType::Q4_0 => &self.k.gemv_q4_0_expert_slot,
-                _ => &self.k.gemv_q8_expert_slot,
+            let gate_up_k = if is_q4 {
+                &self.k.gemv_q4_0_expert_gate_up
+            } else {
+                &self.k.gemv_q8_expert_gate_up
             };
-            // gate
+            let down_scale_k = if is_q4 {
+                &self.k.gemv_q4_0_expert_down_scale
+            } else {
+                &self.k.gemv_q8_expert_down_scale
+            };
+
+            // Fused gate+up+SiLU → hb (hb2 unused placeholder for ABI)
             unsafe {
                 self.stream
-                    .launch_builder(expert_slot_k)
+                    .launch_builder(gate_up_k)
                     .arg(&gate_all.data)
-                    .arg(&self.q8_x)
-                    .arg(&self.q8_d)
-                    .arg(&mut self.hb)
-                    .arg(&self.moe_idx)
-                    .arg(&slot_i)
-                    .arg(&n_embd_i)
-                    .arg(&expert_ff_i)
-                    .arg(&gate_cb)
-                    .arg(&zero_res)
-                    .arg(&self.xb) // unused residual
-                    .launch(LaunchConfig {
-                        grid_dim: (grid_gate, 1, 1),
-                        block_dim: (threads, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
-            }
-            // up
-            unsafe {
-                self.stream
-                    .launch_builder(expert_slot_k)
                     .arg(&up_all.data)
                     .arg(&self.q8_x)
                     .arg(&self.q8_d)
+                    .arg(&mut self.hb)
                     .arg(&mut self.hb2)
                     .arg(&self.moe_idx)
                     .arg(&slot_i)
                     .arg(&n_embd_i)
                     .arg(&expert_ff_i)
-                    .arg(&up_cb)
-                    .arg(&zero_res)
-                    .arg(&self.xb)
+                    .arg(&gate_cb)
                     .launch(LaunchConfig {
                         grid_dim: (grid_gate, 1, 1),
                         block_dim: (threads, 1, 1),
                         shared_mem_bytes: 0,
                     })?;
             }
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.silu_mul)
-                    .arg(&mut self.hb)
-                    .arg(&self.hb2)
-                    .arg(&expert_ff_i)
-                    .launch(LaunchConfig::for_num_elems(expert_ff as u32))?;
-            }
-            // Quantize hb for down (n_rows = expert_ff).
+            // Quantize silu*up (hb) for down.
             {
                 use super::matmul::quantize_q8;
                 quantize_q8(
@@ -1606,40 +1593,25 @@ impl CudaModel {
                     expert_ff_i,
                 )?;
             }
-            let down_slot_k = match down_all.wtype {
-                super::types::WType::Q4_0 => &self.k.gemv_q4_0_expert_slot,
-                _ => &self.k.gemv_q8_expert_slot,
-            };
+            // Fused down + residual scale-add
             unsafe {
                 self.stream
-                    .launch_builder(down_slot_k)
+                    .launch_builder(down_scale_k)
                     .arg(&down_all.data)
                     .arg(&self.q8_x)
                     .arg(&self.q8_d)
-                    .arg(&mut self.xb2)
+                    .arg(&mut self.x)
                     .arg(&self.moe_idx)
+                    .arg(&self.moe_w)
                     .arg(&slot_i)
                     .arg(&expert_ff_i)
                     .arg(&n_embd_i)
                     .arg(&down_cb)
-                    .arg(&zero_res)
-                    .arg(&self.xb)
                     .launch(LaunchConfig {
                         grid_dim: (grid_down, 1, 1),
                         block_dim: (threads, 1, 1),
                         shared_mem_bytes: 0,
                     })?;
-            }
-            let n = d.n_embd;
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.scale_add_slot)
-                    .arg(&mut self.x)
-                    .arg(&self.xb2)
-                    .arg(&self.moe_w)
-                    .arg(&slot_i)
-                    .arg(&n)
-                    .launch(LaunchConfig::for_num_elems(d.n_embd_u as u32))?;
             }
         }
         Ok(())

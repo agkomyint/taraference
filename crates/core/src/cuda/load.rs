@@ -317,6 +317,12 @@ impl CudaModel {
             gemv_q4_0: module.load_function("gemv_q4_0")?,
             gemv_q4_0_global: module.load_function("gemv_q4_0_global")?,
             gemv_q4_0_expert_slot: module.load_function("gemv_q4_0_global_expert_slot")?,
+            gemv_q4_0_expert_gate_up: module.load_function("gemv_q4_0_global_expert_gate_up")?,
+            gemv_q4_0_expert_down_scale: module
+                .load_function("gemv_q4_0_global_expert_down_scale")?,
+            gemv_q8_expert_gate_up: module.load_function("gemv_q8_0_global_expert_gate_up")?,
+            gemv_q8_expert_down_scale: module
+                .load_function("gemv_q8_0_global_expert_down_scale")?,
             gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
             gemv_q4_global_splitk: module.load_function("gemv_q4_k_global_splitk")?,
             gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,

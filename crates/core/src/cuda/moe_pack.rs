@@ -216,6 +216,12 @@ impl CudaModel {
             gemv_q4_0: module.load_function("gemv_q4_0")?,
             gemv_q4_0_global: module.load_function("gemv_q4_0_global")?,
             gemv_q4_0_expert_slot: module.load_function("gemv_q4_0_global_expert_slot")?,
+            gemv_q4_0_expert_gate_up: module.load_function("gemv_q4_0_global_expert_gate_up")?,
+            gemv_q4_0_expert_down_scale: module
+                .load_function("gemv_q4_0_global_expert_down_scale")?,
+            gemv_q8_expert_gate_up: module.load_function("gemv_q8_0_global_expert_gate_up")?,
+            gemv_q8_expert_down_scale: module
+                .load_function("gemv_q8_0_global_expert_down_scale")?,
             gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
             gemv_q4_global_splitk: module.load_function("gemv_q4_k_global_splitk")?,
             gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,
@@ -378,12 +384,41 @@ impl CudaModel {
             Ok(stream.clone_htod(&v)?)
         };
 
-        let token_embd = upload_mat("token_embd")?;
+        let mut token_embd = upload_mat("token_embd")?;
         let output_norm = upload_f32_vec("output_norm.f32", cfg.n_embd)?;
         // Tied embeddings: no separate output head.
         let output = None;
         let output_special = None;
         let output_special_id = None;
+        // Vocab head shortlist for 750 path (full vocab: TARAFER_FULL_VOCAB=1).
+        // Default 8192 on speed packs (top_k=1 or mode contains "speed").
+        let speed_pack = meta.router_top_k <= 1
+            || meta
+                .mode
+                .as_deref()
+                .map(|m| m.contains("speed"))
+                .unwrap_or(false);
+        let vocab_limit = if std::env::var_os("TARAFER_FULL_VOCAB").is_some() {
+            None
+        } else {
+            std::env::var("TARAFER_VOCAB_LIMIT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| {
+                    if std::env::var_os("TARAFER_SPEED").is_some() || speed_pack {
+                        Some(8_192)
+                    } else {
+                        None
+                    }
+                })
+        };
+        if let Some(limit) = vocab_limit.filter(|&n| n >= 1024 && n < cfg.n_vocab) {
+            token_embd.n_cols = limit;
+            eprintln!(
+                "approximation | active_vocab={limit}/{} (MoE 750 shortlist; TARAFER_FULL_VOCAB=1 for full)",
+                cfg.n_vocab
+            );
+        }
 
         let pack_experts = |kind: &str,
                             n_rows: usize,
