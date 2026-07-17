@@ -17,25 +17,25 @@ decode, CUDA graphs, and dynamic NVRTC `sm_XX` targeting.
 
 ---
 
-## Fast install (recommended) — prebuilt Linux binary
+## Fast install (recommended) — prebuilt binary
 
-**Use this if you want first inference ASAP** (Lightning Studio, cloud SSH, Ubuntu GPU box, etc.).
+**Use this if you want first inference ASAP** (Lightning Studio, cloud SSH, Ubuntu GPU box, Windows NVIDIA PC, etc.).
 
-You **do not** need Rust, Cargo, or a local compile. CI ships a ready Linux binary on every version tag.
+You **do not** need Rust, Cargo, or a local compile. CI ships ready **Linux** and **Windows** x86_64 binaries on every version tag.
 
 ### What you need (runtime only)
 
 | Requirement | Notes |
 |-------------|--------|
-| **OS** | Linux **x86_64** (Ubuntu 22.04-class is what we build on) |
+| **OS** | Linux **x86_64** (Ubuntu 22.04-class) or Windows **x86_64** |
 | **GPU** | NVIDIA (T4, 3050 Ti, A10, …). Arch is detected at load (`sm_75`, `sm_86`, …) |
 | **Driver** | `nvidia-smi` works |
 | **CUDA toolkit 13.x** | Must include **NVRTC** (runtime kernel compile). Many cloud images already have this |
 | **Disk** | ~10 MB binary + ~380 MB for the 0.5B model (or ~2 GB for 3B) |
 
-Windows / macOS: use [Install from source](#install-from-source) for now (no prebuilt yet).
+macOS: use [Install from source](#install-from-source) for now (no prebuilt yet).
 
-### One-liner install + chat (on PATH)
+### One-liner install + chat (Linux, on PATH)
 
 ```bash
 # 1) download binary (~seconds)
@@ -51,6 +51,17 @@ chmod +x tarafer
 # 3) model + run
 tarafer --download 0.5b
 tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+```
+
+### One-liner install + chat (Windows)
+
+```powershell
+Invoke-WebRequest -Uri "https://github.com/agkomyint/taraference/releases/latest/download/tarafer-windows-x86_64.zip" -OutFile tarafer-windows-x86_64.zip
+Expand-Archive .\tarafer-windows-x86_64.zip -DestinationPath .
+.\tarafer.exe install
+# if needed:  $env:Path += ";$env:USERPROFILE\.local\bin"
+.\tarafer.exe --download 0.5b
+.\tarafer.exe models\Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
 ```
 
 Interactive chat: type messages, `/reset`, `/quit`.  
@@ -113,8 +124,10 @@ Release assets (see [Releases](https://github.com/agkomyint/taraference/releases
 
 | Asset | Purpose |
 |-------|---------|
-| `tarafer-linux-x86_64.tar.gz` | Packed binary (use this) |
-| `tarafer` | Same binary, unpacked |
+| `tarafer-linux-x86_64.tar.gz` | Linux packed binary (use this) |
+| `tarafer` | Linux binary, unpacked |
+| `tarafer-windows-x86_64.zip` | Windows packed binary (use this) |
+| `tarafer.exe` | Windows binary, unpacked |
 | `*.sha256` | Checksums |
 
 | Command | What it does |
@@ -137,7 +150,7 @@ Release assets (see [Releases](https://github.com/agkomyint/taraference/releases
 
 ## Install from source
 
-Use this to **develop** kernels, change code, or run on **Windows**.
+Use this to **develop** kernels, change code, or when no prebuilt matches your OS.
 
 ```powershell
 # Windows

@@ -29,7 +29,8 @@ Commands (no model path required):
   tarafer install             Copy tarafer to ~/.local/bin (add to PATH)
 
 Fast path on a new Linux GPU box:
-  curl -fsSL .../tarafer-linux-x86_64.tar.gz | tar xz
+  # Linux:  tarafer-linux-x86_64.tar.gz
+  # Windows: tarafer-windows-x86_64.zip  →  tarafer.exe
   ./tarafer install
   tarafer --download 0.8b
   tarafer --download 4b          # Qwen3.5-4B Q4_K_M
@@ -104,7 +105,7 @@ fn main() -> Result<()> {
                 // Optional: tarafer update --install  → also land in ~/.local/bin
                 let also_install = argv.iter().any(|a| a == "--install" || a == "install");
                 if also_install {
-                    let dest = self_update::default_install_dir()?.join("tarafer");
+                    let dest = self_update::default_install_dir()?.join(self_update::bin_name());
                     self_update::self_update(tag, Some(dest))?;
                 } else {
                     self_update::self_update(tag, None)?;

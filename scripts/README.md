@@ -59,4 +59,4 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-CI builds `tarafer-linux-x86_64.tar.gz` and attaches it to the GitHub Release.
+CI builds `tarafer-linux-x86_64.tar.gz` and `tarafer-windows-x86_64.zip` (plus raw binaries + checksums) and attaches them to the GitHub Release.
