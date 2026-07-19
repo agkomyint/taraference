@@ -3,11 +3,12 @@
 use super::decode::{find_by_name, AttnLaunch};
 use super::kv::CudaKv;
 use super::matmul::{
-    gemm, gemv, launch_gemv_q4_0_qkv, try_gemv_gdn_4way, try_gemv_global_q8, try_gemv_pair,
-    try_gemv_q4_dual, try_gemv_q4_ffn, try_gemv_qkv, GemvResidual,
+    gemm, gemv, launch_gemv_q4_0_qkv, try_gemv_gdn_4way, try_gemv_global_q8,
+    try_gemv_prequantized_q8, try_gemv_pair, try_gemv_q4_dual, try_gemv_q4_ffn,
+    try_gemv_qkv, GemvResidual,
 };
 use super::model::CudaModel;
-use super::types::{FullAttnWeights, LayerAttn, LinearAttnWeights};
+use super::types::{FullAttnWeights, LayerAttn, LinearAttnWeights, WType};
 use anyhow::Result;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
@@ -1612,11 +1613,18 @@ impl CudaModel {
             && std::env::var_os("TARAFER_MOE_CLASSIC").is_none()
             && !use_q4_4w
             && !use_q4_2w;
-        // Short K (n_blocks < 32): 1 warp/col maximizes CTA count (latency-bound on laptop).
-        // Tall K: more warps amortize. Override with TARAFER_GEMV_WARPS.
+        // Short-K MoE (d=640 → 20 Q4 blocks): use multi-column CTAs so Q8 activation
+        // staging in smem is amortized. Four columns/CTA measured best on sm_86 for
+        // the 100M-active flagship shape; eight slightly reduces occupancy.
+        // Tall K: fewer warps still fill SMs. Override with TARAFER_GEMV_WARPS.
         let n_blocks_gate = (d.n_embd_u / 32).max(1);
-        let default_warps = if n_blocks_gate < 32 { 1u32 } else { 4u32 };
-        let warps = std::env::var("TARAFER_GEMV_WARPS")
+        let default_warps = if n_blocks_gate < 32 {
+            4u32
+        } else {
+            4u32
+        };
+        let warps = std::env::var("TARAFER_MOE_WARPS")
+            .or_else(|_| std::env::var("TARAFER_GEMV_WARPS"))
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&w: &u32| (1..=32).contains(&w))
@@ -1624,6 +1632,24 @@ impl CudaModel {
         let threads = warps * 32;
         let grid_gate = ((expert_ff as u32) + warps - 1) / warps;
         let grid_down = ((d.n_embd_u as u32) + warps - 1) / warps;
+        // Activation staging smem for classic Q4 expert kernels (xq + scales).
+        let gate_act_smem = {
+            let n = d.n_embd_u;
+            let off = (n + 3) & !3;
+            (off + (n / 32) * 4) as u32
+        };
+        let down_act_smem = {
+            let n = expert_ff;
+            let off = (n + 3) & !3;
+            (off + (n / 32) * 4) as u32
+        };
+        // The activation is tiny and cache-hot across CTAs. Direct reads beat the
+        // per-CTA copy+barrier on sm_86; retain staging only for architecture A/B.
+        let stage_act_i = if std::env::var_os("TARAFER_MOE_SMEM").is_some() {
+            1i32
+        } else {
+            0i32
+        };
 
         for slot in 0..top_k {
             let slot_i = slot as i32;
@@ -1859,14 +1885,16 @@ impl CudaModel {
                         .arg(&expert_ff_i)
                         .arg(&n_embd_i)
                         .arg(&down_cb)
+                        .arg(&stage_act_i)
                         .launch(LaunchConfig {
                             grid_dim: (grid_down, 1, 1),
                             block_dim: (threads, 1, 1),
-                            shared_mem_bytes: 0,
+                            shared_mem_bytes: if stage_act_i != 0 { down_act_smem } else { 0 },
                         })?;
                 }
             } else {
-                // Classic: max CTA fill on short-K. Separate quantize once (don't re-quant per CTA).
+                // Classic: max CTA fill on short-K. Read the cache-hot Q8 activation
+                // directly by default; optional TARAFER_MOE_SMEM stages per CTA.
                 let gate_up_k = if is_q4 {
                     &self.k.gemv_q4_0_expert_gate_up
                 } else {
@@ -1877,6 +1905,8 @@ impl CudaModel {
                 } else {
                     &self.k.gemv_q8_expert_down_scale
                 };
+                let gate_smem = if is_q4 { gate_act_smem } else { 0 };
+                let down_smem = if is_q4 { down_act_smem } else { 0 };
                 unsafe {
                     self.stream
                         .launch_builder(gate_up_k)
@@ -1891,10 +1921,11 @@ impl CudaModel {
                         .arg(&n_embd_i)
                         .arg(&expert_ff_i)
                         .arg(&gate_cb)
+                        .arg(&stage_act_i)
                         .launch(LaunchConfig {
                             grid_dim: (grid_gate, 1, 1),
                             block_dim: (threads, 1, 1),
-                            shared_mem_bytes: 0,
+                            shared_mem_bytes: if stage_act_i != 0 { gate_smem } else { 0 },
                         })?;
                 }
                 {
@@ -1921,10 +1952,11 @@ impl CudaModel {
                         .arg(&expert_ff_i)
                         .arg(&n_embd_i)
                         .arg(&down_cb)
+                        .arg(&stage_act_i)
                         .launch(LaunchConfig {
                             grid_dim: (grid_down, 1, 1),
                             block_dim: (threads, 1, 1),
-                            shared_mem_bytes: 0,
+                            shared_mem_bytes: if stage_act_i != 0 { down_smem } else { 0 },
                         })?;
                 }
             }
@@ -2088,61 +2120,65 @@ impl CudaModel {
     }
 
     pub(crate) fn logits_from_last(&mut self, d: &ChunkDims) -> Result<()> {
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.copy_last)
-                .arg(&self.x)
-                .arg(&mut self.x1)
-                .arg(&d.n_tok)
-                .arg(&d.n_embd)
-                .launch(LaunchConfig::for_num_elems(d.n_embd_u as u32))?;
-            let one = 1i32;
-            self.stream
-                .launch_builder(&self.k.rms_norm)
-                .arg(&self.x1)
-                .arg(&self.output_norm)
-                .arg(&mut self.xb1)
-                .arg(&d.n_embd)
-                .arg(&one)
-                .arg(&d.eps)
-                .launch(LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
-        use super::matmul::try_gemv_global_q8;
-        if let Some(ref ow) = self.output {
-            if !try_gemv_global_q8(
+        let head = self.output.as_ref().unwrap_or(&self.token_embd);
+        let fused_decode_head = d.n_tok_u == 1
+            && self.output_special.is_none()
+            && matches!(head.wtype, WType::Q4_0 | WType::Q8_0);
+        if fused_decode_head {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.attn_prep)
+                    .arg(&self.x)
+                    .arg(&self.output_norm)
+                    .arg(&mut self.xb1)
+                    .arg(&mut self.q8_x)
+                    .arg(&mut self.q8_d)
+                    .arg(&d.n_embd)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            if !try_gemv_prequantized_q8(
                 &self.stream,
                 &self.k,
-                ow,
-                &self.xb1,
+                head,
+                &self.q8_x,
+                &self.q8_d,
                 &mut self.logits,
-                None,
-                GemvResidual::None,
-                &mut self.q8_x,
-                &mut self.q8_d,
-                &mut self.gemv_partial,
-                self.gemv_partial_stride,
             )? {
-                gemv(
-                    &self.stream,
-                    &self.k,
-                    ow,
-                    &self.xb1,
-                    &mut self.logits,
-                    None,
-                    GemvResidual::None,
-                    &mut self.gemv_partial,
-                    self.gemv_partial_stride,
-                )?;
+                unreachable!("fused decode head type checked above");
             }
         } else {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.copy_last)
+                    .arg(&self.x)
+                    .arg(&mut self.x1)
+                    .arg(&d.n_tok)
+                    .arg(&d.n_embd)
+                    .launch(LaunchConfig::for_num_elems(d.n_embd_u as u32))?;
+                let one = 1i32;
+                self.stream
+                    .launch_builder(&self.k.rms_norm)
+                    .arg(&self.x1)
+                    .arg(&self.output_norm)
+                    .arg(&mut self.xb1)
+                    .arg(&d.n_embd)
+                    .arg(&one)
+                    .arg(&d.eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
             if !try_gemv_global_q8(
                 &self.stream,
                 &self.k,
-                &self.token_embd,
+                head,
                 &self.xb1,
                 &mut self.logits,
                 None,
@@ -2155,7 +2191,7 @@ impl CudaModel {
                 gemv(
                     &self.stream,
                     &self.k,
-                    &self.token_embd,
+                    head,
                     &self.xb1,
                     &mut self.logits,
                     None,

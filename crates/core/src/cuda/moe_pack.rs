@@ -228,8 +228,9 @@ impl CudaModel {
             attention_head_dim: meta.head_dim,
             no_rope_layer_interval: 0,
             n_ff,
-            // Train may say 1024; small MoE KV is cheap — allow longer chat ctx.
-            // Override: TARAFER_N_CTX=8192. Floor: max(meta, 4096) unless TARAFER_STRICT_CTX=1.
+            // Product target for 100M-active MoE: solid ~500 tok/s through ctx≤1024.
+            // Default floor 1024 (not 4096) so KV/graph match the speed SKU.
+            // Longer chat: TARAFER_N_CTX=4096 (or pass --ctx). Strict: TARAFER_STRICT_CTX=1.
             n_ctx: {
                 let env_ctx = std::env::var("TARAFER_N_CTX")
                     .ok()
@@ -238,7 +239,8 @@ impl CudaModel {
                 if std::env::var_os("TARAFER_STRICT_CTX").is_some() {
                     env_ctx.unwrap_or(meta.n_ctx)
                 } else {
-                    env_ctx.unwrap_or(meta.n_ctx.max(4096))
+                    // Product default: at least 1024 (500 tok/s band), no forced 4k floor.
+                    env_ctx.unwrap_or(meta.n_ctx.max(1024))
                 }
             },
             rope_theta: meta.rope_theta,
@@ -440,16 +442,19 @@ impl CudaModel {
             embed_q5k: module.load_function("embed_q5_k")?,
             embed_q6: module.load_function("embed_q6_k")?,
             embed_q8: module.load_function("embed_q8_0")?,
+            embed_q4_0: module.load_function("embed_q4_0")?,
             embed_q4_one: module.load_function("embed_q4_k_one")?,
             embed_q5_one: module.load_function("embed_q5_0_one")?,
             embed_q5k_one: module.load_function("embed_q5_k_one")?,
             embed_q6_one: module.load_function("embed_q6_k_one")?,
             embed_q8_one: module.load_function("embed_q8_0_one")?,
+            embed_q4_0_one: module.load_function("embed_q4_0_one")?,
             embed_q4_one_d: module.load_function("embed_q4_k_one_d")?,
             embed_q5_one_d: module.load_function("embed_q5_0_one_d")?,
             embed_q5k_one_d: module.load_function("embed_q5_k_one_d")?,
             embed_q6_one_d: module.load_function("embed_q6_k_one_d")?,
             embed_q8_one_d: module.load_function("embed_q8_0_one_d")?,
+            embed_q4_0_one_d: module.load_function("embed_q4_0_one_d")?,
             rms_norm: module.load_function("rms_norm_f32")?,
             moe_ffn_prep: module.load_function("moe_ffn_prep_rms_router_quant")?,
             attn_prep: module.load_function("attn_prep_rms_quant")?,
@@ -771,7 +776,10 @@ impl CudaModel {
             cfg.router_top_k,
             cfg.n_experts
         );
-        eprintln!("weights | Q8_0 pack on device (tied embd, no separate output head)");
+        eprintln!(
+            "weights | {:?} tied embedding/head on device (no separate output head)",
+            token_embd.wtype
+        );
         ctx.synchronize().context("ctx sync after load")?;
         eprintln!(
             "ready | decode={} | MoE device top-k (packed experts, graph-ready)",

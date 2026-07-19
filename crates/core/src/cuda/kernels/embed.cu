@@ -1,6 +1,53 @@
 // Decode embed: token id as kernel arg (no H→D buffer).
 // *_one_d variants read token from device memory (CUDA-graph safe).
 
+extern "C" __global__ void embed_q4_0_one(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    int token,
+    int n_rows,
+    int col_bytes
+) {
+    const unsigned char* col = table + (size_t)token * (size_t)col_bytes;
+    const int nb = n_rows / 32;
+    for (int bi = (int)threadIdx.x; bi < nb; bi += (int)blockDim.x) {
+        const unsigned char* base = col + bi * q4_0_block_bytes(n_rows, col_bytes);
+        const float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const unsigned char* qs = base + (q4_0_block_bytes(n_rows, col_bytes) >= 32 ? 4 : 2);
+        const int yo = bi * 32;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const unsigned char q = qs[j];
+            out[yo + j] = d * (float)((int)(q & 0x0f) - 8);
+            out[yo + 16 + j] = d * (float)((int)(q >> 4) - 8);
+        }
+    }
+}
+
+extern "C" __global__ void embed_q4_0_one_d(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    const int* __restrict__ token_ptr,
+    int n_rows,
+    int col_bytes
+) {
+    const int token = token_ptr[0];
+    const unsigned char* col = table + (size_t)token * (size_t)col_bytes;
+    const int nb = n_rows / 32;
+    for (int bi = (int)threadIdx.x; bi < nb; bi += (int)blockDim.x) {
+        const unsigned char* base = col + bi * q4_0_block_bytes(n_rows, col_bytes);
+        const float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const unsigned char* qs = base + (q4_0_block_bytes(n_rows, col_bytes) >= 32 ? 4 : 2);
+        const int yo = bi * 32;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const unsigned char q = qs[j];
+            out[yo + j] = d * (float)((int)(q & 0x0f) - 8);
+            out[yo + 16 + j] = d * (float)((int)(q >> 4) - 8);
+        }
+    }
+}
+
 extern "C" __global__ void embed_q4_k_one(
     const unsigned char* __restrict__ table,
     float* __restrict__ out,
@@ -197,6 +244,34 @@ extern "C" __global__ void embed_q5_k_one_d(
 }
 
 // Prefill embed: one block per token, warp dequants column into out[t*n_rows]
+extern "C" __global__ void embed_q4_0(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    const int* __restrict__ tokens,
+    int n_tok,
+    int n_rows,
+    int col_bytes
+) {
+    const int t = (int)blockIdx.x;
+    if (t >= n_tok) return;
+    const int token = tokens[t];
+    const unsigned char* col = table + (size_t)token * (size_t)col_bytes;
+    float* dst = out + (size_t)t * (size_t)n_rows;
+    const int nb = n_rows / 32;
+    for (int bi = (int)threadIdx.x; bi < nb; bi += (int)blockDim.x) {
+        const unsigned char* base = col + bi * q4_0_block_bytes(n_rows, col_bytes);
+        const float d = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const unsigned char* qs = base + (q4_0_block_bytes(n_rows, col_bytes) >= 32 ? 4 : 2);
+        const int yo = bi * 32;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const unsigned char q = qs[j];
+            dst[yo + j] = d * (float)((int)(q & 0x0f) - 8);
+            dst[yo + 16 + j] = d * (float)((int)(q >> 4) - 8);
+        }
+    }
+}
+
 extern "C" __global__ void embed_q4_k(
     const unsigned char* __restrict__ table,
     float* __restrict__ out,

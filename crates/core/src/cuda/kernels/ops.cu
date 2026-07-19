@@ -513,6 +513,40 @@ __device__ __forceinline__ float kv_load(
         cache[(size_t)t * (size_t)stride + (size_t)kv_h * (size_t)head_dim + d]);
 }
 
+/// Base pointer to KV head row at time t (f16 elements).
+__device__ __forceinline__ const unsigned short* kv_row_ptr(
+    const unsigned short* __restrict__ cache,
+    int t, int stride, int kv_h, int head_dim
+) {
+    return cache + (size_t)t * (size_t)stride + (size_t)kv_h * (size_t)head_dim;
+}
+
+/// Q·K for one time step: 4-wide f16 loads when head_dim % 4 == 0 (Tara MoE hd=80).
+__device__ __forceinline__ float kv_dot_q(
+    const float* __restrict__ qh,
+    const unsigned short* __restrict__ cache,
+    int t, int stride, int kv_h, int head_dim
+) {
+    const unsigned short* row = kv_row_ptr(cache, t, stride, kv_h, head_dim);
+    float dot = 0.f;
+    if ((head_dim & 3) == 0) {
+        #pragma unroll 4
+        for (int d = 0; d < head_dim; d += 4) {
+            // Coalesced-friendly sequential half loads along head dim.
+            float k0 = half_to_float(row[d]);
+            float k1 = half_to_float(row[d + 1]);
+            float k2 = half_to_float(row[d + 2]);
+            float k3 = half_to_float(row[d + 3]);
+            dot += qh[d] * k0 + qh[d + 1] * k1 + qh[d + 2] * k2 + qh[d + 3] * k3;
+        }
+    } else {
+        #pragma unroll 8
+        for (int d = 0; d < head_dim; d++)
+            dot += qh[d] * half_to_float(row[d]);
+    }
+    return dot;
+}
+
 extern "C" __global__ void argmax_f32(
     const float* __restrict__ x,
     int n,

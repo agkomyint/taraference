@@ -115,6 +115,11 @@ async fn chat_completions(
     let last_user = last_user_preview(&req.messages);
     let max_tokens = req.max_tokens.or(req.max_completion_tokens);
     let stream = req.stream.unwrap_or(false);
+    let temperature = req.temperature.unwrap_or(0.0);
+    let top_p = req.top_p.unwrap_or(1.0);
+    let top_k = req.top_k.unwrap_or(256);
+    let repetition_penalty = req.repetition_penalty.unwrap_or(1.0);
+    let seed = req.seed.unwrap_or(42);
     // One process = one GGUF; request `model` is ignored (always the loaded weights).
     let served_id = {
         let eng = state.engine.lock().expect("engine lock");
@@ -144,7 +149,10 @@ async fn chat_completions(
     };
 
     if stream {
-        return stream_chat(state, messages, max_tokens, served_id, t_req).into_response();
+        return stream_chat(
+            state, messages, max_tokens, served_id, t_req, temperature, top_p,
+            top_k, repetition_penalty, seed,
+        ).into_response();
     }
 
     // Non-streaming: GPU work off the async worker.
@@ -157,7 +165,16 @@ async fn chat_completions(
         }
         let model_id = eng.model_id.clone();
         let gen = Instant::now();
-        let stats = eng.chat_completion(&messages, max_tokens)?;
+        let stats = eng.chat_completion_stream_sampled(
+            &messages,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            seed,
+            |_| {},
+        )?;
         let gen_ms = gen.elapsed().as_secs_f64() * 1000.0;
         Ok::<_, anyhow::Error>((model_id, stats, gen_ms, lock_ms))
     })
@@ -227,6 +244,11 @@ fn stream_chat(
     max_tokens: Option<usize>,
     model_id: String,
     t_req: Instant,
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    repetition_penalty: f32,
+    seed: u64,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
     let id = format!("chatcmpl-{}", Uuid::new_v4());
@@ -287,7 +309,15 @@ fn stream_chat(
 
         let gen = Instant::now();
         let mut streamed_chars = 0usize;
-        let result = eng.chat_completion_stream(&messages, max_tokens, |piece| {
+        let result = eng.chat_completion_stream_sampled(
+            &messages,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            seed,
+            |piece| {
             streamed_chars += piece.len();
             let chunk = ChatCompletionChunk {
                 id: id.clone(),
@@ -306,7 +336,8 @@ fn stream_chat(
             if let Ok(s) = serde_json::to_string(&chunk) {
                 send(s);
             }
-        });
+            },
+        );
 
         match result {
             Ok(stats) => {

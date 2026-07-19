@@ -16,13 +16,16 @@ pub struct ChatCompletionRequest {
     pub max_completion_tokens: Option<usize>,
     #[serde(default)]
     pub stream: Option<bool>,
-    // Accepted but ignored for now (greedy only).
     #[serde(default)]
-    #[allow(dead_code)]
     pub temperature: Option<f32>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -301,6 +301,48 @@ pub(crate) fn try_gemv_global_q8(
     Ok(true)
 }
 
+/// GEMV using an activation already quantized by a fused preparation kernel.
+/// Decode logits use this to avoid a second Q8 quantization launch.
+pub(crate) fn try_gemv_prequantized_q8(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    w: &GpuMat,
+    q8_x: &CudaSlice<i8>,
+    q8_d: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+) -> Result<bool> {
+    let f = match w.wtype {
+        WType::Q4_0 => &k.gemv_q4_0_global,
+        WType::Q8_0 => &k.gemv_q8_global,
+        _ => return Ok(false),
+    };
+    let n_rows = w.n_rows as i32;
+    let n_cols = w.n_cols as i32;
+    let col_bytes = w.col_bytes as i32;
+    let zero = 0i32;
+    unsafe {
+        stream
+            .launch_builder(f)
+            .arg(&w.data)
+            .arg(q8_x)
+            .arg(q8_d)
+            .arg(y)
+            .arg(&n_rows)
+            .arg(&n_cols)
+            .arg(&col_bytes)
+            .arg(&zero)
+            .arg(q8_d) // unused bias pointer
+            .arg(&zero)
+            .arg(q8_d) // unused residual pointer
+            .launch(lc_gemv_quantized(
+                w.n_cols as u32,
+                w.n_rows as u32,
+                k.gemv_quantized_warps,
+            ))?;
+    }
+    Ok(true)
+}
+
 fn gemv_baseline(
     stream: &Arc<CudaStream>,
     k: &Kernels,
@@ -1289,12 +1331,10 @@ impl CudaModel {
         self.stream.memcpy_htod(tokens, &mut self.tok_buf)?;
         let n_rows = self.token_embd.n_rows as i32;
         let col_bytes = self.token_embd.col_bytes as i32;
-        if self.token_embd.wtype == WType::Q4_0 {
-            anyhow::bail!("Q4_0 token_embd unsupported; keep embd as Q8_0 in pack");
-        }
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4,
-            WType::Q4_0 | WType::Q4_0_BM | WType::F16 => unreachable!(),
+            WType::Q4_0 => &self.k.embed_q4_0,
+            WType::Q4_0_BM | WType::F16 => unreachable!(),
             WType::Q5K => &self.k.embed_q5k,
             WType::Q5_0 => &self.k.embed_q5,
             WType::Q6K => &self.k.embed_q6,
@@ -1321,12 +1361,10 @@ impl CudaModel {
     fn embed_one(&mut self, token: i32) -> Result<()> {
         let n_rows = self.token_embd.n_rows as i32;
         let col_bytes = self.token_embd.col_bytes as i32;
-        if self.token_embd.wtype == WType::Q4_0 {
-            anyhow::bail!("Q4_0 token_embd unsupported; keep embd as Q8_0 in pack");
-        }
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4_one,
-            WType::Q4_0 | WType::Q4_0_BM | WType::F16 => unreachable!(),
+            WType::Q4_0 => &self.k.embed_q4_0_one,
+            WType::Q4_0_BM | WType::F16 => unreachable!(),
             WType::Q5K => &self.k.embed_q5k_one,
             WType::Q5_0 => &self.k.embed_q5_one,
             WType::Q6K => &self.k.embed_q6_one,
@@ -1353,12 +1391,10 @@ impl CudaModel {
     pub(crate) fn embed_one_device(&mut self) -> Result<()> {
         let n_rows = self.token_embd.n_rows as i32;
         let col_bytes = self.token_embd.col_bytes as i32;
-        if self.token_embd.wtype == WType::Q4_0 {
-            anyhow::bail!("Q4_0 token_embd unsupported; keep embd as Q8_0 in pack");
-        }
         let f = match self.token_embd.wtype {
             WType::Q4K => &self.k.embed_q4_one_d,
-            WType::Q4_0 | WType::Q4_0_BM | WType::F16 => unreachable!(),
+            WType::Q4_0 => &self.k.embed_q4_0_one_d,
+            WType::Q4_0_BM | WType::F16 => unreachable!(),
             WType::Q5K => &self.k.embed_q5k_one_d,
             WType::Q5_0 => &self.k.embed_q5_one_d,
             WType::Q6K => &self.k.embed_q6_one_d,

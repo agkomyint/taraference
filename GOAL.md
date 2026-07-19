@@ -1,5 +1,10 @@
 # Goals: fast single-stream inference and a 750 tok/s frontier
 
+> [!IMPORTANT]
+> Before using Tara 1.5 for quality claims, fix and validate the MoE prefill-routing
+> mismatch described in [PREFILL_CORRECTNESS_TODO.md](PREFILL_CORRECTNESS_TODO.md).
+> Decode tok/s alone is not a correctness result.
+
 ## North stars
 
 1. Maximize **accepted decode tokens per second for one user** on one GPU.

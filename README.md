@@ -65,6 +65,41 @@ Expand-Archive .\tarafer-windows-x86_64.zip -DestinationPath .
 ```
 
 Interactive chat: type messages, `/reset`, `/quit`.  
+
+### Tara 1.4.1 Base (custom top-2 MoE)
+
+The official Tara 1.4.1 safetensors release is supported through a dedicated
+taraference-native sparse-MoE Q4 pack. It preserves the model's trained four
+experts, top-2 routing, full 32K vocabulary, and tied embedding/output head.
+
+```powershell
+# Interactive base-model testing
+.\scripts\chat-tara-1.4.1.ps1
+
+# Alpaca SFT checkpoint (Q8 reference)
+.\scripts\chat-tara-1.4.1.ps1 -Sft
+
+# One-shot continuation
+.\scripts\chat-tara-1.4.1.ps1 -Prompt "The future of clean energy is"
+
+# Fixed-length speed test
+.\scripts\chat-tara-1.4.1.ps1 -Benchmark -N 128
+```
+
+Quality testing defaults to Q8. Pass `-Q4Fast` only for the faster base-model
+Q4 path. The Tara 1.4.1 launcher enables temperature `0.7`, top-p `0.9`, and
+repetition penalty `1.1`; pass no sampling flags to `tarafer` when measuring the
+fully GPU greedy speed path.
+
+Rebuild the pack from `D:\Tara_HQ\artifacts\release\tara1.4.1` with:
+
+```powershell
+.\scripts\export-tara-1.4.1.ps1
+```
+
+This custom architecture uses a native pack directory rather than a standard
+llama.cpp GGUF. Do not enable `TARAFER_SPEED` or force top-1 when evaluating
+quality; Tara 1.4.1 was trained with top-2 routing.
 One-shot prompt:
 
 ```bash

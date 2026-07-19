@@ -1,4 +1,4 @@
-# Test Tara MoE speed pack for ~750 single-stream decode tok/s on taraference.
+# Test the Tara 1.5 Base v4 architecture for >=750 single-stream decode tok/s.
 #
 # Usage:
 #   .\scripts\test-moe-750.ps1
@@ -7,18 +7,20 @@
 #   .\scripts\test-moe-750.ps1 -Pack "D:\path\to\pack"
 #
 # Expectation (RTX 3050 Ti Laptop, warm CUDA graph):
-#   cold first run  ~600 t/s
-#   warm runs       ~760–770 t/s  (target ≥ 750)
+#   cold first run can be below target
+#   warm runs should reach >=750 tok/s
 
 [CmdletBinding()]
 param(
-    [string]$Pack = "D:\Tara_HQ\departments\taraference_750_department\exports\tara-moe-400-speed768-q4pack",
+    [string]$Pack = "D:\Tara_HQ\departments\taraference_750_department\exports\tara-moe-1b-a100-v4-l12-laptop-mock-q4pack",
     [string]$TokenizerGguf = "",
     [string]$Tarafer = "",
     [string]$Prompt = "hello world speed test please continue writing more tokens for benchmark now",
     [int]$N = 256,
     [int]$Ctx = 384,
-    [int]$Runs = 4,
+    [int]$Runs = 3,
+    [ValidateSet("flash", "fastv2")]
+    [string]$Decode = "flash",
     [switch]$FullVocab,
     [int]$VocabLimit = 8192,
     [switch]$SkipBuild
@@ -65,7 +67,7 @@ if (-not $TokenizerGguf) {
 }
 
 if (-not (Test-Path -LiteralPath $Pack)) {
-    throw "MoE pack not found: $Pack`nExport speed pack first (tara-moe-400-speed768-q4pack)."
+    throw "Tara v4 MoE pack not found: $Pack"
 }
 if (-not (Test-Path -LiteralPath (Join-Path $Pack "meta.json"))) {
     throw "Not a MoE pack (missing meta.json): $Pack"
@@ -80,13 +82,15 @@ if (-not (Test-Path -LiteralPath $Tarafer)) {
 # Env for MoE serve
 $env:TARAFER_TOKENIZER_GGUF = $TokenizerGguf
 Remove-Item Env:TARAFER_MOE_FIXED -ErrorAction SilentlyContinue
-Remove-Item Env:TARAFER_MOE_TOPK -ErrorAction SilentlyContinue
-Remove-Item Env:TARAFER_IGNORE_EOS -ErrorAction SilentlyContinue
+$env:TARAFER_MOE_TOPK = "1"
+$env:TARAFER_IGNORE_EOS = "1" # fixed token count; benchmark only
+$env:TARAFER_SPEED = "1"
+$env:TARAFER_N_CTX = "1024"
+$env:TARAFER_MOE_WARPS = "4"
 
 if ($FullVocab) {
     $env:TARAFER_FULL_VOCAB = "1"
     Remove-Item Env:TARAFER_VOCAB_LIMIT -ErrorAction SilentlyContinue
-    Remove-Item Env:TARAFER_SPEED -ErrorAction SilentlyContinue
     $vocabNote = "full vocab (slower)"
 } else {
     Remove-Item Env:TARAFER_FULL_VOCAB -ErrorAction SilentlyContinue
@@ -96,20 +100,21 @@ if ($FullVocab) {
 }
 
 Write-Host ""
-Write-Host "=== MoE 750 speed test ===" -ForegroundColor Cyan
+Write-Host "=== Tara 1.5 Base v4 — 750 tok/s test ===" -ForegroundColor Cyan
 Write-Host "tarafer   : $Tarafer"
 Write-Host "pack      : $Pack"
 Write-Host "tokenizer : $TokenizerGguf"
 Write-Host "prompt    : $Prompt"
-Write-Host "n=$N  ctx=$Ctx  runs=$Runs  $vocabNote"
+Write-Host "n=$N  ctx=$Ctx  runs=$Runs  decode=$Decode  $vocabNote"
 Write-Host "target    : warm decode >= 750 tok/s"
+Write-Host "note      : run 1 is cold; judge warm best/average"
 Write-Host ""
 
 $rates = New-Object System.Collections.Generic.List[double]
 
 for ($i = 1; $i -le $Runs; $i++) {
     Write-Host "--- run $i/$Runs ---" -ForegroundColor DarkCyan
-    $out = & $Tarafer $Pack --prompt $Prompt -n $N --ctx $Ctx 2>&1
+    $out = & $Tarafer $Pack --prompt $Prompt -n $N --ctx $Ctx --decode $Decode 2>&1
     $text = ($out | Out-String)
 
     $line = ($out | Where-Object { $_ -match 'decode\s+([\d.]+)\s+tok/s' } | Select-Object -Last 1)

@@ -5,6 +5,7 @@
 //! - **chat** — message types + ChatML formatting (shared by CLI + server)
 
 pub mod chat;
+pub mod backend;
 pub mod config;
 pub mod cuda;
 pub mod engine;
@@ -13,6 +14,7 @@ pub mod session;
 pub mod tokenizer;
 
 pub use chat::{assistant_generation_prompt, format_chatml, ChatMessage, ChatRole};
+pub use backend::BackendKind;
 pub use config::ModelConfig;
 pub use cuda::{CudaKv, CudaModel, DecodeBackend};
 pub use engine::{EngineConfig, InferenceEngine};

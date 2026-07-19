@@ -64,12 +64,7 @@ extern "C" __global__ void attn_flash_partial(
             if (tlen > ATTN_TILE) tlen = ATTN_TILE;
 
             for (int t = tid; t < tlen; t += nt) {
-                float dot = 0.f;
-                #pragma unroll 8
-                for (int d = 0; d < head_dim; d++) {
-                    dot += qh[d] * kv_load(k_cache, t0 + t, stride, kv_h, head_dim, d);
-                }
-                scores[t] = dot * scale;
+                scores[t] = kv_dot_q(qh, k_cache, t0 + t, stride, kv_h, head_dim) * scale;
             }
             __syncthreads();
 
@@ -93,9 +88,11 @@ extern "C" __global__ void attn_flash_partial(
                 float a0 = 0.f, a1 = 0.f;
                 for (int t = 0; t < tlen; t++) {
                     float w = scores[t];
-                    a0 += w * kv_load(v_cache, t0 + t, stride, kv_h, head_dim, d0);
+                    const unsigned short* vrow =
+                        kv_row_ptr(v_cache, t0 + t, stride, kv_h, head_dim);
+                    a0 += w * half_to_float(vrow[d0]);
                     if (d1 < head_dim)
-                        a1 += w * kv_load(v_cache, t0 + t, stride, kv_h, head_dim, d1);
+                        a1 += w * half_to_float(vrow[d1]);
                 }
                 acc0 += a0;
                 acc1 += a1;
@@ -171,12 +168,7 @@ extern "C" __global__ void attn_flash_partial_d(
             if (tlen > ATTN_TILE) tlen = ATTN_TILE;
 
             for (int t = tid; t < tlen; t += nt) {
-                float dot = 0.f;
-                #pragma unroll 8
-                for (int d = 0; d < head_dim; d++) {
-                    dot += qh[d] * kv_load(k_cache, t0 + t, stride, kv_h, head_dim, d);
-                }
-                scores[t] = dot * scale;
+                scores[t] = kv_dot_q(qh, k_cache, t0 + t, stride, kv_h, head_dim) * scale;
             }
             __syncthreads();
 
@@ -200,9 +192,11 @@ extern "C" __global__ void attn_flash_partial_d(
                 float a0 = 0.f, a1 = 0.f;
                 for (int t = 0; t < tlen; t++) {
                     float w = scores[t];
-                    a0 += w * kv_load(v_cache, t0 + t, stride, kv_h, head_dim, d0);
+                    const unsigned short* vrow =
+                        kv_row_ptr(v_cache, t0 + t, stride, kv_h, head_dim);
+                    a0 += w * half_to_float(vrow[d0]);
                     if (d1 < head_dim)
-                        a1 += w * kv_load(v_cache, t0 + t, stride, kv_h, head_dim, d1);
+                        a1 += w * half_to_float(vrow[d1]);
                 }
                 acc0 += a0;
                 acc1 += a1;

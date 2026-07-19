@@ -1,6 +1,7 @@
 //! High-level inference engine: load model once, run completions.
 
 use crate::chat::{format_chatml, ChatMessage};
+use crate::backend::BackendKind;
 use crate::cuda::{CudaKv, CudaModel, DecodeBackend};
 use crate::session::{Session, SessionOptions, TurnStats};
 use crate::tokenizer::Tokenizer;
@@ -97,6 +98,8 @@ pub struct InferenceEngine {
     pub max_new: usize,
     pub default_system: String,
     pub weight_gib: f64,
+    /// Architecture-specific accelerator selected for this model.
+    pub backend_kind: BackendKind,
 }
 
 impl InferenceEngine {
@@ -114,20 +117,16 @@ impl InferenceEngine {
         let tok = Tokenizer::from_gguf(&gguf)?;
         let mut model = CudaModel::load_with(&gguf, cfg.decode)?;
         model.set_cuda_graph(cfg.cuda_graph);
-        // Hybrid Qwen3.5 on small VRAM: long max_seq + Q5→Q8 inflate leaves almost
-        // no free memory and collapses clocks. Cap default-sized contexts unless the
-        // user opts into long context.
-        let mut max_seq = cfg.max_seq.min(model.cfg.n_ctx);
-        if model.cfg.is_hybrid()
-            && weight_gib > 2.0
-            && max_seq > 1024
-            && std::env::var_os("TARAFER_LONG_CTX").is_none()
-        {
+        let backend_kind = BackendKind::from_config(&model.cfg);
+        let requested_max_seq = cfg.max_seq.min(model.cfg.n_ctx);
+        let max_seq = backend_kind.max_seq(cfg.max_seq, model.cfg.n_ctx, weight_gib);
+        if max_seq != requested_max_seq {
             eprintln!(
-                "hybrid | max_seq {max_seq} → 1024 (weights {weight_gib:.2} GiB; set TARAFER_LONG_CTX=1 to keep)"
+                "backend | {} max_seq {requested_max_seq} → {max_seq} (weights {weight_gib:.2} GiB; set TARAFER_LONG_CTX=1 to keep)",
+                backend_kind.name()
             );
-            max_seq = 1024;
         }
+        eprintln!("backend | {}", backend_kind.name());
         let kv = model.alloc_kv(max_seq)?;
         let model_id = path
             .file_stem()
@@ -150,6 +149,7 @@ impl InferenceEngine {
             max_new: cfg.max_new,
             default_system: cfg.default_system,
             weight_gib,
+            backend_kind,
         })
     }
 
@@ -180,7 +180,13 @@ impl InferenceEngine {
         }
 
         let weight_gib = dir_bytes(&path) as f64 / (1024.0 * 1024.0 * 1024.0);
-        let max_seq = cfg.max_seq.min(model.cfg.n_ctx);
+        let backend_kind = BackendKind::from_config(&model.cfg);
+        debug_assert!(matches!(
+            backend_kind,
+            BackendKind::TaraMoe | BackendKind::Tara141
+        ));
+        let max_seq = backend_kind.max_seq(cfg.max_seq, model.cfg.n_ctx, weight_gib);
+        eprintln!("backend | {}", backend_kind.name());
         let kv = model.alloc_kv(max_seq)?;
         let model_id = path
             .file_name()
@@ -188,8 +194,9 @@ impl InferenceEngine {
             .unwrap_or("tara-moe")
             .to_string();
         eprintln!(
-            "flags | cuda_graph={} | moe_device_topk=1 | decode={} | weight_gib={weight_gib:.3}",
+            "flags | cuda_graph={} | moe_device_topk={} | decode={} | weight_gib={weight_gib:.3}",
             cfg.cuda_graph,
+            model.cfg.router_top_k,
             cfg.decode.name()
         );
 
@@ -203,6 +210,7 @@ impl InferenceEngine {
             max_new: cfg.max_new,
             default_system: cfg.default_system,
             weight_gib,
+            backend_kind,
         })
     }
 
@@ -310,6 +318,46 @@ impl InferenceEngine {
             print_stream: false,
             print_stats: false,
             enable_thinking,
+            ..SessionOptions::default()
+        };
+        self.kv.clear();
+        let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);
+        session.complete_prompt_stream(&prompt, on_token)
+    }
+
+    /// Stateless sampled completion for CLI/server clients that request quality
+    /// decoding instead of the greedy benchmark path.
+    pub fn chat_completion_stream_sampled<F>(
+        &mut self,
+        messages: &[ChatMessage],
+        max_tokens: Option<usize>,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+        repetition_penalty: f32,
+        seed: u64,
+        on_token: F,
+    ) -> Result<TurnStats>
+    where
+        F: FnMut(&str),
+    {
+        if messages.is_empty() {
+            anyhow::bail!("messages must not be empty");
+        }
+        let max_new = max_tokens.unwrap_or(self.max_new).max(1);
+        let enable_thinking = false;
+        let prompt = format_chatml(messages, Some(&self.default_system), enable_thinking);
+        let opts = SessionOptions {
+            max_new,
+            system: self.default_system.clone(),
+            print_stream: false,
+            print_stats: false,
+            enable_thinking,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            seed,
         };
         self.kv.clear();
         let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);

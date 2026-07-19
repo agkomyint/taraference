@@ -15,6 +15,29 @@ fn cuda_graph_debug(message: &str) {
 }
 
 impl CudaModel {
+    /// Copy the current next-token logits to the host for quality sampling.
+    /// Greedy benchmarks keep using the device argmax path and pay no copy cost.
+    pub fn current_logits(&self) -> Result<Vec<(u32, f32)>> {
+        let active = self
+            .output
+            .as_ref()
+            .map_or(self.token_embd.n_cols, |m| m.n_cols);
+        let host = self.stream.clone_dtoh(&self.logits)?;
+        let mut out: Vec<(u32, f32)> = host
+            .into_iter()
+            .take(active)
+            .enumerate()
+            .map(|(id, logit)| (id as u32, logit))
+            .collect();
+        if let Some(id) = self.output_special_id {
+            let special = self.stream.clone_dtoh(&self.special_logit)?;
+            if let Some(&logit) = special.first() {
+                out.push((id, logit));
+            }
+        }
+        Ok(out)
+    }
+
     /// Run tokens through the model; return greedy next-token id.
     pub fn forward_greedy(&mut self, tokens: &[u32], cache: &mut CudaKv) -> Result<u32> {
         if tokens.is_empty() {
@@ -41,7 +64,7 @@ impl CudaModel {
         }
         cache.len += tokens.len();
 
-        self.stream.synchronize().context("cuda sync")?;
+        // clone_dtoh device-synchronizes; no extra stream.synchronize needed.
         let idx = self.stream.clone_dtoh(&self.argmax_buf)?;
         Ok(self.map_output_id(idx[0] as u32))
     }
@@ -76,7 +99,7 @@ impl CudaModel {
         }
 
         cache.len += 1;
-        self.stream.synchronize().context("cuda sync")?;
+        // clone_dtoh already device-synchronizes; skip extra stream.synchronize().
         let idx = self.stream.clone_dtoh(&self.argmax_buf)?;
         Ok(self.map_output_id(idx[0] as u32))
     }

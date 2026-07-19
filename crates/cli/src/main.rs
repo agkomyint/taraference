@@ -83,6 +83,21 @@ struct Cli {
     /// get chain-of-thought before the answer.
     #[arg(long, default_value_t = false)]
     think: bool,
+    /// Sampling temperature. 0 keeps the fastest greedy GPU argmax path.
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f32,
+    /// Nucleus sampling probability (used when temperature > 0).
+    #[arg(long, default_value_t = 1.0)]
+    top_p: f32,
+    /// Candidate cap before nucleus sampling (used when temperature > 0).
+    #[arg(long, default_value_t = 256)]
+    top_k: usize,
+    /// Penalize tokens already present in the prompt or generated text.
+    #[arg(long, default_value_t = 1.0)]
+    repetition_penalty: f32,
+    /// Deterministic sampling seed.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
     /// Start OpenAI-compatible HTTP server on PORT (default 8787). One GGUF = one model.
     #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "8787")]
     serve: Option<u16>,
@@ -176,6 +191,17 @@ fn main() -> Result<()> {
     } else {
         let mut opts = SessionOptions::interactive(cli.max_new);
         opts.enable_thinking = cli.think;
+        opts.temperature = cli.temperature;
+        opts.top_p = cli.top_p;
+        opts.top_k = cli.top_k;
+        opts.repetition_penalty = cli.repetition_penalty;
+        opts.seed = cli.seed;
+        if cli.temperature > 0.0 {
+            eprintln!(
+                "sampling | temperature={:.3} top_p={:.3} top_k={} repetition_penalty={:.3} seed={}",
+                cli.temperature, cli.top_p, cli.top_k, cli.repetition_penalty, cli.seed
+            );
+        }
         if cli.think {
             eprintln!("thinking | enabled (generation prompt opens <think>)");
         }

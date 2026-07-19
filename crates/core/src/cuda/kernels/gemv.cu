@@ -947,8 +947,27 @@ extern "C" __global__ void gemv_q4_0_global_expert_slot(
 }
 
 /// Fused gate+up+SiLU*mul expert GEMV for one MoE slot.
+/// Stage Q8 activation (xq + per-block scales) into dynamic smem when host
+/// passes shared_mem_bytes >= n_rows + n_blocks*4 (aligned). All CTAs share
+/// the same activation — smem cuts repeated global reads on short-K MoE (d=640).
+__device__ __forceinline__ void stage_q8_act_smem(
+    const signed char* __restrict__ xq_g,
+    const float* __restrict__ xd_g,
+    signed char* __restrict__ xq_s,
+    float* __restrict__ xd_s,
+    int n_rows,
+    int n_blocks
+) {
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    for (int i = tid; i < n_rows; i += nt) xq_s[i] = xq_g[i];
+    for (int bi = tid; bi < n_blocks; bi += nt) xd_s[bi] = xd_g[bi];
+    __syncthreads();
+}
+
 /// Writes out_ff[j] = silu(gate[j]) * up[j] (ready for down-proj).
 /// Interleaves gate/up block loads in one K-loop for short-K latency hiding (d=640).
+/// Optional dynamic smem: stage activation once per CTA (TARAFER_MOE_SMEM).
 extern "C" __global__ void gemv_q4_0_global_expert_gate_up(
     const unsigned char* __restrict__ gate_packed,
     const unsigned char* __restrict__ up_packed,
@@ -960,8 +979,17 @@ extern "C" __global__ void gemv_q4_0_global_expert_gate_up(
     int slot,
     int n_rows,
     int n_cols_expert,
-    int col_bytes
+    int col_bytes,
+    int stage_act
 ) {
+    const int n_blocks = n_rows >> 5;
+    // When stage_act != 0, host passes align4(n_rows)+n_blocks*sizeof(float).
+    extern __shared__ unsigned char act_smem[];
+    signed char* xq_s = reinterpret_cast<signed char*>(act_smem);
+    float* xd_s = reinterpret_cast<float*>(act_smem + ((n_rows + 3) & ~3));
+    if (stage_act) stage_q8_act_smem(xq, xd, xq_s, xd_s, n_rows, n_blocks);
+    const signed char* xq_use = stage_act ? xq_s : xq;
+    const float* xd_use = stage_act ? xd_s : xd;
     const int expert = expert_ids[slot];
     const int lane = (int)threadIdx.x & 31;
     const int warp = (int)threadIdx.x >> 5;
@@ -970,7 +998,6 @@ extern "C" __global__ void gemv_q4_0_global_expert_gate_up(
     if (j >= n_cols_expert) return;
     const int packed_j = expert * n_cols_expert + j;
     const int bsz = q4_0_block_bytes(n_rows, col_bytes);
-    const int n_blocks = n_rows >> 5;
     const unsigned char* cg = gate_packed + (size_t)packed_j * (size_t)col_bytes;
     const unsigned char* cu = up_packed + (size_t)packed_j * (size_t)col_bytes;
     float ag = 0.f, au = 0.f;
@@ -979,8 +1006,8 @@ extern "C" __global__ void gemv_q4_0_global_expert_gate_up(
         const unsigned char* bu = cu + bi * bsz;
         float dwg = half_to_float((unsigned short)(bg[0] | (bg[1] << 8)));
         float dwu = half_to_float((unsigned short)(bu[0] | (bu[1] << 8)));
-        const signed char* xv = xq + (bi << 5);
-        const float xsc = xd[bi];
+        const signed char* xv = xq_use + (bi << 5);
+        const float xsc = xd_use[bi];
         int sumg = 0, sumu = 0;
         if (bsz >= 32) {
             const unsigned int* qsg = reinterpret_cast<const unsigned int*>(bg + 4);
@@ -1110,7 +1137,6 @@ extern "C" __global__ void gemv_q4_0_global_expert_gate_up_q8(
     amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 1));
     amax = __shfl_sync(0xffffffffu, amax, 0);
     const float d = amax * (1.0f / 127.0f);
-    // Always write full 32-wide group (OOB cols are 0 in tile).
     const int base = bi << 5;
     q8_out[base + lane] = (amax == 0.f || d == 0.f)
         ? 0
@@ -1129,8 +1155,18 @@ extern "C" __global__ void gemv_q4_0_global_expert_down_scale(
     int slot,
     int n_rows,
     int n_cols_expert,
-    int col_bytes
+    int col_bytes,
+    int stage_act
 ) {
+    // When stage_act != 0, host passes align4(n_rows)+(n_rows/32)*4.
+    const int n_blocks = n_rows >> 5;
+    extern __shared__ unsigned char act_smem[];
+    signed char* xq_s = reinterpret_cast<signed char*>(act_smem);
+    float* xd_s = reinterpret_cast<float*>(act_smem + ((n_rows + 3) & ~3));
+    if (stage_act) stage_q8_act_smem(xq, xd, xq_s, xd_s, n_rows, n_blocks);
+    const signed char* xq_use = stage_act ? xq_s : xq;
+    const float* xd_use = stage_act ? xd_s : xd;
+
     const int expert = expert_ids[slot];
     const float w = weights[slot];
     const int lane = (int)threadIdx.x & 31;
@@ -1140,7 +1176,8 @@ extern "C" __global__ void gemv_q4_0_global_expert_down_scale(
     if (j >= n_cols_expert) return;
     const int packed_j = expert * n_cols_expert + j;
     const unsigned char* col = down_packed + (size_t)packed_j * (size_t)col_bytes;
-    float acc = dot_q4_0_col_q8_range_bsz(col, xq, xd, 0, n_rows / 32, lane, q4_0_block_bytes(n_rows, col_bytes));
+    float acc = dot_q4_0_col_q8_range_bsz(
+        col, xq_use, xd_use, 0, n_blocks, lane, q4_0_block_bytes(n_rows, col_bytes));
     if (lane == 0) residual_x[j] += w * acc;
 }
 
@@ -3083,5 +3120,3 @@ extern "C" __global__ void gemv_splitk_reduce_gdn_4way(
     else { out = out_alpha; oj = j - n_qkv - n_gate - n_beta; }
     out[oj] = acc;
 }
-
-
