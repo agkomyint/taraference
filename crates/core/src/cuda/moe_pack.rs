@@ -8,7 +8,7 @@ use super::model::CudaModel;
 use super::types::{
     FullAttnWeights, GpuLayer, GpuMat, Kernels, LayerAttn, LayerFfn, MoeFfnWeights, WType, MAX_BATCH,
 };
-use crate::config::{LayerKind, ModelConfig};
+use crate::config::{LayerKind, ModelConfig, RouterWeightMode};
 use anyhow::{anyhow, bail, Context, Result};
 use cudarc::driver::CudaContext;
 use serde::Deserialize;
@@ -32,6 +32,8 @@ struct PackMeta {
     n_ff: usize,
     n_experts: usize,
     router_top_k: usize,
+    #[serde(default)]
+    router_weight_mode: Option<String>,
     expert_ff: usize,
     num_dense_layers: usize,
     rope_theta: f32,
@@ -216,6 +218,16 @@ impl CudaModel {
         if meta.expert_ff % 32 != 0 {
             bail!("expert_ff={} must be multiple of 32 for Q8_0", meta.expert_ff);
         }
+        if meta.n_experts == 0 || meta.n_experts > 64 {
+            bail!("n_experts={} must be in 1..=64 for CUDA MoE", meta.n_experts);
+        }
+        if meta.router_top_k == 0 || meta.router_top_k > meta.n_experts || meta.router_top_k > 8 {
+            bail!(
+                "router_top_k={} must be in 1..=min(n_experts, 8)",
+                meta.router_top_k
+            );
+        }
+        let router_weight_mode = RouterWeightMode::from_metadata(meta.router_weight_mode.as_deref())?;
 
         let n_ff = meta.n_ff.max(meta.expert_ff);
         let cfg = ModelConfig {
@@ -255,6 +267,7 @@ impl CudaModel {
             layer_kinds: vec![LayerKind::FullAttention; meta.n_layer],
             n_experts: meta.n_experts,
             router_top_k: meta.router_top_k,
+            router_weight_mode,
             expert_ff: meta.expert_ff,
             num_dense_layers: meta.num_dense_layers,
         };
@@ -277,7 +290,7 @@ impl CudaModel {
             eprintln!("decode | {mode}");
         }
         eprintln!(
-            "GPU | {} MoE L={} dense_ffn={} moe_ffn={} d={} heads={}/{} ff={} experts={} top_k={} expert_ff={} n_ctx={} | {:.2} GiB pack | decode={}",
+            "GPU | {} MoE L={} dense_ffn={} moe_ffn={} d={} heads={}/{} ff={} experts={} top_k={} router_weights={} expert_ff={} n_ctx={} | {:.2} GiB pack | decode={}",
             cfg.architecture,
             cfg.n_layer,
             cfg.num_dense_layers,
@@ -288,6 +301,7 @@ impl CudaModel {
             cfg.n_ff,
             cfg.n_experts,
             cfg.router_top_k,
+            cfg.router_weight_mode.as_str(),
             cfg.expert_ff,
             cfg.n_ctx,
             weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),

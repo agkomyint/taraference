@@ -1527,6 +1527,7 @@ impl CudaModel {
         let n_exp_i = n_experts as i32;
         let n_embd_i = d.n_embd;
         let top_k_i = top_k as i32;
+        let router_full_softmax_i = self.cfg.router_weight_mode.cuda_flag();
         let expert_ff_i = expert_ff as i32;
         let gate_cb = gate_col_bytes as i32;
         let down_cb = down_col_bytes as i32;
@@ -1564,6 +1565,7 @@ impl CudaModel {
                     .arg(&n_exp_i)
                     .arg(&n_embd_i)
                     .arg(&top_k_i)
+                    .arg(&router_full_softmax_i)
                     .launch(LaunchConfig {
                         grid_dim: (1, 1, 1),
                         block_dim: (256, 1, 1),
@@ -1591,6 +1593,7 @@ impl CudaModel {
                     .arg(&n_embd_i)
                     .arg(&n_exp_i)
                     .arg(&top_k_i)
+                    .arg(&router_full_softmax_i)
                     .arg(&d.eps)
                     .launch(LaunchConfig {
                         grid_dim: (1, 1, 1),

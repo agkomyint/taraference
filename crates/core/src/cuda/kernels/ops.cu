@@ -97,11 +97,12 @@ extern "C" __global__ void moe_ffn_prep_rms_router_quant(
     int n_embd,
     int n_experts,
     int top_k,
+    int full_softmax,
     float eps
 ) {
     int tid = (int)threadIdx.x;
     __shared__ float red[256];
-    __shared__ float scores[32];
+    __shared__ float scores[64];
     __shared__ float scale;
 
     // RMSNorm
@@ -139,6 +140,12 @@ extern "C" __global__ void moe_ffn_prep_rms_router_quant(
         __syncthreads();
     }
     if (tid == 0) {
+        float full_max = scores[0];
+        for (int e = 1; e < n_experts; e++)
+            if (scores[e] > full_max) full_max = scores[e];
+        float full_sum = 0.f;
+        if (full_softmax)
+            for (int e = 0; e < n_experts; e++) full_sum += expf(scores[e] - full_max);
         for (int k = 0; k < top_k; k++) {
             int best_i = 0;
             float best_v = -1e30f;
@@ -153,16 +160,21 @@ extern "C" __global__ void moe_ffn_prep_rms_router_quant(
             top_w[k] = best_v;
             scores[best_i] = -1e30f;
         }
-        float max_l = top_w[0];
-        for (int k = 1; k < top_k; k++)
-            if (top_w[k] > max_l) max_l = top_w[k];
-        float sum = 0.f;
-        for (int k = 0; k < top_k; k++) {
-            top_w[k] = expf(top_w[k] - max_l);
-            sum += top_w[k];
+        if (full_softmax) {
+            float inv = full_sum > 0.f ? 1.f / full_sum : 0.f;
+            for (int k = 0; k < top_k; k++) top_w[k] = expf(top_w[k] - full_max) * inv;
+        } else {
+            float max_l = top_w[0];
+            for (int k = 1; k < top_k; k++)
+                if (top_w[k] > max_l) max_l = top_w[k];
+            float sum = 0.f;
+            for (int k = 0; k < top_k; k++) {
+                top_w[k] = expf(top_w[k] - max_l);
+                sum += top_w[k];
+            }
+            float inv = sum > 0.f ? 1.f / sum : 0.f;
+            for (int k = 0; k < top_k; k++) top_w[k] *= inv;
         }
-        float inv = sum > 0.f ? 1.f / sum : 0.f;
-        for (int k = 0; k < top_k; k++) top_w[k] *= inv;
     }
     __syncthreads();
 
@@ -240,7 +252,7 @@ extern "C" __global__ void gemv_f32_rows(
 }
 
 /// Device MoE router: scores = router @ x, write top-k indices + softmax weights.
-/// One block; n_experts <= 32, top_k <= 8. Fully device-side (CUDA-graph safe).
+/// One block; n_experts <= 64, top_k <= 8. Fully device-side (CUDA-graph safe).
 extern "C" __global__ void moe_router_topk_f32(
     const float* __restrict__ router,
     const float* __restrict__ x,
@@ -248,9 +260,10 @@ extern "C" __global__ void moe_router_topk_f32(
     float* __restrict__ top_w,
     int n_experts,
     int n_embd,
-    int top_k
+    int top_k,
+    int full_softmax
 ) {
-    __shared__ float scores[32];
+    __shared__ float scores[64];
     __shared__ float red[256];
     int tid = (int)threadIdx.x;
     // Score each expert (serial over E, parallel reduce over embd — E is tiny).
@@ -269,7 +282,13 @@ extern "C" __global__ void moe_router_topk_f32(
         __syncthreads();
     }
     if (tid == 0) {
-        // Iterative top-k (n_experts <= 32).
+        float full_max = scores[0];
+        for (int e = 1; e < n_experts; e++)
+            if (scores[e] > full_max) full_max = scores[e];
+        float full_sum = 0.f;
+        if (full_softmax)
+            for (int e = 0; e < n_experts; e++) full_sum += expf(scores[e] - full_max);
+        // Iterative top-k (n_experts <= 64).
         float taken = -1e30f;
         for (int k = 0; k < top_k; k++) {
             int best_i = 0;
@@ -287,17 +306,21 @@ extern "C" __global__ void moe_router_topk_f32(
             scores[best_i] = -1e30f; // remove from next rounds
             (void)taken;
         }
-        // Softmax over selected logits only.
-        float max_l = top_w[0];
-        for (int k = 1; k < top_k; k++)
-            if (top_w[k] > max_l) max_l = top_w[k];
-        float sum = 0.f;
-        for (int k = 0; k < top_k; k++) {
-            top_w[k] = expf(top_w[k] - max_l);
-            sum += top_w[k];
+        if (full_softmax) {
+            float inv = full_sum > 0.f ? 1.f / full_sum : 0.f;
+            for (int k = 0; k < top_k; k++) top_w[k] = expf(top_w[k] - full_max) * inv;
+        } else {
+            float max_l = top_w[0];
+            for (int k = 1; k < top_k; k++)
+                if (top_w[k] > max_l) max_l = top_w[k];
+            float sum = 0.f;
+            for (int k = 0; k < top_k; k++) {
+                top_w[k] = expf(top_w[k] - max_l);
+                sum += top_w[k];
+            }
+            float inv = sum > 0.f ? 1.f / sum : 0.f;
+            for (int k = 0; k < top_k; k++) top_w[k] *= inv;
         }
-        float inv = sum > 0.f ? 1.f / sum : 0.f;
-        for (int k = 0; k < top_k; k++) top_w[k] *= inv;
     }
 }
 

@@ -129,7 +129,10 @@ impl CudaModel {
 
         let safe_pos = (cache.max_seq - 1) as i32;
         let dummy_tok = 0i32;
-        let flags0 = unsafe { std::mem::transmute::<u32, CUgraphInstantiate_flags>(0) };
+        // cudarc exposes CUDA's bitmask as a Rust enum whose valid values start at 1.
+        // Constructing a zero-valued enum is invalid and panics with newer Rust/CUDA
+        // bindings. This graph performs no device allocations, so AUTO_FREE is safe.
+        let flags0 = CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 
         // Drain ALL context streams (null + non-blocking) so capture has no cross-stream deps.
         self._ctx

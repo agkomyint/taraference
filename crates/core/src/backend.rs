@@ -63,7 +63,7 @@ impl BackendKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LayerKind;
+    use crate::config::{LayerKind, RouterWeightMode};
 
     fn cfg(architecture: &str, experts: usize) -> ModelConfig {
         ModelConfig {
@@ -89,6 +89,7 @@ mod tests {
             layer_kinds: vec![LayerKind::FullAttention],
             n_experts: experts,
             router_top_k: usize::from(experts > 0),
+            router_weight_mode: RouterWeightMode::SelectedSoftmax,
             expert_ff: 32,
             num_dense_layers: usize::from(experts == 0),
         }

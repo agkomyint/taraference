@@ -12,6 +12,57 @@ pub enum LayerKind {
     LinearAttention,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterWeightMode {
+    /// Softmax is computed only across the selected top-k logits (legacy packs).
+    SelectedSoftmax,
+    /// Selected weights retain their probability from the full expert softmax.
+    FullSoftmax,
+}
+
+impl RouterWeightMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelectedSoftmax => "selected_softmax",
+            Self::FullSoftmax => "full_softmax",
+        }
+    }
+
+    pub fn cuda_flag(self) -> i32 {
+        i32::from(matches!(self, Self::FullSoftmax))
+    }
+
+    pub fn from_metadata(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("selected_softmax") {
+            "selected_softmax" => Ok(Self::SelectedSoftmax),
+            "full_softmax" => Ok(Self::FullSoftmax),
+            other => Err(anyhow!("unsupported router_weight_mode {other:?}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod router_weight_mode_tests {
+    use super::RouterWeightMode;
+
+    #[test]
+    fn missing_metadata_preserves_legacy_mode() {
+        assert_eq!(
+            RouterWeightMode::from_metadata(None).unwrap(),
+            RouterWeightMode::SelectedSoftmax
+        );
+    }
+
+    #[test]
+    fn parses_full_softmax_and_rejects_unknown_modes() {
+        assert_eq!(
+            RouterWeightMode::from_metadata(Some("full_softmax")).unwrap(),
+            RouterWeightMode::FullSoftmax
+        );
+        assert!(RouterWeightMode::from_metadata(Some("mystery")).is_err());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub architecture: String,
@@ -44,6 +95,8 @@ pub struct ModelConfig {
     pub n_experts: usize,
     /// MoE: router top-k (active experts per token).
     pub router_top_k: usize,
+    /// How selected expert logits are converted into mixture weights.
+    pub router_weight_mode: RouterWeightMode,
     /// MoE: expert intermediate size (may differ from dense n_ff).
     pub expert_ff: usize,
     /// First N layers use dense FFN; rest are MoE (Tara Llama-MoE).
@@ -204,6 +257,7 @@ impl ModelConfig {
             layer_kinds,
             n_experts: 0,
             router_top_k: 0,
+            router_weight_mode: RouterWeightMode::SelectedSoftmax,
             expert_ff: 0,
             num_dense_layers: n_layer,
         })
