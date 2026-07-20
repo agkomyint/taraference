@@ -10,6 +10,7 @@ pub mod config;
 pub mod cuda;
 pub mod engine;
 pub mod quant;
+pub mod sampler;
 pub mod session;
 pub mod tokenizer;
 
@@ -18,5 +19,6 @@ pub use backend::BackendKind;
 pub use config::ModelConfig;
 pub use cuda::{CudaKv, CudaModel, DecodeBackend};
 pub use engine::{EngineConfig, InferenceEngine};
+pub use sampler::{sample_logits, SamplingOptions};
 pub use session::{Session, SessionOptions, StopReason, TurnStats};
 pub use tokenizer::Tokenizer;

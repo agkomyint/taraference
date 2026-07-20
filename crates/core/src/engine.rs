@@ -24,8 +24,17 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// Relative tokenizer GGUF candidates searched after env + pack-local paths.
+fn default_tokenizer_candidates() -> &'static [&'static str] {
+    &[
+        "models/tara-sprint-80m-Q8_0.gguf",
+        "models/tara-sprint-50m-Q8_0.gguf",
+        "models/tara-sprint-150m-Q8_0.gguf",
+    ]
+}
+
 /// Tokenizer GGUF for MoE packs: `TARAFER_TOKENIZER_GGUF`, pack-local `tokenizer.gguf`,
-/// or a Tara-Sprint GGUF under `models/` / department exports.
+/// or a Tara-Sprint GGUF under `models/`.
 fn resolve_tokenizer_gguf(pack_dir: &Path) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TARAFER_TOKENIZER_GGUF") {
         let pb = PathBuf::from(p);
@@ -38,18 +47,8 @@ fn resolve_tokenizer_gguf(pack_dir: &Path) -> Result<PathBuf> {
     if local.is_file() {
         return Ok(local);
     }
-    let candidates = [
-        PathBuf::from("models/tara-sprint-80m-Q8_0.gguf"),
-        PathBuf::from("models/tara-sprint-50m-Q8_0.gguf"),
-        PathBuf::from("models/tara-sprint-150m-Q8_0.gguf"),
-        PathBuf::from(
-            r"D:\Tara_HQ\departments\taraference_750_department\exports\tara-sprint-80m-real\tara-sprint-80m-Q8_0.gguf",
-        ),
-        PathBuf::from(
-            r"D:\Tara_HQ\departments\taraference_750_department\exports\tara-sprint-50m-real\tara-sprint-50m-Q8_0.gguf",
-        ),
-    ];
-    for c in candidates {
+    for rel in default_tokenizer_candidates() {
+        let c = PathBuf::from(rel);
         if c.is_file() {
             return Ok(c);
         }
@@ -58,6 +57,22 @@ fn resolve_tokenizer_gguf(pack_dir: &Path) -> Result<PathBuf> {
         "MoE pack needs a tokenizer GGUF. Set TARAFER_TOKENIZER_GGUF=path/to/tara-sprint-*.gguf \
          (same vocab as training) or place tokenizer.gguf next to meta.json"
     );
+}
+
+#[cfg(test)]
+mod tokenizer_resolve_tests {
+    use super::default_tokenizer_candidates;
+
+    #[test]
+    fn default_candidates_are_relative_only() {
+        for c in default_tokenizer_candidates() {
+            assert!(!c.contains(':'), "no machine-local absolute paths: {c}");
+            assert!(
+                c.starts_with("models/"),
+                "expected models/ relative path, got {c}"
+            );
+        }
+    }
 }
 
 /// Configuration for loading an engine.
@@ -295,6 +310,8 @@ impl InferenceEngine {
     }
 
     /// Same as [`Self::chat_completion`], invoking `on_token` for each decoded piece (SSE).
+    /// Greedy (temperature 0) unless the caller uses
+    /// [`Self::chat_completion_stream_sampled`].
     pub fn chat_completion_stream<F>(
         &mut self,
         messages: &[ChatMessage],
@@ -304,25 +321,17 @@ impl InferenceEngine {
     where
         F: FnMut(&str),
     {
-        if messages.is_empty() {
-            anyhow::bail!("messages must not be empty");
-        }
-        let max_new = max_tokens.unwrap_or(self.max_new).max(1);
-        // Server defaults to non-thinking (Qwen3.5 small default). Pass
-        // enable_thinking via a dedicated API later if needed.
-        let enable_thinking = false;
-        let prompt = format_chatml(messages, Some(&self.default_system), enable_thinking);
-        let opts = SessionOptions {
-            max_new,
-            system: self.default_system.clone(),
-            print_stream: false,
-            print_stats: false,
-            enable_thinking,
-            ..SessionOptions::default()
-        };
-        self.kv.clear();
-        let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);
-        session.complete_prompt_stream(&prompt, on_token)
+        let defaults = SessionOptions::default();
+        self.chat_completion_stream_with(
+            messages,
+            max_tokens,
+            defaults.temperature,
+            defaults.top_p,
+            defaults.top_k,
+            defaults.repetition_penalty,
+            defaults.seed,
+            on_token,
+        )
     }
 
     /// Stateless sampled completion for CLI/server clients that request quality
@@ -341,10 +350,37 @@ impl InferenceEngine {
     where
         F: FnMut(&str),
     {
+        self.chat_completion_stream_with(
+            messages,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            seed,
+            on_token,
+        )
+    }
+
+    fn chat_completion_stream_with<F>(
+        &mut self,
+        messages: &[ChatMessage],
+        max_tokens: Option<usize>,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+        repetition_penalty: f32,
+        seed: u64,
+        on_token: F,
+    ) -> Result<TurnStats>
+    where
+        F: FnMut(&str),
+    {
         if messages.is_empty() {
             anyhow::bail!("messages must not be empty");
         }
         let max_new = max_tokens.unwrap_or(self.max_new).max(1);
+        // Server defaults to non-thinking (Qwen3.5 small default).
         let enable_thinking = false;
         let prompt = format_chatml(messages, Some(&self.default_system), enable_thinking);
         let opts = SessionOptions {

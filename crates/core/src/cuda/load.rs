@@ -1,17 +1,15 @@
 //! Load GGUF weights onto GPU and compile NVRTC kernels.
 
 use super::decode::DecodeBackend;
-use super::kernels::SOURCE;
+use super::device::init_device;
 use super::model::CudaModel;
 use super::types::{
-    FullAttnWeights, GpuLayer, GpuMat, Kernels, LayerAttn, LayerFfn, LinearAttnWeights, WType,
-    MAX_BATCH,
+    FullAttnWeights, GpuLayer, GpuMat, LayerAttn, LayerFfn, LinearAttnWeights, WType, MAX_BATCH,
 };
 use crate::config::LayerKind;
 use crate::config::ModelConfig;
-use crate::quant::dequant_f32;
+use crate::quant::{dequant_f32, f16_to_f32, f32_to_f16};
 use anyhow::{anyhow, bail, Context, Result};
-use cudarc::driver::CudaContext;
 use taraference_gguf::{GgmlType, GgufFile};
 
 fn wtype_of(t: GgmlType) -> Result<WType> {
@@ -31,57 +29,6 @@ fn wtype_of(t: GgmlType) -> Result<WType> {
 
 const Q5_K_BLOCK_BYTES: usize = 176;
 const Q8_0_BLOCK_BYTES: usize = 34;
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
-    let exponent = ((bits >> 10) & 0x1f) as i32;
-    let fraction = (bits & 0x03ff) as u32;
-    match exponent {
-        0 if fraction == 0 => sign * 0.0,
-        0 => sign * (fraction as f32) * 2.0f32.powi(-24),
-        31 if fraction == 0 => sign * f32::INFINITY,
-        31 => f32::NAN,
-        _ => sign * (1.0 + fraction as f32 / 1024.0) * 2.0f32.powi(exponent - 15),
-    }
-}
-
-fn f32_to_f16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let fraction = bits & 0x007f_ffff;
-    if exponent == 255 {
-        return sign | if fraction == 0 { 0x7c00 } else { 0x7e00 };
-    }
-    let half_exp = exponent - 127 + 15;
-    if half_exp >= 31 {
-        return sign | 0x7c00;
-    }
-    if half_exp <= 0 {
-        if half_exp < -10 {
-            return sign;
-        }
-        let mantissa = fraction | 0x0080_0000;
-        let shift = (14 - half_exp) as u32;
-        let mut rounded = mantissa >> shift;
-        let remainder = mantissa & ((1u32 << shift) - 1);
-        let halfway = 1u32 << (shift - 1);
-        if remainder > halfway || (remainder == halfway && rounded & 1 != 0) {
-            rounded += 1;
-        }
-        return sign | rounded as u16;
-    }
-    let mut rounded = fraction + 0x0000_0fff + ((fraction >> 13) & 1);
-    let mut out_exp = half_exp as u16;
-    if rounded & 0x0080_0000 != 0 {
-        rounded = 0;
-        out_exp += 1;
-        if out_exp >= 31 {
-            return sign | 0x7c00;
-        }
-    }
-    sign | (out_exp << 10) | (rounded >> 13) as u16
-}
 
 fn q5_k_scale_min(scales: &[u8], j: usize) -> (u8, u8) {
     if j < 4 {
@@ -230,236 +177,15 @@ impl CudaModel {
             decode.name()
         );
 
-        let ctx = CudaContext::new(0).context("CudaContext")?;
-        // cudarc event-tracking inserts cuStreamWaitEvent around every buffer use.
-        // Those waits create cross-stream deps that make CUDA graph capture fail with
-        // CUDA_ERROR_STREAM_CAPTURE_ISOLATION. We use one stream only → tracking is
-        // unnecessary and must be off *before* any allocations.
-        // SAFETY: single inference stream; no concurrent multi-stream buffer sharing.
-        unsafe {
-            ctx.disable_event_tracking();
-        }
-        // Non-null stream required for CUDA graph capture (legacy default/null cannot capture).
-        let stream = ctx.new_stream().context("CudaStream (non-blocking)")?;
-        // Match the live GPU (e.g. sm_86 laptop 3050 Ti, sm_75 Tesla T4).
-        // Hardcoding sm_86 breaks PTX load on other arches.
-        let (cc_major, cc_minor) = ctx
-            .compute_capability()
-            .context("device compute capability")?;
-        let arch = format!("sm_{cc_major}{cc_minor}");
-        let gpu_name = ctx
-            .name()
-            .unwrap_or_else(|_| format!("CUDA device 0 (sm_{cc_major}{cc_minor})"));
-        eprintln!("GPU device | {gpu_name} | compute {cc_major}.{cc_minor} | NVRTC arch={arch}");
-        // `CompileOptions::arch` is `&'static str`; pass dynamic target via `options`.
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-            SOURCE,
-            cudarc::nvrtc::CompileOptions {
-                arch: None,
-                include_paths: vec![],
-                ftz: Some(true),
-                prec_div: Some(false),
-                prec_sqrt: Some(false),
-                fmad: Some(true),
-                use_fast_math: Some(true),
-                maxrregcount: None,
-                options: vec![format!("--gpu-architecture={arch}")],
-                name: None,
-            },
-        )
-        .context("nvrtc compile")?;
-        let module = ctx.load_module(ptx).context("load_module")?;
-        let q4_dual_4way = cc_major >= 8;
-        let q4_dual_symbol = if q4_dual_4way {
-            "gemv_q4_k_dual_4way"
-        } else {
-            "gemv_q4_k_dual"
-        };
-        let q4_ffn_symbol = if q4_dual_4way {
-            "gemv_q4_k_ffn_4way"
-        } else {
-            "gemv_q4_k_ffn"
-        };
-        let q4_ffn_smem_symbol = if q4_dual_4way {
-            "gemv_q4_k_ffn_4way_smem"
-        } else {
-            "gemv_q4_k_ffn"
-        };
-        let q4_dual_threads = if q4_dual_4way { 128 } else { 64 };
-        // Ampere+: keep modest warps for high-register Q4 DP4A paths; Turing
-        // prefers fat blocks. Override with TARAFER_GEMV_WARPS.
-        let gemv_quantized_warps = std::env::var("TARAFER_GEMV_WARPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&w: &u32| (1..=32).contains(&w))
-            .unwrap_or(if cc_major >= 8 { 16 } else { 32 });
-        eprintln!(
-            "tuning | q4_dual={} | threads={} | quantized_warps={}",
-            if q4_dual_4way { "4way" } else { "2way" },
-            q4_dual_threads,
-            gemv_quantized_warps
-        );
-        let k = Kernels {
-            quantize_q8: module.load_function("quantize_q8_global")?,
-            gemv_q4: module.load_function("gemv_q4_k")?,
-            gemv_q4_global: module.load_function("gemv_q4_k_global")?,
-            gemv_q5: module.load_function("gemv_q5_0")?,
-            gemv_q5k: module.load_function("gemv_q5_k")?,
-            gemv_q6: module.load_function("gemv_q6_k")?,
-            gemv_q6_repack: module.load_function("gemv_q6_k_repack")?,
-            gemv_q6_repack_global: module.load_function("gemv_q6_k_repack_global")?,
-            gemv_q6_compact_global: module.load_function("gemv_q6_k_compact_global")?,
-            gemv_q6_compact_global_4way: module.load_function("gemv_q6_k_compact_global_4way")?,
-            gemv_q6_compact_global_8way: module.load_function("gemv_q6_k_compact_global_8way")?,
-            gemv_q6_compact_global_mcol: module.load_function("gemv_q6_k_compact_global_mcol")?,
-            gemv_q8: module.load_function("gemv_q8_0")?,
-            gemv_q8_global: module.load_function("gemv_q8_0_global")?,
-            gemv_q4_0: module.load_function("gemv_q4_0")?,
-            gemv_q4_0_global: module.load_function("gemv_q4_0_global")?,
-            gemv_q4_0_expert_slot: module.load_function("gemv_q4_0_global_expert_slot")?,
-            gemv_q4_0_expert_gate_up: module.load_function("gemv_q4_0_global_expert_gate_up")?,
-            gemv_q4_0_expert_gate_up_q8: module
-                .load_function("gemv_q4_0_global_expert_gate_up_q8")?,
-            gemv_q4_0_expert_down_scale: module
-                .load_function("gemv_q4_0_global_expert_down_scale")?,
-            gemv_f16_expert_gate_up: module.load_function("gemv_f16_expert_gate_up")?,
-            gemv_f16_expert_down_scale: module.load_function("gemv_f16_expert_down_scale")?,
-            gemv_f16_expert_gate_up_4w: module.load_function("gemv_f16_expert_gate_up_4w")?,
-            gemv_f16_expert_down_scale_4w: module
-                .load_function("gemv_f16_expert_down_scale_4w")?,
-            gemv_q4_0_bm_expert_gate_up: module.load_function("gemv_q4_0_bm_expert_gate_up")?,
-            gemv_q4_0_bm_expert_down_scale: module
-                .load_function("gemv_q4_0_bm_expert_down_scale")?,
-            gemv_q4_0_qkv: module.load_function("gemv_q4_0_global_qkv")?,
-            gemv_q4_0_qkv_2w: module.load_function("gemv_q4_0_global_qkv_2w")?,
-            gemv_q4_0_pair: module.load_function("gemv_q4_0_global_pair")?,
-            gemv_q4_0_ffn: module.load_function("gemv_q4_0_global_ffn")?,
-            gemv_q4_0_expert_gate_up_2w: module
-                .load_function("gemv_q4_0_global_expert_gate_up_2w")?,
-            gemv_q4_0_expert_down_scale_2w: module
-                .load_function("gemv_q4_0_global_expert_down_scale_2w")?,
-            gemv_q4_0_expert_gate_up_4w: module
-                .load_function("gemv_q4_0_global_expert_gate_up_4w")?,
-            gemv_q4_0_expert_down_scale_4w: module
-                .load_function("gemv_q4_0_global_expert_down_scale_4w")?,
-            gemv_q4_0_expert_gate_up_f32: module.load_function("gemv_q4_0_expert_gate_up_f32")?,
-            gemv_q4_0_expert_down_scale_f32: module
-                .load_function("gemv_q4_0_expert_down_scale_f32")?,
-            gemv_q8_expert_gate_up: module.load_function("gemv_q8_0_global_expert_gate_up")?,
-            gemv_q8_expert_down_scale: module
-                .load_function("gemv_q8_0_global_expert_down_scale")?,
-            gemv_q4_splitk: module.load_function("gemv_q4_k_splitk")?,
-            gemv_q4_global_splitk: module.load_function("gemv_q4_k_global_splitk")?,
-            gemv_q5_splitk: module.load_function("gemv_q5_0_splitk")?,
-            gemv_q5k_splitk: module.load_function("gemv_q5_k_splitk")?,
-            gemv_q6_splitk: module.load_function("gemv_q6_k_splitk")?,
-            gemv_q6_repack_splitk: module.load_function("gemv_q6_k_repack_splitk")?,
-            gemv_q6_repack_global_splitk: module.load_function("gemv_q6_k_repack_global_splitk")?,
-            gemv_q6_compact_global_splitk: module
-                .load_function("gemv_q6_k_compact_global_splitk")?,
-            gemv_q8_splitk: module.load_function("gemv_q8_0_splitk")?,
-            gemv_q8_global_splitk: module.load_function("gemv_q8_0_global_splitk")?,
-            gemv_splitk_reduce: module.load_function("gemv_splitk_reduce")?,
-            gemv_q5_qk: module.load_function("gemv_q5_0_qk")?,
-            gemv_q5_qkv: module.load_function("gemv_q5_0_qkv")?,
-            gemv_q4_pair: module.load_function("gemv_q4_k_pair")?,
-            gemv_q4_dual: module.load_function(q4_dual_symbol)?,
-            gemv_q4_ffn: module.load_function(q4_ffn_symbol)?,
-            gemv_q4_ffn_8way: module.load_function("gemv_q4_k_ffn_8way")?,
-            gemv_q4_ffn_mcol: module.load_function("gemv_q4_k_ffn_mcol")?,
-            gemv_q4_ffn_smem: module.load_function(q4_ffn_smem_symbol)?,
-            gemv_q4_dual_threads: q4_dual_threads,
-            gemv_quantized_warps,
-            gemv_q4_qkv: module.load_function("gemv_q4_k_qkv")?,
-            gemv_q8_qkv: module.load_function("gemv_q8_0_qkv")?,
-            gemv_q8_gdn_4way: module.load_function("gemv_q8_0_gdn_4way")?,
-            gemv_hybrid_gdn_4way: module.load_function("gemv_hybrid_gdn_4way")?,
-            gemv_q8_qkv_splitk: module.load_function("gemv_q8_0_qkv_splitk")?,
-            gemv_q8_gdn_4way_splitk: module.load_function("gemv_q8_0_gdn_4way_splitk")?,
-            gemv_hybrid_gdn_4way_splitk: module.load_function("gemv_hybrid_gdn_4way_splitk")?,
-            gemv_splitk_reduce_qkv: module.load_function("gemv_splitk_reduce_qkv")?,
-            gemv_splitk_reduce_gdn_4way: module.load_function("gemv_splitk_reduce_gdn_4way")?,
-            gemm_q4: module.load_function("gemm_q4_k")?,
-            gemm_q5: module.load_function("gemm_q5_0")?,
-            gemm_q5k: module.load_function("gemm_q5_k")?,
-            gemm_q6: module.load_function("gemm_q6_k")?,
-            gemm_q8: module.load_function("gemm_q8_0")?,
-            embed_q4: module.load_function("embed_q4_k")?,
-            embed_q5: module.load_function("embed_q5_0")?,
-            embed_q5k: module.load_function("embed_q5_k")?,
-            embed_q6: module.load_function("embed_q6_k")?,
-            embed_q8: module.load_function("embed_q8_0")?,
-            embed_q4_0: module.load_function("embed_q4_0")?,
-            embed_q4_one: module.load_function("embed_q4_k_one")?,
-            embed_q5_one: module.load_function("embed_q5_0_one")?,
-            embed_q5k_one: module.load_function("embed_q5_k_one")?,
-            embed_q6_one: module.load_function("embed_q6_k_one")?,
-            embed_q8_one: module.load_function("embed_q8_0_one")?,
-            embed_q4_0_one: module.load_function("embed_q4_0_one")?,
-            embed_q4_one_d: module.load_function("embed_q4_k_one_d")?,
-            embed_q5_one_d: module.load_function("embed_q5_0_one_d")?,
-            embed_q5k_one_d: module.load_function("embed_q5_k_one_d")?,
-            embed_q6_one_d: module.load_function("embed_q6_k_one_d")?,
-            embed_q8_one_d: module.load_function("embed_q8_0_one_d")?,
-            embed_q4_0_one_d: module.load_function("embed_q4_0_one_d")?,
-            rms_norm: module.load_function("rms_norm_f32")?,
-            moe_ffn_prep: module.load_function("moe_ffn_prep_rms_router_quant")?,
-            attn_prep: module.load_function("attn_prep_rms_quant")?,
-            silu_mul: module.load_function("silu_mul_f32")?,
-            add: module.load_function("add_f32")?,
-            scale_add: module.load_function("scale_add_f32")?,
-            scale_add_slot: module.load_function("scale_add_slot_f32")?,
-            gemv_f32_rows: module.load_function("gemv_f32_rows")?,
-            moe_router_topk: module.load_function("moe_router_topk_f32")?,
-            gemv_q8_expert_slot: module.load_function("gemv_q8_0_global_expert_slot")?,
-            add_bias: module.load_function("add_bias_f32")?,
-            rope: module.load_function("rope_neox_f32")?,
-            rope_d: module.load_function("rope_neox_f32_d")?,
-            qk_norm_rope: module.load_function("qk_rms_norm_rope_neox_f32")?,
-            qk_norm_rope_d: module.load_function("qk_rms_norm_rope_neox_f32_d")?,
-            qk_norm_partial_rope: module.load_function("qk_rms_norm_partial_rope_neox_f32")?,
-            qk_norm_partial_rope_d: module.load_function("qk_rms_norm_partial_rope_neox_f32_d")?,
-            sigmoid: module.load_function("sigmoid_f32")?,
-            softplus_bias_scale: module.load_function("softplus_bias_scale_f32")?,
-            softplus_bias_scale_rows: module.load_function("softplus_bias_scale_rows_f32")?,
-            gdn_prep_decay_beta: module.load_function("gdn_prep_decay_beta_f32")?,
-            copy_f32: module.load_function("copy_f32")?,
-            exp_f: module.load_function("exp_f32")?,
-            l2_norm_heads: module.load_function("l2_norm_heads_f32")?,
-            gated_rms_norm: module.load_function("gated_rms_norm_f32")?,
-            split_q_gate: module.load_function("split_q_gate_interleaved_f32")?,
-            mul_sigmoid: module.load_function("mul_sigmoid_f32")?,
-            causal_conv1d: module.load_function("causal_conv1d_f32")?,
-            causal_conv1d_one: module.load_function("causal_conv1d_one_f32")?,
-            gated_delta_seq: module.load_function("gated_delta_rule_seq_f32")?,
-            gated_delta_one: module.load_function("gated_delta_rule_one_f32")?,
-            gdn_conv_qkvl2_one: module.load_function("gdn_conv_qkvl2_one_f32")?,
-            gdn_delta_gated_one: module.load_function("gdn_delta_gated_one_f32")?,
-            gdn_delta_gated_one_d128: module.load_function("gdn_delta_gated_one_d128_f32")?,
-            gdn_split_l2_seq: module.load_function("gdn_split_l2_seq_f32")?,
-            gdn_delta_gated_seq: module.load_function("gdn_delta_gated_seq_f32")?,
-            split_qkv_conv: module.load_function("split_qkv_from_conv_f32")?,
-            split_qkv_l2_one: module.load_function("split_qkv_l2_one_f32")?,
-            zero_f32: module.load_function("zero_f32")?,
-            attn: {
-                // Load only symbols listed in decode::REGISTRY (easy add/remove).
-                let mut map = std::collections::HashMap::new();
-                for sym in DecodeBackend::required_kernel_symbols() {
-                    map.insert(
-                        sym,
-                        module.load_function(sym).with_context(|| {
-                            format!("load attn kernel {sym} (missing from CUDA source?)")
-                        })?,
-                    );
-                }
-                map
-            },
-            copy_kv: module.load_function("copy_kv_f16")?,
-            copy_kv_d: module.load_function("copy_kv_f16_d")?,
-            argmax: module.load_function("argmax_f32")?,
-            argmax_rows: module.load_function("argmax_rows_f32")?,
-            copy_last: module.load_function("copy_last_row")?,
-        };
+        let device = init_device()?;
+        let ctx = device.ctx;
+        let stream = device.stream;
+        let module = device.module;
+        let k = device.kernels;
+        let gpu_name = device.gpu_name;
+        let cc_major = device.compute_major;
+        let cc_minor = device.compute_minor;
+        let arch = device.nvrtc_arch;
 
         // Q5_K f32-dot GEMV is much slower than Q8_0 on sm_86 decode.
         // Hybrid Qwen3.5 puts Q5_K on the hot path (attn_qkv / ssm_out) — auto

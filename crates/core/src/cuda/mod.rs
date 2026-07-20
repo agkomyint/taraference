@@ -1,6 +1,7 @@
 //! CUDA inference engine (load, matmul, forward).
 
 mod decode;
+mod device;
 mod forward;
 mod kernels;
 mod kv;

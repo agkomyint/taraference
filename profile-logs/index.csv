@@ -118,3 +118,6 @@ stamp,decode,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_dro
 2026-07-17_22-22-51,Qwen3.5-4B-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-17_22-22-51_Qwen3.5-4B-Q4_K_M_flash.txt,31.263,35.828,28.827,19.54,356
 2026-07-17_22-23-23,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-17_22-23-23_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,42.286,51.207,32.860,35.83,574
 2026-07-17_22-27-45,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-17_22-27-45_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,51.490,71.769,44.652,37.78,574
+2026-07-20_17-52-51,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-20_17-52-51_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,38.628,45.001,48.969,-8.82,465
+2026-07-20_17-53-57,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-20_17-53-57_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,65.218,68.450,61.937,9.52,465
+2026-07-20_17-55-13,Qwen3.5-4B-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-20_17-55-13_Qwen3.5-4B-Q4_K_M_flash.txt,39.416,46.469,35.266,24.11,595

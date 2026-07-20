@@ -1,10 +1,10 @@
 //! Multi-turn chat session (GPU).
 
 use crate::cuda::{CudaKv, CudaModel};
+use crate::sampler::{sample_logits, SamplingOptions};
 use crate::tokenizer::Tokenizer;
 use anyhow::Result;
 use std::io::{self, Write};
-use std::collections::HashSet;
 use std::time::Instant;
 
 /// Why generation stopped this turn.
@@ -463,14 +463,6 @@ impl<'a> Session<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SamplingOptions {
-    temperature: f32,
-    top_p: f32,
-    top_k: usize,
-    repetition_penalty: f32,
-}
-
 impl Session<'_> {
     fn choose_next(&mut self, greedy: u32) -> Result<u32> {
         if self.sampling.temperature <= 0.0 {
@@ -483,93 +475,5 @@ impl Session<'_> {
             self.sampling,
             &mut self.rng_state,
         ))
-    }
-}
-
-fn next_random(state: &mut u64) -> f64 {
-    let mut x = (*state).max(1);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    (x as f64) / (u64::MAX as f64 + 1.0)
-}
-
-fn sample_logits(
-    mut logits: Vec<(u32, f32)>,
-    history: &[u32],
-    opts: SamplingOptions,
-    rng: &mut u64,
-) -> u32 {
-    let penalty = opts.repetition_penalty.max(1.0);
-    if penalty > 1.0 {
-        let seen: HashSet<u32> = history.iter().copied().collect();
-        for (id, logit) in &mut logits {
-            if seen.contains(id) {
-                *logit = if *logit < 0.0 {
-                    *logit * penalty
-                } else {
-                    *logit / penalty
-                };
-            }
-        }
-    }
-    let temperature = opts.temperature.max(1e-5);
-    let candidate_count = opts.top_k.max(1).min(logits.len());
-    if candidate_count < logits.len() {
-        logits.select_nth_unstable_by(candidate_count, |a, b| b.1.total_cmp(&a.1));
-        logits.truncate(candidate_count);
-    }
-    logits.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-    let max_logit = logits.first().map_or(0.0, |x| x.1);
-    let mut probs: Vec<f64> = logits
-        .iter()
-        .map(|(_, x)| (((*x - max_logit) / temperature) as f64).exp())
-        .collect();
-    let total: f64 = probs.iter().sum::<f64>().max(f64::MIN_POSITIVE);
-    for p in &mut probs {
-        *p /= total;
-    }
-    let top_p = opts.top_p.clamp(1e-6, 1.0) as f64;
-    let mut keep = probs.len();
-    let mut cumulative = 0.0;
-    for (i, p) in probs.iter().enumerate() {
-        cumulative += *p;
-        if cumulative >= top_p {
-            keep = i + 1;
-            break;
-        }
-    }
-    let kept_total: f64 = probs[..keep].iter().sum::<f64>().max(f64::MIN_POSITIVE);
-    let target = next_random(rng) * kept_total;
-    let mut running = 0.0;
-    for (i, p) in probs[..keep].iter().enumerate() {
-        running += *p;
-        if running >= target {
-            return logits[i].0;
-        }
-    }
-    logits[keep.saturating_sub(1)].0
-}
-
-#[cfg(test)]
-mod sampling_tests {
-    use super::*;
-
-    #[test]
-    fn repetition_penalty_can_change_the_choice() {
-        let mut seed = 1;
-        let id = sample_logits(
-            vec![(1, 10.0), (2, 9.9)],
-            &[1],
-            SamplingOptions {
-                temperature: 0.01,
-                top_p: 1.0,
-                top_k: 2,
-                repetition_penalty: 1.2,
-            },
-            &mut seed,
-        );
-        assert_eq!(id, 2);
     }
 }
