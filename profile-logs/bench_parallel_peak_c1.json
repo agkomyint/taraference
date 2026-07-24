@@ -1,0 +1,31 @@
+{
+  "model": "Qwen3.5-4B-Q4_K_M",
+  "base_url": "http://127.0.0.1:8787/v1",
+  "runs": [
+    {
+      "concurrency": 1,
+      "max_tokens": 512,
+      "duration_s": 45.0,
+      "wall_s": 61.89998409996042,
+      "requests_ok": 2,
+      "requests_err": 0,
+      "total_completion": 1024,
+      "total_prompt": 98,
+      "aggregate_tps": 16.542815234756333,
+      "mean_req_tps": 19.178259470479045,
+      "mean_latency_s": 30.949544650007738,
+      "p50_latency_s": 30.949544650007738,
+      "p95_latency_s": 41.27476643500559,
+      "projected_1m_s": 60449.2032226176,
+      "notes": "single stream"
+    }
+  ],
+  "best_aggregate_tps": 16.542815234756333,
+  "best_config": {
+    "concurrency": 1,
+    "max_tokens": 512
+  },
+  "projected_1m_s": 60449.2032226176,
+  "projected_1m_human": "16h 47m 29s",
+  "architecture": "single_mutex_engine_no_continuous_batching"
+}

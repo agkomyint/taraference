@@ -297,6 +297,19 @@ fn run_profile(engine: &mut InferenceEngine, cli: &Cli, model: &PathBuf) -> Resu
     };
     enrich_gpu_info_from_smi(&mut gpu);
 
+    let variant = if std::env::var_os("TARAFER_Q35_FAST").is_some()
+        || std::env::var("TARAFER_VARIANT")
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v == "q35fast" || v == "fast" || v == "q4"
+            })
+            .unwrap_or(false)
+    {
+        Some("q35fast".to_string())
+    } else {
+        None
+    };
+
     let meta = ProfileMeta {
         model_path: model.display().to_string(),
         cfg: engine.cfg().clone(),
@@ -305,15 +318,20 @@ fn run_profile(engine: &mut InferenceEngine, cli: &Cli, model: &PathBuf) -> Resu
         max_new,
         sample_interval_ms: 100,
         decode: engine.decode(),
+        variant: variant.clone(),
         gpu: gpu.clone(),
     };
 
     eprintln!(
-        "profile mode ({mode}) | decode={} | max_new={max_new} | turns={} | gpu={} ({})",
+        "profile mode ({mode}) | decode={} | max_new={max_new} | turns={} | gpu={} ({}){}",
         engine.decode().name(),
         script.len(),
         gpu.name,
-        gpu.nvrtc_arch
+        gpu.nvrtc_arch,
+        variant
+            .as_ref()
+            .map(|v| format!(" | variant={v}"))
+            .unwrap_or_default()
     );
     for (i, u) in script.iter().enumerate() {
         eprintln!("  turn {}: {u:?}", i + 1);

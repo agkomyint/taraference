@@ -121,3 +121,11 @@ stamp,decode,file,overall_decode_tps,decode_tps_first,decode_tps_last,decode_dro
 2026-07-20_17-52-51,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-20_17-52-51_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,38.628,45.001,48.969,-8.82,465
 2026-07-20_17-53-57,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-20_17-53-57_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,65.218,68.450,61.937,9.52,465
 2026-07-20_17-55-13,Qwen3.5-4B-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-20_17-55-13_Qwen3.5-4B-Q4_K_M_flash.txt,39.416,46.469,35.266,24.11,595
+2026-07-24_23-11-15,Qwen3.5-4B-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-24_23-11-15_Qwen3.5-4B-Q4_K_M_flash.txt,46.613,47.703,44.946,5.78,595
+2026-07-24_23-24-33,Qwen3.5-4B-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-24_23-24-33_Qwen3.5-4B-Q4_K_M_flash.txt,46.501,48.590,44.856,7.68,595
+2026-07-24_23-24-54,Qwen3.5-4B-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-24_23-24-54_Qwen3.5-4B-Q4_K_M_flash.txt,52.475,56.954,50.326,11.64,596
+2026-07-24_23-25-37,Qwen3.5-4B-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-24_23-25-37_Qwen3.5-4B-Q4_K_M_flash.txt,55.372,58.440,52.634,9.93,596
+2026-07-24_23-25-58,Qwen3.5-4B-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-24_23-25-58_Qwen3.5-4B-Q4_K_M_flash.txt,53.032,57.543,50.829,11.67,596
+2026-07-24_23-45-21,Qwen3.5-4B-Q4_K_M_q35fast,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-24_23-45-21_Qwen3.5-4B-Q4_K_M_q35fast_flash.txt,56.406,58.110,54.583,6.07,596
+2026-07-24_23-46-35,Qwen3.5-4B-Q4_K_M_q35fast,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-24_23-46-35_Qwen3.5-4B-Q4_K_M_q35fast_flash.txt,55.782,57.383,53.363,7.01,596
+2026-07-25_00-09-49,Qwen2.5-3B-Instruct-Q4_K_M,flash,"NVIDIA GeForce RTX 3050 Ti Laptop GPU",8.6,sm_86,profile_2026-07-25_00-09-49_Qwen2.5-3B-Instruct-Q4_K_M_flash.txt,67.344,69.993,64.498,7.85,465

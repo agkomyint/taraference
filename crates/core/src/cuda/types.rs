@@ -186,6 +186,8 @@ pub struct Kernels {
     pub gemv_q8_qkv: CudaFunction,
     pub gemv_q8_gdn_4way: CudaFunction,
     pub gemv_hybrid_gdn_4way: CudaFunction,
+    /// q35fast: Q4 wqkv+gate + Q8 beta/alpha.
+    pub gemv_q4_gdn_4way: CudaFunction,
     pub gemv_q8_qkv_splitk: CudaFunction,
     pub gemv_q8_gdn_4way_splitk: CudaFunction,
     pub gemv_hybrid_gdn_4way_splitk: CudaFunction,

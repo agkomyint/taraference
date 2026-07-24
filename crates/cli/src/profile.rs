@@ -80,6 +80,8 @@ pub struct ProfileMeta {
     pub max_new: usize,
     pub sample_interval_ms: u64,
     pub decode: DecodeBackend,
+    /// Optional A/B path label (e.g. `q35fast` from `TARAFER_Q35_FAST=1`).
+    pub variant: Option<String>,
     /// Which GPU this run used (name + sm_XX + driver).
     pub gpu: GpuProfileInfo,
 }
@@ -303,6 +305,9 @@ impl Profiler {
         line("════════════════════════════════════════════════════════════════".into());
         line("  CONFIG".into());
         line(format!("    model     {}", meta.model_path));
+        if let Some(ref v) = meta.variant {
+            line(format!("    variant   {v}"));
+        }
         line(format!(
             "    arch      {}  L={}  d={}  heads={}/{}  ff={}  vocab={}",
             meta.cfg.architecture,
@@ -589,6 +594,11 @@ impl Profiler {
         line("════════════════════════════════════════════════════════════════".into());
 
         let model_slug = model_slug(&meta.model_path);
+        // Keep A/B variants in separate latest_* files so baseline vs q35fast don't clobber.
+        let compare_slug = match &meta.variant {
+            Some(v) if !v.is_empty() => format!("{model_slug}_{v}"),
+            _ => model_slug.clone(),
+        };
 
         // Machine-readable SUMMARY block (easy to diff between runs).
         line("  SUMMARY_KV".into());
@@ -596,6 +606,9 @@ impl Profiler {
         line(format!("    model={model_slug}"));
         line(format!("    model_path={}", meta.model_path));
         line(format!("    decode_backend={}", meta.decode.name()));
+        if let Some(ref v) = meta.variant {
+            line(format!("    variant={v}"));
+        }
         line(format!("    mode={mode}"));
         // GPU keys first-class for multi-machine A/B (T4 vs 3050 Ti, etc.)
         line(format!(
@@ -636,19 +649,19 @@ impl Profiler {
 
         print!("{report}");
 
-        // Compare only against the previous run of the *same* model.
-        let prev = read_latest_for_model(&model_slug);
-        let path = save_profile_log(&report, meta, &stamp, &model_slug);
+        // Compare only against the previous run of the *same* model+variant.
+        let prev = read_latest_for_model(&compare_slug);
+        let path = save_profile_log(&report, meta, &stamp, &compare_slug);
         if let Some(ref p) = path {
             eprintln!("\nprofile log → {}", p.display());
-            // Global latest + per-model latest (fair A/B).
+            // Global latest + per-model(+variant) latest (fair A/B).
             let _ = fs::write(Path::new(PROFILE_LOG_DIR).join("latest.txt"), &report);
             let _ = fs::write(
-                Path::new(PROFILE_LOG_DIR).join(format!("latest_{model_slug}.txt")),
+                Path::new(PROFILE_LOG_DIR).join(format!("latest_{compare_slug}.txt")),
                 &report,
             );
             if let Some(prev_text) = prev {
-                print_compare(&prev_text, &report, &model_slug);
+                print_compare(&prev_text, &report, &compare_slug);
             }
         } else {
             eprintln!("\nprofile log: failed to write under {PROFILE_LOG_DIR}/");

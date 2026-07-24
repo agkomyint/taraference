@@ -29,6 +29,46 @@ fn wtype_of(t: GgmlType) -> Result<WType> {
 
 const Q5_K_BLOCK_BYTES: usize = 176;
 const Q8_0_BLOCK_BYTES: usize = 34;
+const Q4_K_BLOCK_BYTES: usize = 144;
+
+/// How hybrid models treat Q5_K hot-path weights (attn_qkv / ssm_out).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Q5kDecodeMode {
+    /// Keep native Q5_K (slow f32 GEMV — debug / quality check).
+    Native,
+    /// Default hybrid path: expand to Q8_0 for fast DP4A GEMV (more BW).
+    ToQ8,
+    /// A/B fast path (`TARAFER_Q35_FAST=1`): requantize to Q4_K for less BW +
+    /// existing Q4 DP4A kernels. Slight quality trade for ~15% less traffic.
+    ToQ4,
+}
+
+fn q5k_decode_mode(is_hybrid: bool) -> Q5kDecodeMode {
+    if std::env::var_os("TARAFER_Q5K_NATIVE").is_some() {
+        return Q5kDecodeMode::Native;
+    }
+    // Explicit full force to Q8 even on non-hybrid.
+    if std::env::var_os("TARAFER_Q5K_TRANSCODE").is_some() {
+        return Q5kDecodeMode::ToQ8;
+    }
+    // Qwen3.5-4B speed variant: keep default binary, opt-in via env.
+    if is_hybrid
+        && (std::env::var_os("TARAFER_Q35_FAST").is_some()
+            || std::env::var("TARAFER_VARIANT")
+                .map(|v| {
+                    let v = v.to_ascii_lowercase();
+                    v == "q35fast" || v == "fast" || v == "q4"
+                })
+                .unwrap_or(false))
+    {
+        return Q5kDecodeMode::ToQ4;
+    }
+    if is_hybrid {
+        Q5kDecodeMode::ToQ8
+    } else {
+        Q5kDecodeMode::Native
+    }
+}
 
 fn q5_k_scale_min(scales: &[u8], j: usize) -> (u8, u8) {
     if j < 4 {
@@ -39,6 +79,24 @@ fn q5_k_scale_min(scales: &[u8], j: usize) -> (u8, u8) {
             (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
         )
     }
+}
+
+/// Pack eight 6-bit (scale, min) pairs into the 12-byte Q4_K scale field.
+/// Matches `get_scale_min_k4` in `common.cu`.
+fn pack_q4k_scales(sc: &[u8; 8], m: &[u8; 8]) -> [u8; 12] {
+    let mut scales = [0u8; 12];
+    for j in 0..4 {
+        scales[j] = sc[j] & 0x3f;
+        scales[j + 4] = m[j] & 0x3f;
+    }
+    for j in 0..4 {
+        let sc_hi = (sc[j + 4] >> 4) & 3;
+        let m_hi = (m[j + 4] >> 4) & 3;
+        scales[j] |= sc_hi << 6;
+        scales[j + 4] |= m_hi << 6;
+        scales[j + 8] = (sc[j + 4] & 0x0f) | ((m[j + 4] & 0x0f) << 4);
+    }
+    scales
 }
 
 fn dequant_q5_k_block(block: &[u8], out: &mut [f32; 256]) {
@@ -95,6 +153,125 @@ fn transcode_q5_k_to_q8_0(raw: &[u8]) -> Result<Vec<u8>> {
                 out.push(q as u8);
             }
         }
+    }
+    Ok(out)
+}
+
+/// Requantize one dequantized 256-vector into a Q4_K block (144 B).
+/// Layout matches `dequant_q4_k_block_smem` / `dot_q4_k_col_q8_range`.
+fn quantize_q4_k_block(values: &[f32; 256], out: &mut [u8; Q4_K_BLOCK_BYTES]) {
+    // 8 groups of 32: find per-group min and (max-min)/15 scale.
+    let mut group_min = [0.0f32; 8];
+    let mut group_scale = [0.0f32; 8];
+    for g in 0..8 {
+        let base = g * 32;
+        let mut mn = values[base];
+        let mut mx = values[base];
+        for i in 1..32 {
+            let v = values[base + i];
+            mn = mn.min(v);
+            mx = mx.max(v);
+        }
+        group_min[g] = mn;
+        let span = mx - mn;
+        group_scale[g] = if span > 0.0 { span / 15.0 } else { 0.0 };
+    }
+
+    let mut max_scale = 0.0f32;
+    let mut max_min_abs = 0.0f32;
+    for g in 0..8 {
+        max_scale = max_scale.max(group_scale[g]);
+        // dequant does: x = d*sc*q - dmin*m  → offset = dmin*m ≈ -min when min≤0,
+        // or more generally m tracks |offset| with the sign absorbed into the math
+        // (GGML stores mins as non-negative magnitudes of the subtracted term).
+        max_min_abs = max_min_abs.max((-group_min[g]).max(0.0));
+        // Also cover positive mins (rare): treat offset magnitude.
+        max_min_abs = max_min_abs.max(group_min[g].abs());
+    }
+
+    let d = if max_scale > 0.0 {
+        max_scale / 63.0
+    } else {
+        0.0
+    };
+    let dmin = if max_min_abs > 0.0 {
+        max_min_abs / 63.0
+    } else {
+        0.0
+    };
+
+    let mut sc_q = [0u8; 8];
+    let mut m_q = [0u8; 8];
+    for g in 0..8 {
+        sc_q[g] = if d > 0.0 {
+            (group_scale[g] / d).round().clamp(0.0, 63.0) as u8
+        } else {
+            0
+        };
+        // Offset magnitude for dequant subtraction. Prefer -min when min is negative
+        // (common after centering); otherwise |min|.
+        let offset_mag = if group_min[g] <= 0.0 {
+            -group_min[g]
+        } else {
+            group_min[g]
+        };
+        m_q[g] = if dmin > 0.0 {
+            (offset_mag / dmin).round().clamp(0.0, 63.0) as u8
+        } else {
+            0
+        };
+    }
+    let scales = pack_q4k_scales(&sc_q, &m_q);
+
+    out[0..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+    out[2..4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+    out[4..16].copy_from_slice(&scales);
+
+    // qs: 128 bytes, 4 groups of 32 bytes packing two 4-bit values (low/high nibble).
+    for t in 0..4 {
+        let g0 = t * 2;
+        let g1 = t * 2 + 1;
+        let scale0 = d * sc_q[g0] as f32;
+        let scale1 = d * sc_q[g1] as f32;
+        let offset0 = dmin * m_q[g0] as f32;
+        let offset1 = dmin * m_q[g1] as f32;
+        let base0 = g0 * 32;
+        let base1 = g1 * 32;
+        for l in 0..32 {
+            let q0 = if scale0 > 0.0 {
+                ((values[base0 + l] + offset0) / scale0)
+                    .round()
+                    .clamp(0.0, 15.0) as u8
+            } else {
+                0
+            };
+            let q1 = if scale1 > 0.0 {
+                ((values[base1 + l] + offset1) / scale1)
+                    .round()
+                    .clamp(0.0, 15.0) as u8
+            } else {
+                0
+            };
+            out[16 + t * 32 + l] = (q0 & 0x0f) | ((q1 & 0x0f) << 4);
+        }
+    }
+}
+
+/// Q35-fast path: each Q5_K block (176 B) → Q4_K block (144 B). ~18% less bytes
+/// than native Q5 and ~47% less than the default Q5→Q8 expand, with DP4A GEMV.
+fn transcode_q5_k_to_q4_k(raw: &[u8]) -> Result<Vec<u8>> {
+    if raw.len() % Q5_K_BLOCK_BYTES != 0 {
+        bail!("invalid Q5_K tensor byte length {}", raw.len());
+    }
+    let n_blocks = raw.len() / Q5_K_BLOCK_BYTES;
+    let mut out = vec![0u8; n_blocks * Q4_K_BLOCK_BYTES];
+    let mut values = [0.0f32; 256];
+    let mut block_out = [0u8; Q4_K_BLOCK_BYTES];
+    for (i, block) in raw.chunks_exact(Q5_K_BLOCK_BYTES).enumerate() {
+        dequant_q5_k_block(block, &mut values);
+        quantize_q4_k_block(&values, &mut block_out);
+        let dst = i * Q4_K_BLOCK_BYTES;
+        out[dst..dst + Q4_K_BLOCK_BYTES].copy_from_slice(&block_out);
     }
     Ok(out)
 }
@@ -187,47 +364,63 @@ impl CudaModel {
         let cc_minor = device.compute_minor;
         let arch = device.nvrtc_arch;
 
-        // Q5_K f32-dot GEMV is much slower than Q8_0 on sm_86 decode.
-        // Hybrid Qwen3.5 puts Q5_K on the hot path (attn_qkv / ssm_out) — auto
-        // transcode unless the user forces native Q5_K.
-        // Override: TARAFER_Q5K_TRANSCODE=1 always; TARAFER_Q5K_NATIVE=1 never.
-        let q5k_fallback = if std::env::var_os("TARAFER_Q5K_NATIVE").is_some() {
-            false
-        } else if std::env::var_os("TARAFER_Q5K_TRANSCODE").is_some() {
-            true
-        } else {
-            cfg.is_hybrid()
-        };
-        let q5k_transcoded = std::cell::Cell::new(0usize);
+        // Q5_K f32-dot GEMV is much slower than Q8/Q4 DP4A on sm_86 decode.
+        // Hybrid Qwen3.5 puts Q5_K on the hot path (attn_qkv / ssm_out).
+        //   default:          Q5_K → Q8_0  (quality, more BW)
+        //   TARAFER_Q35_FAST: Q5_K → Q4_K  (A/B speed variant, less BW)
+        //   TARAFER_Q5K_NATIVE: keep Q5_K
+        let q5k_mode = q5k_decode_mode(cfg.is_hybrid());
+        if matches!(q5k_mode, Q5kDecodeMode::ToQ4) {
+            eprintln!(
+                "variant | q35fast  Q5_K→Q4_K hot-path (A/B; unset TARAFER_Q35_FAST / TARAFER_VARIANT for default Q5→Q8)"
+            );
+        }
+        let q5k_to_q8 = std::cell::Cell::new(0usize);
+        let q5k_to_q4 = std::cell::Cell::new(0usize);
         let q5_1_transcoded = std::cell::Cell::new(0usize);
         let upload_mat = |name: &str| -> Result<GpuMat> {
             let t = gguf.tensor(name).ok_or_else(|| anyhow!("missing {name}"))?;
             let n_rows = t.dims[0] as usize;
             let n_cols = *t.dims.get(1).unwrap_or(&1) as usize;
             let source_raw = gguf.tensor_data(t);
-            let converted = match t.ggml_type {
-                GgmlType::Q5_K if q5k_fallback => {
-                    q5k_transcoded.set(q5k_transcoded.get() + 1);
-                    Some(
-                        transcode_q5_k_to_q8_0(source_raw)
-                            .with_context(|| format!("transcode {name} Q5_K -> Q8_0"))?,
-                    )
-                }
+            // (bytes, resulting WType)
+            let converted: Option<(Vec<u8>, WType)> = match t.ggml_type {
+                GgmlType::Q5_K => match q5k_mode {
+                    Q5kDecodeMode::Native => None,
+                    Q5kDecodeMode::ToQ8 => {
+                        q5k_to_q8.set(q5k_to_q8.get() + 1);
+                        Some((
+                            transcode_q5_k_to_q8_0(source_raw)
+                                .with_context(|| format!("transcode {name} Q5_K -> Q8_0"))?,
+                            WType::Q8_0,
+                        ))
+                    }
+                    Q5kDecodeMode::ToQ4 => {
+                        q5k_to_q4.set(q5k_to_q4.get() + 1);
+                        Some((
+                            transcode_q5_k_to_q4_k(source_raw)
+                                .with_context(|| format!("transcode {name} Q5_K -> Q4_K"))?,
+                            WType::Q4K,
+                        ))
+                    }
+                },
                 GgmlType::Q5_1 => {
                     q5_1_transcoded.set(q5_1_transcoded.get() + 1);
-                    Some(
+                    Some((
                         transcode_q5_1_to_q8_0(source_raw)
                             .with_context(|| format!("transcode {name} Q5_1 -> Q8_0"))?,
-                    )
+                        WType::Q8_0,
+                    ))
                 }
                 _ => None,
             };
-            let (raw, wtype, col_bytes) = if let Some(ref data) = converted {
-                (
-                    data.as_slice(),
-                    WType::Q8_0,
-                    GgmlType::Q8_0.nbytes(n_rows as u64) as usize,
-                )
+            let (raw, wtype, col_bytes) = if let Some((ref data, wt)) = converted {
+                let cb = match wt {
+                    WType::Q4K => GgmlType::Q4_K.nbytes(n_rows as u64) as usize,
+                    WType::Q8_0 => GgmlType::Q8_0.nbytes(n_rows as u64) as usize,
+                    _ => unreachable!("q5 transcode only yields Q4K/Q8_0"),
+                };
+                (data.as_slice(), wt, cb)
             } else {
                 (
                     source_raw,
@@ -416,10 +609,11 @@ impl CudaModel {
                 },
             });
         }
-        if q5k_transcoded.get() != 0 || q5_1_transcoded.get() != 0 {
+        if q5k_to_q8.get() != 0 || q5k_to_q4.get() != 0 || q5_1_transcoded.get() != 0 {
             eprintln!(
-                "load fast-path | Q5_K -> Q8_0={} Q5_1 -> Q8_0={} tensors (hybrid decode; set TARAFER_Q5K_NATIVE=1 to keep Q5_K)",
-                q5k_transcoded.get(),
+                "load fast-path | Q5_K->Q8_0={} Q5_K->Q4_K={} Q5_1->Q8_0={} (native: TARAFER_Q5K_NATIVE=1; q35fast: TARAFER_Q35_FAST=1)",
+                q5k_to_q8.get(),
+                q5k_to_q4.get(),
                 q5_1_transcoded.get()
             );
         }

@@ -222,6 +222,7 @@ impl Kernels {
             gemv_q8_qkv: module.load_function("gemv_q8_0_qkv")?,
             gemv_q8_gdn_4way: module.load_function("gemv_q8_0_gdn_4way")?,
             gemv_hybrid_gdn_4way: module.load_function("gemv_hybrid_gdn_4way")?,
+            gemv_q4_gdn_4way: module.load_function("gemv_q4_gdn_4way")?,
             gemv_q8_qkv_splitk: module.load_function("gemv_q8_0_qkv_splitk")?,
             gemv_q8_gdn_4way_splitk: module.load_function("gemv_q8_0_gdn_4way_splitk")?,
             gemv_hybrid_gdn_4way_splitk: module.load_function("gemv_hybrid_gdn_4way_splitk")?,

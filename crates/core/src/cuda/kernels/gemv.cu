@@ -2924,6 +2924,63 @@ extern "C" __global__ void gemv_hybrid_gdn_4way(
     }
 }
 
+// q35fast path: wqkv + gate Q4_K, beta/alpha Q8_0. Less weight traffic than hybrid Q8 qkv.
+extern "C" __global__ void gemv_q4_gdn_4way(
+    const unsigned char* __restrict__ wqkv,
+    const unsigned char* __restrict__ w_gate,
+    const unsigned char* __restrict__ w_beta,
+    const unsigned char* __restrict__ w_alpha,
+    const float* __restrict__ x,
+    float* __restrict__ out_qkv,
+    float* __restrict__ out_gate,
+    float* __restrict__ out_beta,
+    float* __restrict__ out_alpha,
+    int n_rows, int n_qkv, int n_gate, int n_beta, int n_alpha,
+    int col_bytes_q4, int col_bytes_q8
+) {
+    extern __shared__ unsigned char qsmem[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    signed char* xq = reinterpret_cast<signed char*>(qsmem);
+    float* xd = reinterpret_cast<float*>(qsmem + n_rows);
+    quantize_q8_smem(x, xq, xd, n_rows, warp, lane);
+    __syncthreads();
+
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int j = (int)blockIdx.x * warps_per_block + warp;
+    const int n_tot = n_qkv + n_gate + n_beta + n_alpha;
+    if (j >= n_tot) return;
+
+    const unsigned char* wcol;
+    float* out;
+    int oj;
+    float acc;
+    if (j < n_qkv) {
+        wcol = wqkv + (size_t)j * (size_t)col_bytes_q4;
+        out = out_qkv; oj = j;
+        acc = dot_q4_k_col_q8_range(wcol, xq, xd, 0, n_rows / 256, lane);
+    } else if (j < n_qkv + n_gate) {
+        oj = j - n_qkv;
+        wcol = w_gate + (size_t)oj * (size_t)col_bytes_q4;
+        out = out_gate;
+        acc = dot_q4_k_col_q8_range(wcol, xq, xd, 0, n_rows / 256, lane);
+    } else if (j < n_qkv + n_gate + n_beta) {
+        oj = j - n_qkv - n_gate;
+        wcol = w_beta + (size_t)oj * (size_t)col_bytes_q8;
+        out = out_beta;
+        acc = dot_q8_0_col_q8_range(wcol, xq, xd, 0, n_rows / 32, lane);
+    } else {
+        oj = j - n_qkv - n_gate - n_beta;
+        wcol = w_alpha + (size_t)oj * (size_t)col_bytes_q8;
+        out = out_alpha;
+        acc = dot_q8_0_col_q8_range(wcol, xq, xd, 0, n_rows / 32, lane);
+    }
+    if (lane == 0) {
+        out[oj] = acc;
+    }
+}
+
 extern "C" __global__ void gemv_q8_0_qkv_splitk(
     const unsigned char* __restrict__ wq,
     const unsigned char* __restrict__ wk,

@@ -1160,6 +1160,7 @@ pub(crate) fn try_gemv_gdn_4way(
         && wqkv.col_bytes == w_beta.col_bytes
         && wqkv.col_bytes == w_alpha.col_bytes;
 
+    // Default hybrid: Q5→Q8 qkv + native Q4 gate + Q8 beta/alpha.
     let is_hybrid = wqkv.wtype == WType::Q8_0
         && w_gate.wtype == WType::Q4K
         && w_beta.wtype == WType::Q8_0
@@ -1167,7 +1168,15 @@ pub(crate) fn try_gemv_gdn_4way(
         && wqkv.col_bytes == w_beta.col_bytes
         && wqkv.col_bytes == w_alpha.col_bytes;
 
-    if (!is_all_q8 && !is_hybrid)
+    // q35fast: Q5→Q4 qkv + native Q4 gate + Q8 beta/alpha.
+    let is_q4_fast = wqkv.wtype == WType::Q4K
+        && w_gate.wtype == WType::Q4K
+        && w_beta.wtype == WType::Q8_0
+        && w_alpha.wtype == WType::Q8_0
+        && wqkv.col_bytes == w_gate.col_bytes
+        && w_beta.col_bytes == w_alpha.col_bytes;
+
+    if (!is_all_q8 && !is_hybrid && !is_q4_fast)
         || wqkv.n_rows != w_gate.n_rows
         || wqkv.n_rows != w_beta.n_rows
         || wqkv.n_rows != w_alpha.n_rows
@@ -1179,14 +1188,23 @@ pub(crate) fn try_gemv_gdn_4way(
     let n_gate = w_gate.n_cols as i32;
     let n_beta = w_beta.n_cols as i32;
     let n_alpha = w_alpha.n_cols as i32;
-    let col_bytes = wqkv.col_bytes as i32;
-    let col_bytes_q4 = w_gate.col_bytes as i32;
+    let col_bytes_q8 = if is_q4_fast {
+        w_beta.col_bytes as i32
+    } else {
+        wqkv.col_bytes as i32
+    };
+    let col_bytes_q4 = if is_q4_fast {
+        wqkv.col_bytes as i32
+    } else {
+        w_gate.col_bytes as i32
+    };
     let n_tot = (wqkv.n_cols + w_gate.n_cols + w_beta.n_cols + w_alpha.n_cols) as u32;
     let n_split = gemv_n_split(wqkv.n_rows);
     let warps = k.gemv_quantized_warps.max(1);
     // Prefer smem-quantize fused kernel for typical GDN widths (d_model ≤ 4k).
     // Split-K uses global Q8 and is reserved for tall mats (FFN-class rows).
-    if n_split > 1 && (n_tot as usize) <= partial_stride {
+    // q35fast has no split-K twin yet — fall through to smem path (n_rows=2560 → n_split=1).
+    if n_split > 1 && !is_q4_fast && (n_tot as usize) <= partial_stride {
         quantize_q8(stream, k, x, q8_x, q8_d, n_rows)?;
         unsafe {
             let mut b = if is_hybrid {
@@ -1206,7 +1224,7 @@ pub(crate) fn try_gemv_gdn_4way(
                 .arg(&n_gate)
                 .arg(&n_beta)
                 .arg(&n_alpha)
-                .arg(&col_bytes);
+                .arg(&col_bytes_q8);
             if is_hybrid {
                 b.arg(&col_bytes_q4);
             }
@@ -1237,30 +1255,52 @@ pub(crate) fn try_gemv_gdn_4way(
     } else {
         // Smem path: f32 x → Q8 once per block (same math as gemv_q8_0_qkv).
         unsafe {
-            let mut b = if is_hybrid {
-                stream.launch_builder(&k.gemv_hybrid_gdn_4way)
+            if is_q4_fast {
+                stream
+                    .launch_builder(&k.gemv_q4_gdn_4way)
+                    .arg(&wqkv.data)
+                    .arg(&w_gate.data)
+                    .arg(&w_beta.data)
+                    .arg(&w_alpha.data)
+                    .arg(x)
+                    .arg(out_qkv)
+                    .arg(out_gate)
+                    .arg(out_beta)
+                    .arg(out_alpha)
+                    .arg(&n_rows)
+                    .arg(&n_qkv)
+                    .arg(&n_gate)
+                    .arg(&n_beta)
+                    .arg(&n_alpha)
+                    .arg(&col_bytes_q4)
+                    .arg(&col_bytes_q8)
+                    .launch(lc_gemv_quantized(n_tot, wqkv.n_rows as u32, warps))?;
             } else {
-                stream.launch_builder(&k.gemv_q8_gdn_4way)
-            };
-            b.arg(&wqkv.data)
-                .arg(&w_gate.data)
-                .arg(&w_beta.data)
-                .arg(&w_alpha.data)
-                .arg(x)
-                .arg(out_qkv)
-                .arg(out_gate)
-                .arg(out_beta)
-                .arg(out_alpha)
-                .arg(&n_rows)
-                .arg(&n_qkv)
-                .arg(&n_gate)
-                .arg(&n_beta)
-                .arg(&n_alpha)
-                .arg(&col_bytes);
-            if is_hybrid {
-                b.arg(&col_bytes_q4);
+                let mut b = if is_hybrid {
+                    stream.launch_builder(&k.gemv_hybrid_gdn_4way)
+                } else {
+                    stream.launch_builder(&k.gemv_q8_gdn_4way)
+                };
+                b.arg(&wqkv.data)
+                    .arg(&w_gate.data)
+                    .arg(&w_beta.data)
+                    .arg(&w_alpha.data)
+                    .arg(x)
+                    .arg(out_qkv)
+                    .arg(out_gate)
+                    .arg(out_beta)
+                    .arg(out_alpha)
+                    .arg(&n_rows)
+                    .arg(&n_qkv)
+                    .arg(&n_gate)
+                    .arg(&n_beta)
+                    .arg(&n_alpha)
+                    .arg(&col_bytes_q8);
+                if is_hybrid {
+                    b.arg(&col_bytes_q4);
+                }
+                b.launch(lc_gemv_quantized(n_tot, wqkv.n_rows as u32, warps))?;
             }
-            b.launch(lc_gemv_quantized(n_tot, wqkv.n_rows as u32, warps))?;
         }
     }
     Ok(true)
