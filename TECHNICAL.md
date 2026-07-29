@@ -6,13 +6,14 @@ This document contains low-level technical specifications, internal kernel archi
 
 ## 🏗 System Architecture & Design Principles
 
-Taraference is built from the ground up in **Rust** and **CUDA** with a single target in mind: **Maximum single-stream token generation throughput on NVIDIA consumer and enterprise GPUs**.
+Taraference is built from the ground up in **Rust** and **CUDA** with a single target in mind: **Maximum single-stream token generation throughput and embedding extraction performance on NVIDIA GPUs**.
 
-Unlike multi-tenant engines (vLLM, TGI) that optimize for batch throughput and concurrent request density, Taraference optimizes for **zero-latency single-user interactive decode token generation**.
+Unlike multi-tenant engines (vLLM, TGI) that optimize for batch throughput and concurrent request density, Taraference optimizes for **zero-latency single-user interactive decode token generation and fast vector embedding inference**.
 
 ```
                            +---------------------------+
                            |  tarafer CLI / REST API   |
+                           |  (/v1/chat & /v1/embed)   |
                            +-------------+-------------+
                                          |
                                          v
@@ -34,10 +35,27 @@ Unlike multi-tenant engines (vLLM, TGI) that optimize for batch throughput and c
                                                     |                      |                      |
                                                     v                      v                      v
                                              +--------------+       +--------------+       +--------------+
-                                             | Split-K GEMV |       | Flash Decode |       | Dynamic NVRTC|
-                                             |  (Q4/Q5/Q8)  |       | (8-way KV)   |       | CUDA Graphs  |
+                                             | Split-K GEMV |       | Flash Decode |       | Embedding &  |
+                                             |  (Q4/Q5/Q8)  |       | (8-way KV)   |       | Norm Kernels |
                                              +--------------+       +--------------+       +--------------+
 ```
+
+---
+
+## 🔤 Text Embeddings Architecture (`BackendKind::Qwen3Embedding`)
+
+Taraference includes dedicated, first-class support for high-dimensional text embedding models (such as `Qwen3-Embedding-4B-Q4_K_M.gguf`).
+
+### Embedding Forward Pipeline
+1. **Tokenization & EOS Binding**:
+   - The input text string is tokenized with automatic trailing `<|endoftext|>` token insertion.
+2. **Dense Transformer Forward Pass**:
+   - Computes causal/dense transformer hidden states up to the final layer, bypassing the token generation output head projection.
+3. **EOS State Extraction & Output Normalization**:
+   - Extracts the hidden vector corresponding to the final EOS token state and applies the model's `output_norm` (RMSNorm/LayerNorm).
+4. **Matryoshka Dimension Truncation & L2 Normalization**:
+   - If a custom dimension parameter is specified (e.g. `256`, `512`, `1024`, or full `2560`), the hidden vector is sliced to the target sub-dimension.
+   - Computes L2 vector magnitude normalization using custom CUDA kernels, returning an FP32 normalized vector array.
 
 ---
 
@@ -65,9 +83,9 @@ Unlike multi-tenant engines (vLLM, TGI) that optimize for batch throughput and c
 | Path | Crate | Role & Functionality |
 |------|-------|----------------------|
 | `crates/cli` | `taraference` | Main executable binary (`tarafer`). Provides interactive chat, HuggingFace model downloader, OpenAI REST server, and benchmarking profiler. |
-| `crates/cli/src/serve` | N/A | Axum-based OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`). |
-| `crates/core` | `taraference-core` | Complete inference engine runtime. Handles model weights loading, CUDA context initialization, KV cache management, and session state. |
-| `crates/core/src/cuda/` | N/A | Low-level GPU memory allocators, tensor loaders, matrix multiplication wrappers, and NVRTC CUDA kernel definitions (`kernels/*.cu`). |
+| `crates/cli/src/serve` | N/A | Axum-based OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/health`). |
+| `crates/core` | `taraference-core` | Complete inference engine runtime. Handles model weights loading, CUDA context initialization, KV cache management, embeddings extraction, and session state. |
+| `crates/core/src/cuda/` | N/A | Low-level GPU memory allocators, tensor loaders, matrix multiplication wrappers, and NVRTC CUDA kernel definitions (`kernels/*.cu`, `kernels/embed.cu`). |
 | `crates/gguf` | `taraference-gguf` | High-performance zero-copy mmap reader for GGUF model files. |
 
 ---
