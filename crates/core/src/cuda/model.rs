@@ -193,6 +193,60 @@ impl CudaModel {
         Ok(())
     }
 
+    /// Snapshot hybrid GDN/conv state for speculative verify rollback.
+    pub fn snapshot_recurrent(
+        &self,
+        cache: &CudaKv,
+    ) -> anyhow::Result<(Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>)> {
+        use anyhow::Context;
+        let mut ssm = Vec::with_capacity(self.cfg.n_layer);
+        let mut conv = Vec::with_capacity(self.cfg.n_layer);
+        for li in 0..self.cfg.n_layer {
+            if !self.cfg.is_linear_layer(li) {
+                ssm.push(self.stream.alloc_zeros::<f32>(1)?);
+                conv.push(self.stream.alloc_zeros::<f32>(1)?);
+                continue;
+            }
+            let se = self.cfg.ssm_state_elems().max(1);
+            let ce = self.cfg.ssm_conv_state_elems().max(1);
+            let mut ss = self.stream.alloc_zeros::<f32>(se)?;
+            let mut cc = self.stream.alloc_zeros::<f32>(ce)?;
+            self.stream
+                .memcpy_dtod(&cache.ssm[li], &mut ss)
+                .context("snapshot ssm")?;
+            self.stream
+                .memcpy_dtod(&cache.conv[li], &mut cc)
+                .context("snapshot conv")?;
+            ssm.push(ss);
+            conv.push(cc);
+        }
+        self.stream.synchronize().context("snapshot sync")?;
+        Ok((ssm, conv))
+    }
+
+    /// Restore hybrid GDN/conv state after a rejected speculative suffix.
+    pub fn restore_recurrent(
+        &self,
+        cache: &mut CudaKv,
+        ssm: &[CudaSlice<f32>],
+        conv: &[CudaSlice<f32>],
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        for li in 0..self.cfg.n_layer {
+            if !self.cfg.is_linear_layer(li) {
+                continue;
+            }
+            self.stream
+                .memcpy_dtod(&ssm[li], &mut cache.ssm[li])
+                .context("restore ssm")?;
+            self.stream
+                .memcpy_dtod(&conv[li], &mut cache.conv[li])
+                .context("restore conv")?;
+        }
+        self.stream.synchronize().context("restore sync")?;
+        Ok(())
+    }
+
     /// Drop CUDA graph (e.g. after backend switch — not used mid-session).
     pub fn invalidate_decode_graph(&mut self) {
         self.decode_graph = None;

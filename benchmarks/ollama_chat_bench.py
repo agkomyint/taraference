@@ -29,6 +29,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model")
     parser.add_argument("--label", default="")
+    parser.add_argument("--num-ctx", type=int, default=5000)
+    parser.add_argument("--num-predict", type=int, default=128)
+    parser.add_argument(
+        "--keep-alive",
+        default="10m",
+        help="Ollama keep_alive during bench; use 0 after unload separately",
+    )
     args = parser.parse_args()
 
     messages = [{"role": "system", "content": "You are a helpful assistant."}]
@@ -41,10 +48,10 @@ def main():
                 "model": args.model,
                 "messages": messages,
                 "stream": False,
-                "keep_alive": "10m",
+                "keep_alive": args.keep_alive,
                 "options": {
-                    "num_ctx": 5000,
-                    "num_predict": 128,
+                    "num_ctx": args.num_ctx,
+                    "num_predict": args.num_predict,
                     "temperature": 0,
                     "seed": 0,
                 },

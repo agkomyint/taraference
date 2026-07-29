@@ -3,6 +3,47 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingRequest {
+    /// Accepted for OpenAI clients; server always uses the loaded GGUF.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub model: String,
+    pub input: EmbeddingInput,
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingObject>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingObject {
+    pub object: &'static str,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     /// Accepted for OpenAI clients; server always uses the loaded GGUF.
     #[serde(default)]
@@ -109,4 +150,22 @@ pub struct ErrorBody {
     #[serde(rename = "type")]
     pub type_: String,
     pub code: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_single_and_multiple_embedding_inputs() {
+        let one: EmbeddingRequest =
+            serde_json::from_str(r#"{"model":"embed","input":"hello","dimensions":256}"#).unwrap();
+        assert!(matches!(one.input, EmbeddingInput::One(ref value) if value == "hello"));
+        assert_eq!(one.dimensions, Some(256));
+
+        let many: EmbeddingRequest =
+            serde_json::from_str(r#"{"input":["hello","สวัสดี"],"encoding_format":"float"}"#)
+                .unwrap();
+        assert!(matches!(many.input, EmbeddingInput::Many(ref values) if values.len() == 2));
+    }
 }

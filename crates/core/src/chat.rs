@@ -62,6 +62,9 @@ pub fn assistant_generation_prompt(enable_thinking: bool) -> &'static str {
     }
 }
 
+/// Plain ChatML assistant continuation used by Qwen2 / Qwen2.5.
+pub const CHATML_ASSISTANT_PROMPT: &str = "<|im_start|>assistant\n";
+
 /// Build a Qwen2 / ChatML prompt from OpenAI-style messages.
 ///
 /// Ends with the Qwen3.5 assistant generation prompt (see
@@ -106,6 +109,50 @@ pub fn format_chatml(
     out
 }
 
+/// Build ChatML with the generation suffix required by the selected model family.
+pub fn format_chatml_for_model(
+    messages: &[ChatMessage],
+    default_system: Option<&str>,
+    uses_thinking_template: bool,
+    enable_thinking: bool,
+) -> String {
+    let mut prompt = format_chatml_messages(messages, default_system);
+    if messages
+        .last()
+        .map(|message| message.role != ChatRole::Assistant)
+        .unwrap_or(true)
+    {
+        if uses_thinking_template {
+            prompt.push_str(assistant_generation_prompt(enable_thinking));
+        } else {
+            prompt.push_str(CHATML_ASSISTANT_PROMPT);
+        }
+    }
+    prompt
+}
+
+fn format_chatml_messages(messages: &[ChatMessage], default_system: Option<&str>) -> String {
+    let has_system = messages.iter().any(|m| m.role == ChatRole::System);
+    let mut out = String::new();
+
+    if !has_system {
+        if let Some(sys) = default_system {
+            out.push_str("<|im_start|>system\n");
+            out.push_str(sys);
+            out.push_str("<|im_end|>\n");
+        }
+    }
+
+    for message in messages {
+        out.push_str("<|im_start|>");
+        out.push_str(message.role.as_str());
+        out.push('\n');
+        out.push_str(&message.content);
+        out.push_str("<|im_end|>\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +172,21 @@ mod tests {
         let s = format_chatml(&msgs, None, true);
         assert!(s.ends_with("<|im_start|>assistant\n<think>\n"));
         assert!(!s.contains("</think>"));
+    }
+
+    #[test]
+    fn qwen25_prompt_never_contains_think_tags() {
+        let msgs = [ChatMessage::user("return json")];
+        let prompt = format_chatml_for_model(&msgs, Some("system"), false, false);
+        assert!(prompt.ends_with(CHATML_ASSISTANT_PROMPT));
+        assert!(!prompt.contains("<think>"));
+        assert!(!prompt.contains("</think>"));
+    }
+
+    #[test]
+    fn qwen35_non_thinking_prompt_prefills_empty_think_block() {
+        let msgs = [ChatMessage::user("return json")];
+        let prompt = format_chatml_for_model(&msgs, Some("system"), true, false);
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 }

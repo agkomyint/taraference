@@ -52,6 +52,8 @@ pub struct SessionOptions {
     /// When false (default, matches Qwen3.5-0.8B/2B/4B/9B), an empty
     /// `<think></think>` pair is prefilled so the model answers directly.
     pub enable_thinking: bool,
+    /// Model-family capability set by [`InferenceEngine`](crate::InferenceEngine).
+    pub uses_thinking_template: bool,
     /// Zero means greedy GPU argmax. Positive values enable host quality sampling.
     pub temperature: f32,
     /// Nucleus probability used when sampling.
@@ -71,6 +73,7 @@ impl Default for SessionOptions {
             print_stream: true,
             print_stats: true,
             enable_thinking: false,
+            uses_thinking_template: false,
             temperature: 0.0,
             top_p: 1.0,
             top_k: 256,
@@ -110,6 +113,7 @@ pub struct Session<'a> {
     print_stream: bool,
     print_stats: bool,
     enable_thinking: bool,
+    uses_thinking_template: bool,
     sampling: SamplingOptions,
     rng_state: u64,
     primed: bool,
@@ -136,6 +140,7 @@ impl<'a> Session<'a> {
             print_stream: opts.print_stream,
             print_stats: opts.print_stats,
             enable_thinking: opts.enable_thinking,
+            uses_thinking_template: opts.uses_thinking_template,
             sampling: SamplingOptions {
                 temperature: opts.temperature,
                 top_p: opts.top_p,
@@ -166,16 +171,26 @@ impl<'a> Session<'a> {
 
     /// Find a continuation that followed the longest recent token suffix at an
     /// earlier position. The model still verifies every proposed token.
-    fn prompt_lookup_draft(&self, current: u32, limit: usize) -> Vec<u32> {
+    ///
+    /// `min_ngram`: only accept matches of this suffix length or longer.
+    /// High values (4–5) = rare but high accept rate (copy/repeat).
+    /// Low values (2) = more attempts, often wrong on open chat.
+    fn prompt_lookup_draft(&self, current: u32, limit: usize, min_ngram: usize) -> Vec<u32> {
         const MAX_NGRAM: usize = 8;
         const MAX_DRAFT: usize = 8;
+        let min_ngram = min_ngram.max(2);
         if limit < 2 || self.history.len() < 4 {
             return Vec::new();
         }
         let mut context = Vec::with_capacity(self.history.len() + 1);
         context.extend_from_slice(&self.history);
         context.push(current);
-        for n in (2..=MAX_NGRAM.min(context.len())).rev() {
+        let n_lo = min_ngram;
+        let n_hi = MAX_NGRAM.min(context.len());
+        if n_lo > n_hi {
+            return Vec::new();
+        }
+        for n in (n_lo..=n_hi).rev() {
             let suffix_start = context.len() - n;
             let suffix = &context[suffix_start..];
             if self.history.len() <= n {
@@ -194,12 +209,44 @@ impl<'a> Session<'a> {
                     }
                     draft.push(id);
                 }
-                if draft.len() >= 2 {
+                // Prefer at least 3 draft tokens when min_ngram is high (worth verify cost).
+                let min_draft = if min_ngram >= 4 { 3 } else { 2 };
+                if draft.len() >= min_draft {
                     return draft;
                 }
             }
         }
         Vec::new()
+    }
+
+    /// 0 = off, 1 = aggressive PLD, 2 = smart PLD (strong ngrams only).
+    /// Default off for everyday chat — PLD still hurts open generation even with
+    /// min_ngram=4 (hybrid re-run on reject). Opt in via env.
+    fn pld_mode() -> u8 {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            if std::env::var_os("TARAFER_PLD_OFF").is_some() {
+                return 0;
+            }
+            if std::env::var_os("TARAFER_PLD").is_some()
+                || std::env::var_os("TARAFER_Q35_SPEC").is_some()
+            {
+                // TARAFER_PLD_SMART=1 → only strong matches (safer with hybrid).
+                if std::env::var_os("TARAFER_PLD_SMART").is_some() {
+                    return 2;
+                }
+                return 1; // aggressive
+            }
+            0
+        })
+    }
+
+    fn pld_min_ngram() -> usize {
+        match Self::pld_mode() {
+            1 => 2,
+            2 => 4,
+            _ => 99,
+        }
     }
 
     fn build_user_prompt(&self, user: &str, first: bool) -> String {
@@ -218,7 +265,13 @@ impl<'a> Session<'a> {
         s.push_str("<|im_start|>user\n");
         s.push_str(user);
         s.push_str("<|im_end|>\n");
-        s.push_str(crate::chat::assistant_generation_prompt(self.enable_thinking));
+        if self.uses_thinking_template {
+            s.push_str(crate::chat::assistant_generation_prompt(
+                self.enable_thinking,
+            ));
+        } else {
+            s.push_str(crate::chat::CHATML_ASSISTANT_PROMPT);
+        }
         s
     }
 
@@ -318,8 +371,12 @@ impl<'a> Session<'a> {
                 break;
             }
 
-            let draft = if std::env::var_os("TARAFER_PLD").is_some() {
-                self.prompt_lookup_draft(next, self.max_new - step)
+            // Speculative decode (PLD):
+            // - TARAFER_PLD / TARAFER_Q35_SPEC → aggressive (min ngram 2)
+            // - TARAFER_Q35_FAST alone → smart (min ngram 4; skip if no strong match)
+            // - TARAFER_PLD_OFF → force off even with q35fast
+            let draft = if Self::pld_mode() != 0 {
+                self.prompt_lookup_draft(next, self.max_new - step, Self::pld_min_ngram())
             } else {
                 Vec::new()
             };
@@ -331,8 +388,19 @@ impl<'a> Session<'a> {
             }
 
             let old_len = self.cache.len;
+            let hybrid = self.model.cfg.is_hybrid();
+            // GDN is recurrent: multi-token verify advances past rejected drafts.
+            // Snapshot so partial reject can restore + re-apply only the prefix.
+            // Full accept keeps the multi-token DP4A path (real speedup when
+            // drafts match — e.g. copy/repeat prompts ~70+ t/s on 4B).
+            let recurrent_snap = if hybrid {
+                Some(self.model.snapshot_recurrent(self.cache)?)
+            } else {
+                None
+            };
+            let current = next;
             let mut verify = Vec::with_capacity(draft.len() + 1);
-            verify.push(next);
+            verify.push(current);
             verify.extend_from_slice(&draft);
             let predictions = self.model.forward_greedy_all(&verify, self.cache)?;
             pld_passes += 1;
@@ -342,8 +410,23 @@ impl<'a> Session<'a> {
                 accepted += 1;
             }
             pld_accepted += accepted;
-            self.cache.len = old_len + 1 + accepted;
-            self.history.push(next);
+
+            if hybrid && accepted < draft.len() {
+                if let Some((ref ssm, ref conv)) = recurrent_snap {
+                    self.model.restore_recurrent(self.cache, ssm, conv)?;
+                }
+                self.cache.len = old_len;
+                let mut committed = Vec::with_capacity(1 + accepted);
+                committed.push(current);
+                committed.extend_from_slice(&draft[..accepted]);
+                let preds2 = self.model.forward_greedy_all(&committed, self.cache)?;
+                next = preds2[accepted];
+            } else {
+                self.cache.len = old_len + 1 + accepted;
+                next = predictions[accepted];
+            }
+
+            self.history.push(current);
             self.history.extend_from_slice(&draft[..accepted]);
 
             for &id in &draft[..accepted] {
@@ -364,7 +447,6 @@ impl<'a> Session<'a> {
                 stop = StopReason::MaxNew;
                 break;
             }
-            next = predictions[accepted];
         }
 
         // Decode throughput covers accepted/generated tokens only. The ChatML

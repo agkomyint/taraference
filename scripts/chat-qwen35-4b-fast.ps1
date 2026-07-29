@@ -2,8 +2,9 @@
 #
 # Usage:
 #   .\scripts\chat-qwen35-4b-fast.ps1
+#   .\scripts\chat-qwen35-4b-fast.ps1 -Spec          # + prompt-lookup speculative decode
 #   .\scripts\chat-qwen35-4b-fast.ps1 -N 256 -Ctx 1024
-#   .\scripts\chat-qwen35-4b-fast.ps1 -Baseline   # default quality path (no Q35_FAST)
+#   .\scripts\chat-qwen35-4b-fast.ps1 -Baseline      # default quality path (no Q35_FAST)
 #
 # In chat:
 #   type a message, Enter
@@ -19,6 +20,8 @@ param(
     [string]$Decode = "flash",
     # Use default Q5→Q8 path instead of q35fast
     [switch]$Baseline,
+    # Prompt-lookup speculative decode (TARAFER_Q35_SPEC=1). Best on repetitive text.
+    [switch]$Spec,
     [switch]$NoCudaGraph,
     [switch]$Think
 )
@@ -64,6 +67,13 @@ if ($Baseline) {
     $env:TARAFER_Q35_FAST = "1"
     $label = "q35fast (Q5→Q4)"
 }
+if ($Spec) {
+    $env:TARAFER_Q35_SPEC = "1"
+    $label = "$label + spec/PLD"
+} else {
+    if (Test-Path Env:TARAFER_Q35_SPEC) { Remove-Item Env:TARAFER_Q35_SPEC -ErrorAction SilentlyContinue }
+    if (Test-Path Env:TARAFER_PLD) { Remove-Item Env:TARAFER_PLD -ErrorAction SilentlyContinue }
+}
 
 Write-Host "Qwen3.5-4B chat — $label" -ForegroundColor Cyan
 Write-Host "  binary  $Tarafer"
@@ -78,8 +88,8 @@ try {
     $code = $LASTEXITCODE
 } finally {
     Pop-Location
-    if (Test-Path Env:TARAFER_Q35_FAST) {
-        Remove-Item Env:TARAFER_Q35_FAST -ErrorAction SilentlyContinue
+    foreach ($e in @("TARAFER_Q35_FAST", "TARAFER_Q35_SPEC", "TARAFER_PLD", "TARAFER_VARIANT")) {
+        if (Test-Path "Env:$e") { Remove-Item "Env:$e" -ErrorAction SilentlyContinue }
     }
 }
 

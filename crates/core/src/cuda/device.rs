@@ -173,8 +173,7 @@ impl Kernels {
             gemv_f16_expert_gate_up: module.load_function("gemv_f16_expert_gate_up")?,
             gemv_f16_expert_down_scale: module.load_function("gemv_f16_expert_down_scale")?,
             gemv_f16_expert_gate_up_4w: module.load_function("gemv_f16_expert_gate_up_4w")?,
-            gemv_f16_expert_down_scale_4w: module
-                .load_function("gemv_f16_expert_down_scale_4w")?,
+            gemv_f16_expert_down_scale_4w: module.load_function("gemv_f16_expert_down_scale_4w")?,
             gemv_q4_0_bm_expert_gate_up: module.load_function("gemv_q4_0_bm_expert_gate_up")?,
             gemv_q4_0_bm_expert_down_scale: module
                 .load_function("gemv_q4_0_bm_expert_down_scale")?,
@@ -233,6 +232,10 @@ impl Kernels {
             gemm_q5k: module.load_function("gemm_q5_k")?,
             gemm_q6: module.load_function("gemm_q6_k")?,
             gemm_q8: module.load_function("gemm_q8_0")?,
+            quantize_q8_rows: module.load_function("quantize_q8_rows")?,
+            gemm_q4_q8_ntok: module.load_function("gemm_q4_k_q8_ntok")?,
+            gemm_q8_q8_ntok: module.load_function("gemm_q8_0_q8_ntok")?,
+            gemm_q6_compact_q8_ntok: module.load_function("gemm_q6_k_compact_q8_ntok")?,
             embed_q4: module.load_function("embed_q4_k")?,
             embed_q5: module.load_function("embed_q5_0")?,
             embed_q5k: module.load_function("embed_q5_k")?,

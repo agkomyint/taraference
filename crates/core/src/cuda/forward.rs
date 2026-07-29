@@ -3,7 +3,7 @@
 use super::kv::CudaKv;
 use super::layer::ChunkDims;
 use super::model::CudaModel;
-use super::types::{MAX_BATCH, MAX_VERIFY_TOKENS};
+use super::types::{GEMM_DP4A_MAX_TOK, MAX_BATCH, MAX_VERIFY_TOKENS};
 use anyhow::{bail, Context, Result};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::PushKernelArg;
@@ -38,6 +38,85 @@ impl CudaModel {
         Ok(out)
     }
 
+    /// Run a complete input and return its last-token, final-RMSNorm hidden
+    /// state. Qwen3 embedding models use this vector, truncated to the requested
+    /// Matryoshka dimension and L2-normalized.
+    pub fn forward_embedding(
+        &mut self,
+        tokens: &[u32],
+        dimensions: usize,
+        cache: &mut CudaKv,
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            bail!("empty embedding input");
+        }
+        if dimensions == 0 || dimensions > self.cfg.n_embd {
+            bail!(
+                "embedding dimensions must be in 1..={} (got {dimensions})",
+                self.cfg.n_embd
+            );
+        }
+        if cache.len + tokens.len() > cache.max_seq {
+            bail!(
+                "embedding input has {} tokens but model limit is {}",
+                cache.len + tokens.len(),
+                cache.max_seq
+            );
+        }
+
+        let max_chunk = if self.cfg.is_moe() {
+            1
+        } else {
+            GEMM_DP4A_MAX_TOK.min(MAX_BATCH)
+        };
+        let mut offset = 0usize;
+        let mut last_chunk_len = 0usize;
+        while offset < tokens.len() {
+            let n = (tokens.len() - offset).min(max_chunk);
+            self.forward_chunk(
+                &tokens[offset..offset + n],
+                cache.len + offset,
+                false,
+                false,
+                cache,
+            )?;
+            offset += n;
+            last_chunk_len = n;
+        }
+        cache.len += tokens.len();
+
+        let n_embd = self.cfg.n_embd as i32;
+        let n_tok = last_chunk_len as i32;
+        let eps = self.cfg.rms_eps;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.rms_norm)
+                .arg(&self.x)
+                .arg(&self.output_norm)
+                .arg(&mut self.xb)
+                .arg(&n_embd)
+                .arg(&n_tok)
+                .arg(&eps)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (last_chunk_len as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+
+        let host = self.stream.clone_dtoh(&self.xb)?;
+        let row_start = (last_chunk_len - 1) * self.cfg.n_embd;
+        let mut embedding = host[row_start..row_start + dimensions].to_vec();
+        let norm = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if !norm.is_finite() || norm == 0.0 {
+            bail!("embedding has invalid L2 norm {norm}");
+        }
+        for value in &mut embedding {
+            *value /= norm;
+        }
+        Ok(embedding)
+    }
+
     /// Run tokens through the model; return greedy next-token id.
     pub fn forward_greedy(&mut self, tokens: &[u32], cache: &mut CudaKv) -> Result<u32> {
         if tokens.is_empty() {
@@ -51,8 +130,14 @@ impl CudaModel {
             return self.forward_decode_one(tokens[0], cache);
         }
 
-        // Tara MoE Q4 packs (and sparse MoE prefill) use n_tok=1 chunks.
-        let max_chunk = if self.cfg.is_moe() { 1 } else { MAX_BATCH };
+        // Tara MoE Q4 packs use n_tok=1 chunks.
+        // Dense/hybrid prefill: tile to GEMM_DP4A_MAX_TOK so multi-token matmuls
+        // hit the DP4A path (f32 dequant GEMM is much slower on sm_86).
+        let max_chunk = if self.cfg.is_moe() {
+            1
+        } else {
+            GEMM_DP4A_MAX_TOK.min(MAX_BATCH)
+        };
         let mut offset = 0usize;
         while offset < tokens.len() {
             let n = (tokens.len() - offset).min(max_chunk);
@@ -322,6 +407,8 @@ impl CudaModel {
                 n_tok_i,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
         } else {
             gemm(
@@ -333,6 +420,8 @@ impl CudaModel {
                 n_tok_i,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
         }
         let n_vocab = self

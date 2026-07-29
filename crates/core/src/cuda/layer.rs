@@ -3,9 +3,8 @@
 use super::decode::{find_by_name, AttnLaunch};
 use super::kv::CudaKv;
 use super::matmul::{
-    gemm, gemv, launch_gemv_q4_0_qkv, try_gemv_gdn_4way, try_gemv_global_q8,
-    try_gemv_prequantized_q8, try_gemv_pair, try_gemv_q4_dual, try_gemv_q4_ffn,
-    try_gemv_qkv, GemvResidual,
+    gemm, gemv, launch_gemv_q4_0_qkv, try_gemv_gdn_4way, try_gemv_global_q8, try_gemv_pair,
+    try_gemv_prequantized_q8, try_gemv_q4_dual, try_gemv_q4_ffn, try_gemv_qkv, GemvResidual,
 };
 use super::model::CudaModel;
 use super::types::{FullAttnWeights, LayerAttn, LinearAttnWeights, WType};
@@ -111,9 +110,8 @@ impl CudaModel {
             self.attn_block(li, d, cache)?;
             let middle = if timing {
                 Some(
-                    self.stream.record_event(Some(
-                        cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-                    ))?,
+                    self.stream
+                        .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
                 )
             } else {
                 None
@@ -123,9 +121,9 @@ impl CudaModel {
                 self.ffn_block(li, d)?;
             }
             if let (Some(start), Some(middle)) = (start, middle) {
-                let end = self.stream.record_event(Some(
-                    cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-                ))?;
+                let end = self
+                    .stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
                 eprintln!(
                     "layer_timing | layer={li} attn_ms={:.4} ffn_ms={:.4}",
                     start.elapsed_ms(&middle)?,
@@ -249,19 +247,18 @@ impl CudaModel {
             if qkv_ok {
                 // fused Q+K+V
             } else if try_gemv_pair(
-                    &self.stream,
-                    &self.k,
-                    &full.wq,
-                    &full.wk,
-                    &self.xb,
-                    &mut self.q,
-                    &mut self.k_buf,
-                    full.bq.as_ref(),
-                    full.bk.as_ref(),
-                    &mut self.q8_x,
-                    &mut self.q8_d,
-                )?
-            {
+                &self.stream,
+                &self.k,
+                &full.wq,
+                &full.wk,
+                &self.xb,
+                &mut self.q,
+                &mut self.k_buf,
+                full.bq.as_ref(),
+                full.bk.as_ref(),
+                &mut self.q8_x,
+                &mut self.q8_d,
+            )? {
                 gemv(
                     &self.stream,
                     &self.k,
@@ -318,6 +315,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             if let Some(ref b) = full.bq {
                 let feat = full.wq.n_cols as i32;
@@ -342,6 +341,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             if let Some(ref b) = full.bk {
                 let feat = (d.n_kv_heads * d.head_dim) as i32;
@@ -366,6 +367,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             if let Some(ref b) = full.bv {
                 let feat = (d.n_kv_heads * d.head_dim) as i32;
@@ -694,6 +697,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
             unsafe {
@@ -728,10 +733,8 @@ impl CudaModel {
         let kernel = lin.conv_kernel as i32;
         let n_v_elems = (lin.n_v_heads * d.n_tok_u) as i32;
         // Qwen3.5: d_k == d_v == state_size (typically 128). Enables fused decode/prefill.
-        let square_state = d_k == d_v
-            && lin.state_size > 0
-            && lin.state_size <= 256
-            && !flag_gdn_legacy();
+        let square_state =
+            d_k == d_v && lin.state_size > 0 && lin.state_size <= 256 && !flag_gdn_legacy();
 
         if d.n_tok == 1 {
             if !try_gemv_gdn_4way(
@@ -806,6 +809,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             gemm(
                 &self.stream,
@@ -816,6 +821,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             gemm(
                 &self.stream,
@@ -826,6 +833,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             gemm(
                 &self.stream,
@@ -836,6 +845,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
         }
 
@@ -1184,6 +1195,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
             unsafe {
@@ -1353,6 +1366,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             gemm(
                 &self.stream,
@@ -1363,6 +1378,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
         }
         let t2 = if timing {
@@ -1429,6 +1446,8 @@ impl CudaModel {
                 d.n_tok,
                 &mut self.gemv_partial,
                 self.gemv_partial_stride,
+                &mut self.q8_x,
+                &mut self.q8_d,
             )?;
             let residual_n = (d.n_embd_u * d.n_tok_u) as i32;
             unsafe {
@@ -1500,20 +1519,28 @@ impl CudaModel {
     fn ffn_block_moe_one(&mut self, li: usize, d: &ChunkDims) -> Result<()> {
         debug_assert_eq!(d.n_tok, 1);
 
-        let (n_experts, mut top_k, expert_ff, gate_col_bytes, down_col_bytes, is_q4, is_f16, is_q4_bm) =
-            match &self.layers[li].ffn {
-                super::types::LayerFfn::Moe(m) => (
-                    m.n_experts,
-                    m.top_k,
-                    m.expert_ff,
-                    m.gate_all.col_bytes,
-                    m.down_all.col_bytes,
-                    m.gate_all.wtype == super::types::WType::Q4_0,
-                    m.gate_all.wtype == super::types::WType::F16,
-                    m.gate_all.wtype == super::types::WType::Q4_0_BM,
-                ),
-                _ => unreachable!(),
-            };
+        let (
+            n_experts,
+            mut top_k,
+            expert_ff,
+            gate_col_bytes,
+            down_col_bytes,
+            is_q4,
+            is_f16,
+            is_q4_bm,
+        ) = match &self.layers[li].ffn {
+            super::types::LayerFfn::Moe(m) => (
+                m.n_experts,
+                m.top_k,
+                m.expert_ff,
+                m.gate_all.col_bytes,
+                m.down_all.col_bytes,
+                m.gate_all.wtype == super::types::WType::Q4_0,
+                m.gate_all.wtype == super::types::WType::F16,
+                m.gate_all.wtype == super::types::WType::Q4_0_BM,
+            ),
+            _ => unreachable!(),
+        };
         // Speed ladder (still real router, not fixed experts):
         //   TARAFER_MOE_TOPK=1  → ~half expert BW (recommended for 750 on laptop)
         //   TARAFER_SPEED=1     → same as topk=1
@@ -1621,11 +1648,7 @@ impl CudaModel {
         // the 100M-active flagship shape; eight slightly reduces occupancy.
         // Tall K: fewer warps still fill SMs. Override with TARAFER_GEMV_WARPS.
         let n_blocks_gate = (d.n_embd_u / 32).max(1);
-        let default_warps = if n_blocks_gate < 32 {
-            4u32
-        } else {
-            4u32
-        };
+        let default_warps = if n_blocks_gate < 32 { 4u32 } else { 4u32 };
         let warps = std::env::var("TARAFER_MOE_WARPS")
             .or_else(|_| std::env::var("TARAFER_GEMV_WARPS"))
             .ok()

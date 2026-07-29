@@ -179,10 +179,16 @@ impl CudaModel {
             bail!("n_embd={} must be multiple of 32 for Q8_0", meta.n_embd);
         }
         if meta.expert_ff % 32 != 0 {
-            bail!("expert_ff={} must be multiple of 32 for Q8_0", meta.expert_ff);
+            bail!(
+                "expert_ff={} must be multiple of 32 for Q8_0",
+                meta.expert_ff
+            );
         }
         if meta.n_experts == 0 || meta.n_experts > 64 {
-            bail!("n_experts={} must be in 1..=64 for CUDA MoE", meta.n_experts);
+            bail!(
+                "n_experts={} must be in 1..=64 for CUDA MoE",
+                meta.n_experts
+            );
         }
         if meta.router_top_k == 0 || meta.router_top_k > meta.n_experts || meta.router_top_k > 8 {
             bail!(
@@ -190,7 +196,8 @@ impl CudaModel {
                 meta.router_top_k
             );
         }
-        let router_weight_mode = RouterWeightMode::from_metadata(meta.router_weight_mode.as_deref())?;
+        let router_weight_mode =
+            RouterWeightMode::from_metadata(meta.router_weight_mode.as_deref())?;
 
         let n_ff = meta.n_ff.max(meta.expert_ff);
         let cfg = ModelConfig {
@@ -407,80 +414,78 @@ impl CudaModel {
             );
         }
 
-        let pack_experts = |kind: &str,
-                            n_rows: usize,
-                            n_cols_e: usize,
-                            layer_i: usize|
-         -> Result<GpuMat> {
-            let mut packed = Vec::new();
-            let mut col_bytes = 0usize;
-            let mut wtype = WType::Q8_0;
-            for e in 0..meta.n_experts {
-                let stem = format!("blk.{layer_i}.exp{e}.ffn_{kind}");
-                let (name, is_q4_file) = if meta.files.contains_key(&format!("{stem}.q4")) {
-                    (format!("{stem}.q4"), true)
-                } else {
-                    (format!("{stem}.q8"), false)
-                };
-                let fi = meta
-                    .files
-                    .get(&name)
-                    .ok_or_else(|| anyhow!("meta.files missing {name}"))?;
-                if fi.n_rows != n_rows || fi.n_cols != n_cols_e {
-                    bail!(
-                        "{name}: shape {}x{}, expected {n_rows}x{n_cols_e}",
-                        fi.n_rows,
-                        fi.n_cols
-                    );
-                }
-                let path = dir.join(&name);
-                let raw = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-                if is_q4_file {
-                    let expect = q4_col_bytes(n_rows) * n_cols_e;
-                    if raw.len() != expect {
-                        bail!("{name}: got {} bytes, expected {expect}", raw.len());
-                    }
-                    // Default: col-major Q4 (best measured on short-K d=640; max CTA fill).
-                    // TARAFER_MOE_BM=1 → block-major layout + BM kernels.
-                    // TARAFER_MOE_F16=1 → expand f16 (usually slower / more BW).
-                    if std::env::var_os("TARAFER_MOE_F16").is_some() {
-                        let f16b = dequant_q4_0_to_f16(&raw, n_rows, n_cols_e)?;
-                        col_bytes = n_rows * 2;
-                        wtype = WType::F16;
-                        packed.extend_from_slice(&f16b);
-                    } else if std::env::var_os("TARAFER_MOE_BM").is_some() {
-                        let bm = repack_q4_0_block_major(&raw, n_rows, n_cols_e)?;
-                        col_bytes = q4_col_bytes(n_rows); // logical; kernel uses BM layout
-                        wtype = WType::Q4_0_BM;
-                        packed.extend_from_slice(&bm);
+        let pack_experts =
+            |kind: &str, n_rows: usize, n_cols_e: usize, layer_i: usize| -> Result<GpuMat> {
+                let mut packed = Vec::new();
+                let mut col_bytes = 0usize;
+                let mut wtype = WType::Q8_0;
+                for e in 0..meta.n_experts {
+                    let stem = format!("blk.{layer_i}.exp{e}.ffn_{kind}");
+                    let (name, is_q4_file) = if meta.files.contains_key(&format!("{stem}.q4")) {
+                        (format!("{stem}.q4"), true)
                     } else {
-                        col_bytes = q4_col_bytes(n_rows);
-                        wtype = WType::Q4_0;
+                        (format!("{stem}.q8"), false)
+                    };
+                    let fi = meta
+                        .files
+                        .get(&name)
+                        .ok_or_else(|| anyhow!("meta.files missing {name}"))?;
+                    if fi.n_rows != n_rows || fi.n_cols != n_cols_e {
+                        bail!(
+                            "{name}: shape {}x{}, expected {n_rows}x{n_cols_e}",
+                            fi.n_rows,
+                            fi.n_cols
+                        );
+                    }
+                    let path = dir.join(&name);
+                    let raw =
+                        fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+                    if is_q4_file {
+                        let expect = q4_col_bytes(n_rows) * n_cols_e;
+                        if raw.len() != expect {
+                            bail!("{name}: got {} bytes, expected {expect}", raw.len());
+                        }
+                        // Default: col-major Q4 (best measured on short-K d=640; max CTA fill).
+                        // TARAFER_MOE_BM=1 → block-major layout + BM kernels.
+                        // TARAFER_MOE_F16=1 → expand f16 (usually slower / more BW).
+                        if std::env::var_os("TARAFER_MOE_F16").is_some() {
+                            let f16b = dequant_q4_0_to_f16(&raw, n_rows, n_cols_e)?;
+                            col_bytes = n_rows * 2;
+                            wtype = WType::F16;
+                            packed.extend_from_slice(&f16b);
+                        } else if std::env::var_os("TARAFER_MOE_BM").is_some() {
+                            let bm = repack_q4_0_block_major(&raw, n_rows, n_cols_e)?;
+                            col_bytes = q4_col_bytes(n_rows); // logical; kernel uses BM layout
+                            wtype = WType::Q4_0_BM;
+                            packed.extend_from_slice(&bm);
+                        } else {
+                            col_bytes = q4_col_bytes(n_rows);
+                            wtype = WType::Q4_0;
+                            packed.extend_from_slice(&raw);
+                        }
+                    } else {
+                        let cb = q8_col_bytes(n_rows);
+                        let expect = cb * n_cols_e;
+                        if raw.len() != expect {
+                            bail!("{name}: got {} bytes, expected {expect}", raw.len());
+                        }
+                        col_bytes = cb;
+                        wtype = WType::Q8_0;
                         packed.extend_from_slice(&raw);
                     }
-                } else {
-                    let cb = q8_col_bytes(n_rows);
-                    let expect = cb * n_cols_e;
-                    if raw.len() != expect {
-                        bail!("{name}: got {} bytes, expected {expect}", raw.len());
-                    }
-                    col_bytes = cb;
-                    wtype = WType::Q8_0;
-                    packed.extend_from_slice(&raw);
                 }
-            }
-            Ok(GpuMat {
-                data: stream.clone_htod(&packed)?,
-                decode_data: None,
-                compact_data: None,
-                n_rows,
-                n_cols: n_cols_e * meta.n_experts,
-                col_bytes,
-                decode_col_bytes: col_bytes,
-                compact_col_bytes: 0,
-                wtype,
-            })
-        };
+                Ok(GpuMat {
+                    data: stream.clone_htod(&packed)?,
+                    decode_data: None,
+                    compact_data: None,
+                    n_rows,
+                    n_cols: n_cols_e * meta.n_experts,
+                    col_bytes,
+                    decode_col_bytes: col_bytes,
+                    compact_col_bytes: 0,
+                    wtype,
+                })
+            };
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
@@ -584,8 +589,7 @@ impl CudaModel {
             xb1: stream.alloc_zeros(n_embd)?,
             logits: stream.alloc_zeros(active_vocab)?,
             special_logit: stream.alloc_zeros(1)?,
-            logits_batch: stream
-                .alloc_zeros(super::types::MAX_VERIFY_TOKENS * active_vocab)?,
+            logits_batch: stream.alloc_zeros(super::types::MAX_VERIFY_TOKENS * active_vocab)?,
             argmax_buf: stream.alloc_zeros(1)?,
             argmax_batch: stream.alloc_zeros(super::types::MAX_VERIFY_TOKENS)?,
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,

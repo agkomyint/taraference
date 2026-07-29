@@ -372,7 +372,8 @@ impl CudaModel {
         let q5k_mode = q5k_decode_mode(cfg.is_hybrid());
         if matches!(q5k_mode, Q5kDecodeMode::ToQ4) {
             eprintln!(
-                "variant | q35fast  Q5_K→Q4_K hot-path (A/B; unset TARAFER_Q35_FAST / TARAFER_VARIANT for default Q5→Q8)"
+                "variant | q35fast  Q5_K→Q4_K + DP4A prefill tiles={} (PLD opt-in: TARAFER_Q35_SPEC=1)",
+                super::types::GEMM_DP4A_MAX_TOK
             );
         }
         let q5k_to_q8 = std::cell::Cell::new(0usize);
@@ -466,9 +467,8 @@ impl CudaModel {
             }
             Ok(stream.clone_htod(&v)?)
         };
-        let upload_vec_plain = |name: &str| -> Result<_> {
-            Ok(stream.clone_htod(&f32_host(gguf, name)?)?)
-        };
+        let upload_vec_plain =
+            |name: &str| -> Result<_> { Ok(stream.clone_htod(&f32_host(gguf, name)?)?) };
 
         let mut token_embd = upload_mat("token_embd.weight")?;
         let output_norm = upload_vec("output_norm.weight")?;
@@ -492,13 +492,12 @@ impl CudaModel {
                 }
             });
         if let Some(limit) = vocab_limit.filter(|&n| n >= 1024 && n < cfg.n_vocab) {
-            let eos = gguf
-                .meta_u32("tokenizer.ggml.eos_token_id")
-                .or_else(|| {
-                    gguf.meta_u64("tokenizer.ggml.eos_token_id")
-                        .map(|v| v as u32)
-                });
-            if let Some(eos) = eos.filter(|&id| id as usize >= limit && (id as usize) < cfg.n_vocab) {
+            let eos = gguf.meta_u32("tokenizer.ggml.eos_token_id").or_else(|| {
+                gguf.meta_u64("tokenizer.ggml.eos_token_id")
+                    .map(|v| v as u32)
+            });
+            if let Some(eos) = eos.filter(|&id| id as usize >= limit && (id as usize) < cfg.n_vocab)
+            {
                 let name = if output.is_some() {
                     "output.weight"
                 } else {
@@ -736,7 +735,9 @@ impl CudaModel {
         // Hybrid GDN updates fixed device buffers in-place — CUDA graphs work
         // when capture saves/restores recurrent state (see try_capture_decode_graph).
         if cfg.is_hybrid() {
-            eprintln!("CUDA graph | hybrid ok (GDN/conv state fixed pointers; capture saves/restores)");
+            eprintln!(
+                "CUDA graph | hybrid ok (GDN/conv state fixed pointers; capture saves/restores)"
+            );
         }
         Ok(Self {
             x: stream.alloc_zeros(b * n_embd)?,
@@ -753,13 +754,18 @@ impl CudaModel {
             xb1: stream.alloc_zeros(n_embd)?,
             logits: stream.alloc_zeros(active_vocab)?,
             special_logit: stream.alloc_zeros(1)?,
-            logits_batch: stream
-                .alloc_zeros(super::types::MAX_VERIFY_TOKENS * active_vocab)?,
+            logits_batch: stream.alloc_zeros(super::types::MAX_VERIFY_TOKENS * active_vocab)?,
             argmax_buf: stream.alloc_zeros(1)?,
             argmax_batch: stream.alloc_zeros(super::types::MAX_VERIFY_TOKENS)?,
             tok_buf: stream.alloc_zeros(MAX_BATCH)?,
-            q8_x: stream.alloc_zeros(cfg.n_ff.max(n_embd).max(ssm_qkv).max(ssm_val))?,
-            q8_d: stream.alloc_zeros((cfg.n_ff.max(n_embd).max(ssm_qkv).max(ssm_val) + 31) / 32)?,
+            // Prefill DP4A tiles + speculative verify (up to GEMM_DP4A_MAX_TOK rows).
+            q8_x: stream.alloc_zeros(
+                super::types::GEMM_DP4A_MAX_TOK * cfg.n_ff.max(n_embd).max(ssm_qkv).max(ssm_val),
+            )?,
+            q8_d: stream.alloc_zeros(
+                super::types::GEMM_DP4A_MAX_TOK
+                    * ((cfg.n_ff.max(n_embd).max(ssm_qkv).max(ssm_val) + 31) / 32),
+            )?,
             q8_ff: stream.alloc_zeros(cfg.n_ff.max(32))?,
             q8_ff_d: stream.alloc_zeros((cfg.n_ff.max(32) + 31) / 32)?,
             gemv_partial: stream.alloc_zeros(GEMV_SPLIT_MAX * gemv_partial_stride)?,

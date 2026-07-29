@@ -296,7 +296,11 @@ pub(crate) fn try_gemv_global_q8(
             .arg(bias_ptr)
             .arg(&use_res)
             .arg(residual_ptr)
-            .launch(lc_gemv_quantized(w.n_cols as u32, w.n_rows as u32, k.gemv_quantized_warps))?;
+            .launch(lc_gemv_quantized(
+                w.n_cols as u32,
+                w.n_rows as u32,
+                k.gemv_quantized_warps,
+            ))?;
     }
     Ok(true)
 }
@@ -996,7 +1000,11 @@ pub(crate) fn try_gemv_qkv(
                 .arg(bq_p)
                 .arg(bk_p)
                 .arg(bv_p)
-                .launch(lc_gemv_quantized(n_tot, wq.n_rows as u32, k.gemv_quantized_warps))?;
+                .launch(lc_gemv_quantized(
+                    n_tot,
+                    wq.n_rows as u32,
+                    k.gemv_quantized_warps,
+                ))?;
         }
         return Ok(true);
     }
@@ -1079,7 +1087,11 @@ pub(crate) fn try_gemv_qkv(
                     .arg(bq_p)
                     .arg(bk_p)
                     .arg(bv_p)
-                    .launch(lc_gemv_quantized(n_tot, wq.n_rows as u32, k.gemv_quantized_warps))?;
+                    .launch(lc_gemv_quantized(
+                        n_tot,
+                        wq.n_rows as u32,
+                        k.gemv_quantized_warps,
+                    ))?;
             }
         }
         return Ok(true);
@@ -1228,12 +1240,11 @@ pub(crate) fn try_gemv_gdn_4way(
             if is_hybrid {
                 b.arg(&col_bytes_q4);
             }
-            b.arg(&(n_split as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (((n_tot + warps - 1) / warps), n_split, 1),
-                    block_dim: (warps * 32, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+            b.arg(&(n_split as i32)).launch(LaunchConfig {
+                grid_dim: (((n_tot + warps - 1) / warps), n_split, 1),
+                block_dim: (warps * 32, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
             stream
                 .launch_builder(&k.gemv_splitk_reduce_gdn_4way)
                 .arg(&*partial)
@@ -1315,6 +1326,8 @@ pub(crate) fn gemm(
     n_tok: i32,
     partial: &mut CudaSlice<f32>,
     partial_stride: usize,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
 ) -> Result<()> {
     if n_tok == 1 {
         return gemv(
@@ -1333,11 +1346,13 @@ pub(crate) fn gemm(
     let n_cols = w.n_cols as i32;
     let col_bytes = w.col_bytes as i32;
     if w.wtype == WType::Q4_0 {
-        // Decode + single-token prefill (forward chunks Q4 MoE as n_tok=1).
-        if n_tok == 1 {
-            return gemv_baseline(stream, k, w, x, y, None, GemvResidual::None);
-        }
         anyhow::bail!("Q4_0 multi-token GEMM: prefill must use chunk size 1");
+    }
+    // Prefill tiles + speculative verify: DP4A instead of f32 dequant GEMM.
+    if (2..=super::types::GEMM_DP4A_MAX_TOK as i32).contains(&n_tok)
+        && gemm_ntok_dp4a(stream, k, w, x, y, n_tok, q8_x, q8_d)?
+    {
+        return Ok(());
     }
     let f = match w.wtype {
         WType::Q4K => &k.gemm_q4,
@@ -1360,6 +1375,69 @@ pub(crate) fn gemm(
             .launch(lc_gemm_cols(w.n_cols as u32))?;
     }
     Ok(())
+}
+
+/// Multi-token DP4A GEMM using model Q8 arena (size >= n_tok * n_rows).
+fn gemm_ntok_dp4a(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    w: &GpuMat,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    n_tok: i32,
+    q8_x: &mut CudaSlice<i8>,
+    q8_d: &mut CudaSlice<f32>,
+) -> Result<bool> {
+    let n_rows = w.n_rows;
+    let need_q = n_tok as usize * n_rows;
+    let need_d = n_tok as usize * ((n_rows + 31) / 32);
+    if q8_x.len() < need_q || q8_d.len() < need_d {
+        return Ok(false);
+    }
+    let (f, data, col_bytes) = match w.wtype {
+        WType::Q4K => (&k.gemm_q4_q8_ntok, &w.data, w.col_bytes),
+        WType::Q8_0 => (&k.gemm_q8_q8_ntok, &w.data, w.col_bytes),
+        WType::Q6K if w.compact_data.is_some() => (
+            &k.gemm_q6_compact_q8_ntok,
+            w.compact_data.as_ref().unwrap(),
+            w.compact_col_bytes,
+        ),
+        _ => return Ok(false),
+    };
+    let n_rows_i = n_rows as i32;
+    let n_cols_i = w.n_cols as i32;
+    let col_bytes_i = col_bytes as i32;
+    let groups = (n_rows as u32 + 31) / 32;
+    unsafe {
+        stream
+            .launch_builder(&k.quantize_q8_rows)
+            .arg(x)
+            .arg(&mut *q8_x)
+            .arg(&mut *q8_d)
+            .arg(&n_rows_i)
+            .arg(&n_tok)
+            .launch(LaunchConfig {
+                grid_dim: ((groups + 7) / 8, n_tok as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+        stream
+            .launch_builder(f)
+            .arg(data)
+            .arg(&*q8_x)
+            .arg(&*q8_d)
+            .arg(y)
+            .arg(&n_rows_i)
+            .arg(&n_cols_i)
+            .arg(&col_bytes_i)
+            .arg(&n_tok)
+            .launch(LaunchConfig {
+                grid_dim: (w.n_cols as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(true)
 }
 
 impl CudaModel {

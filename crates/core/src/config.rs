@@ -162,11 +162,13 @@ impl ModelConfig {
                     .and_then(|t| t.dims.get(1).map(|d| *d as usize))
             })
             .ok_or_else(|| anyhow!("vocab size"))?;
-        let rope_theta = gguf.meta_f32(&p("rope.freq_base")).unwrap_or(if arch_key == "llama" {
-            10_000.0
-        } else {
-            1_000_000.0
-        });
+        let rope_theta = gguf
+            .meta_f32(&p("rope.freq_base"))
+            .unwrap_or(if arch_key == "llama" {
+                10_000.0
+            } else {
+                1_000_000.0
+            });
         let rms_eps = gguf
             .meta_f32(&p("attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-6);

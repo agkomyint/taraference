@@ -185,6 +185,12 @@ fn main() -> Result<()> {
     let cuda_graph = !cli.no_cuda_graph;
     let mut engine =
         InferenceEngine::load_with_flags(&model, cli.decode, cli.ctx, cli.max_new, cuda_graph)?;
+    if cli.think && !engine.backend_kind.uses_thinking_template() {
+        bail!(
+            "--think is not supported by model family {}",
+            engine.backend_kind.name()
+        );
+    }
 
     if cli.profile {
         run_profile(&mut engine, &cli, &model)?;
@@ -216,7 +222,8 @@ fn main() -> Result<()> {
             // suffix so chain-of-thought runs.
             let prompt = if cli.think && !p.contains("<think>") {
                 let mut s = p;
-                if !s.ends_with("<|im_start|>assistant\n") && !s.ends_with("<|im_start|>assistant") {
+                if !s.ends_with("<|im_start|>assistant\n") && !s.ends_with("<|im_start|>assistant")
+                {
                     if !s.ends_with('\n') {
                         s.push('\n');
                     }

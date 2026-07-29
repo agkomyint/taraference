@@ -1,7 +1,7 @@
 //! High-level inference engine: load model once, run completions.
 
-use crate::chat::{format_chatml, ChatMessage};
 use crate::backend::BackendKind;
+use crate::chat::{format_chatml_for_model, ChatMessage};
 use crate::cuda::{CudaKv, CudaModel, DecodeBackend};
 use crate::session::{Session, SessionOptions, TurnStats};
 use crate::tokenizer::Tokenizer;
@@ -132,7 +132,12 @@ impl InferenceEngine {
         let tok = Tokenizer::from_gguf(&gguf)?;
         let mut model = CudaModel::load_with(&gguf, cfg.decode)?;
         model.set_cuda_graph(cfg.cuda_graph);
-        let backend_kind = BackendKind::from_config(&model.cfg);
+        let model_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("taraference")
+            .to_string();
+        let backend_kind = BackendKind::from_config_and_model_id(&model.cfg, &model_id);
         let requested_max_seq = cfg.max_seq.min(model.cfg.n_ctx);
         let max_seq = backend_kind.max_seq(cfg.max_seq, model.cfg.n_ctx, weight_gib);
         if max_seq != requested_max_seq {
@@ -143,11 +148,6 @@ impl InferenceEngine {
         }
         eprintln!("backend | {}", backend_kind.name());
         let kv = model.alloc_kv(max_seq)?;
-        let model_id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("taraference")
-            .to_string();
         eprintln!(
             "flags | cuda_graph={} | decode={}",
             cfg.cuda_graph,
@@ -183,8 +183,8 @@ impl InferenceEngine {
 
         let tok_gguf = resolve_tokenizer_gguf(&path)?;
         eprintln!("tokenizer | {}", tok_gguf.display());
-        let tok_file =
-            GgufFile::open(&tok_gguf).with_context(|| format!("open tokenizer {}", tok_gguf.display()))?;
+        let tok_file = GgufFile::open(&tok_gguf)
+            .with_context(|| format!("open tokenizer {}", tok_gguf.display()))?;
         let tok = Tokenizer::from_gguf(&tok_file)?;
         if tok.tokens.len() != model.cfg.n_vocab {
             eprintln!(
@@ -288,6 +288,50 @@ impl InferenceEngine {
         &self.tok
     }
 
+    /// Produce Qwen-style last-token text embeddings. Each input is independent,
+    /// has `<|endoftext|>` appended, and is returned L2-normalized.
+    pub fn embeddings(
+        &mut self,
+        inputs: &[String],
+        dimensions: Option<usize>,
+    ) -> Result<(Vec<Vec<f32>>, usize)> {
+        if inputs.is_empty() {
+            bail!("embedding input must not be empty");
+        }
+        let dimensions = dimensions.unwrap_or(self.model.cfg.n_embd);
+        if dimensions < 32 || dimensions > self.model.cfg.n_embd {
+            bail!(
+                "dimensions must be between 32 and {} (got {dimensions})",
+                self.model.cfg.n_embd
+            );
+        }
+
+        let mut vectors = Vec::with_capacity(inputs.len());
+        let mut total_tokens = 0usize;
+        for input in inputs {
+            if input.is_empty() {
+                bail!("embedding input strings must not be empty");
+            }
+            let mut tokens = self.tok.encode(input, false);
+            tokens.push(self.tok.eos_id);
+            if tokens.len() > self.max_seq {
+                bail!(
+                    "embedding input has {} tokens including end token; limit is {}",
+                    tokens.len(),
+                    self.max_seq
+                );
+            }
+            self.kv.clear();
+            self.model.zero_recurrent(&mut self.kv)?;
+            vectors.push(
+                self.model
+                    .forward_embedding(&tokens, dimensions, &mut self.kv)?,
+            );
+            total_tokens += tokens.len();
+        }
+        Ok((vectors, total_tokens))
+    }
+
     pub fn model_mut(&mut self) -> &mut CudaModel {
         &mut self.model
     }
@@ -295,6 +339,8 @@ impl InferenceEngine {
     /// Interactive / multi-turn session (CLI REPL + profile).
     /// Uses the engine's shared KV (reset first for a clean chat).
     pub fn session(&mut self, opts: SessionOptions) -> Session<'_> {
+        let mut opts = opts;
+        opts.uses_thinking_template = self.backend_kind.uses_thinking_template();
         self.kv.clear();
         Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts)
     }
@@ -382,13 +428,20 @@ impl InferenceEngine {
         let max_new = max_tokens.unwrap_or(self.max_new).max(1);
         // Server defaults to non-thinking (Qwen3.5 small default).
         let enable_thinking = false;
-        let prompt = format_chatml(messages, Some(&self.default_system), enable_thinking);
+        let uses_thinking_template = self.backend_kind.uses_thinking_template();
+        let prompt = format_chatml_for_model(
+            messages,
+            Some(&self.default_system),
+            uses_thinking_template,
+            enable_thinking,
+        );
         let opts = SessionOptions {
             max_new,
             system: self.default_system.clone(),
             print_stream: false,
             print_stats: false,
             enable_thinking,
+            uses_thinking_template,
             temperature,
             top_p,
             top_k,

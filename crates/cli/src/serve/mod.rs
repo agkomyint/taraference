@@ -11,7 +11,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use openai::{
     ChatChoice, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessageIn,
-    ChunkChoice, Delta, ErrorBody, ErrorResponse, ModelObject, ModelsResponse, Usage,
+    ChunkChoice, Delta, EmbeddingInput, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, ErrorBody, ErrorResponse, ModelObject, ModelsResponse, Usage,
 };
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -45,6 +46,7 @@ pub async fn run(engine: InferenceEngine, port: u16) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -62,6 +64,7 @@ pub async fn run(engine: InferenceEngine, port: u16) -> Result<()> {
     );
     info!("  GET  /health");
     info!("  GET  /v1/models");
+    info!("  POST /v1/embeddings");
     info!("  POST /v1/chat/completions  (stream=true|false)");
     info!(
         "  curl example:  curl http://127.0.0.1:{port}/v1/chat/completions -H \"Content-Type: application/json\" -d '{{\"model\":\"{model_id}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"stream\":true}}'"
@@ -104,6 +107,60 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
             owned_by: "taraference".into(),
         }],
     })
+}
+
+async fn embeddings(State(state): State<AppState>, Json(req): Json<EmbeddingRequest>) -> Response {
+    if req.encoding_format.as_deref().unwrap_or("float") != "float" {
+        return api_err(
+            StatusCode::BAD_REQUEST,
+            "only encoding_format=\"float\" is supported",
+        );
+    }
+    let inputs = match req.input {
+        EmbeddingInput::One(input) => vec![input],
+        EmbeddingInput::Many(inputs) => inputs,
+    };
+    if inputs.is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "input must not be empty");
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut eng = state.engine.lock().expect("engine lock");
+        let model = eng.model_id.clone();
+        let (vectors, total_tokens) = eng.embeddings(&inputs, req.dimensions)?;
+        Ok::<_, anyhow::Error>((model, vectors, total_tokens))
+    })
+    .await;
+
+    let (model, vectors, total_tokens) = match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => return api_err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        Err(e) => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("embedding task join: {e}"),
+            )
+        }
+    };
+    let total_tokens = u32::try_from(total_tokens).unwrap_or(u32::MAX);
+    Json(EmbeddingResponse {
+        object: "list",
+        data: vectors
+            .into_iter()
+            .enumerate()
+            .map(|(index, embedding)| EmbeddingObject {
+                object: "embedding",
+                embedding,
+                index,
+            })
+            .collect(),
+        model,
+        usage: EmbeddingUsage {
+            prompt_tokens: total_tokens,
+            total_tokens,
+        },
+    })
+    .into_response()
 }
 
 async fn chat_completions(
@@ -150,9 +207,18 @@ async fn chat_completions(
 
     if stream {
         return stream_chat(
-            state, messages, max_tokens, served_id, t_req, temperature, top_p,
-            top_k, repetition_penalty, seed,
-        ).into_response();
+            state,
+            messages,
+            max_tokens,
+            served_id,
+            t_req,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            seed,
+        )
+        .into_response();
     }
 
     // Non-streaming: GPU work off the async worker.
@@ -318,24 +384,24 @@ fn stream_chat(
             repetition_penalty,
             seed,
             |piece| {
-            streamed_chars += piece.len();
-            let chunk = ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: model_id.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: Delta {
-                        role: None,
-                        content: Some(piece.to_string()),
-                    },
-                    finish_reason: None,
-                }],
-            };
-            if let Ok(s) = serde_json::to_string(&chunk) {
-                send(s);
-            }
+                streamed_chars += piece.len();
+                let chunk = ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model_id.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: Some(piece.to_string()),
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                if let Ok(s) = serde_json::to_string(&chunk) {
+                    send(s);
+                }
             },
         );
 

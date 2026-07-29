@@ -3177,3 +3177,106 @@ extern "C" __global__ void gemv_splitk_reduce_gdn_4way(
     else { out = out_alpha; oj = j - n_qkv - n_gate - n_beta; }
     out[oj] = acc;
 }
+
+// ── Multi-token DP4A GEMM (prefill tiles + speculative verify, n_tok = 2..32) ─
+// Prefill used to call f32-dequant gemm_*; that is far slower than decode GEMV.
+// Chunk prefill to GEMM_DP4A_MAX_TOK and use the same Q8×quant DP4A math.
+
+#define GEMM_DP4A_MAX_TOK 32
+
+extern "C" __global__ void quantize_q8_rows(
+    const float* __restrict__ x,
+    signed char* __restrict__ q8,
+    float* __restrict__ d8,
+    int n_rows,
+    int n_tok
+) {
+    const int t = (int)blockIdx.y;
+    if (t >= n_tok) return;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int bi = (int)blockIdx.x * 8 + warp;
+    const int nb = n_rows >> 5;
+    if (bi >= nb) return;
+    const float* xr = x + (size_t)t * (size_t)n_rows;
+    signed char* qr = q8 + (size_t)t * (size_t)n_rows;
+    float* dr = d8 + (size_t)t * (size_t)nb;
+    const int i = (bi << 5) + lane;
+    const float xi = xr[i];
+    float amax = fabsf(xi);
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 16));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 8));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 4));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, 1));
+    amax = __shfl_sync(0xffffffffu, amax, 0);
+    const float d = amax * (1.0f / 127.0f);
+    qr[i] = amax == 0.f ? 0 : (signed char)__float2int_rn(xi / d);
+    if (lane == 0) dr[bi] = d;
+}
+
+// One warp per output column; DP4A over n_tok activation rows.
+extern "C" __global__ void gemm_q4_k_q8_ntok(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes, int n_tok
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols) return;
+    const int lane = (int)threadIdx.x & 31;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    const int nb = n_rows / 256;
+    const int n_groups = n_rows >> 5;
+    const int nt = n_tok < GEMM_DP4A_MAX_TOK ? n_tok : GEMM_DP4A_MAX_TOK;
+    #pragma unroll 1
+    for (int t = 0; t < nt; t++) {
+        float acc = dot_q4_k_col_q8_range(
+            col, xq + (size_t)t * (size_t)n_rows, xd + (size_t)t * (size_t)n_groups, 0, nb, lane);
+        if (lane == 0) out[(size_t)t * (size_t)n_cols + j] = acc;
+    }
+}
+
+extern "C" __global__ void gemm_q8_0_q8_ntok(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes, int n_tok
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols) return;
+    const int lane = (int)threadIdx.x & 31;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    const int n_groups = n_rows >> 5;
+    const int nt = n_tok < GEMM_DP4A_MAX_TOK ? n_tok : GEMM_DP4A_MAX_TOK;
+    #pragma unroll 1
+    for (int t = 0; t < nt; t++) {
+        float acc = dot_q8_0_col_q8_range(
+            col, xq + (size_t)t * (size_t)n_rows, xd + (size_t)t * (size_t)n_groups, 0, n_groups, lane);
+        if (lane == 0) out[(size_t)t * (size_t)n_cols + j] = acc;
+    }
+}
+
+extern "C" __global__ void gemm_q6_k_compact_q8_ntok(
+    const unsigned char* __restrict__ w,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xd,
+    float* __restrict__ out,
+    int n_rows, int n_cols, int col_bytes, int n_tok
+) {
+    const int j = (int)blockIdx.x;
+    if (j >= n_cols) return;
+    const int lane = (int)threadIdx.x & 31;
+    const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
+    const int nb = n_rows / 256;
+    const int n_groups = n_rows >> 5;
+    const int nt = n_tok < GEMM_DP4A_MAX_TOK ? n_tok : GEMM_DP4A_MAX_TOK;
+    #pragma unroll 1
+    for (int t = 0; t < nt; t++) {
+        float acc = dot_q6_k_compact_q8_range(
+            col, xq + (size_t)t * (size_t)n_rows, xd + (size_t)t * (size_t)n_groups, 0, nb, lane);
+        if (lane == 0) out[(size_t)t * (size_t)n_cols + j] = acc;
+    }
+}

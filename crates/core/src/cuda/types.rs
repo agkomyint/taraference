@@ -7,6 +7,10 @@ use std::collections::HashMap;
 pub const MAX_BATCH: usize = 256;
 /// Current token plus up to eight prompt-lookup draft tokens.
 pub const MAX_VERIFY_TOKENS: usize = 9;
+/// Multi-token DP4A GEMM tile (prefill + speculative verify).
+/// Prefill is chunked to this size so weight matmuls use decode-class DP4A
+/// instead of the slow f32-dequant GEMM path.
+pub const GEMM_DP4A_MAX_TOK: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WType {
@@ -198,6 +202,11 @@ pub struct Kernels {
     pub gemm_q5k: CudaFunction,
     pub gemm_q6: CudaFunction,
     pub gemm_q8: CudaFunction,
+    /// Speculative verify: multi-token DP4A (n_tok 2..8).
+    pub quantize_q8_rows: CudaFunction,
+    pub gemm_q4_q8_ntok: CudaFunction,
+    pub gemm_q8_q8_ntok: CudaFunction,
+    pub gemm_q6_compact_q8_ntok: CudaFunction,
     pub embed_q4: CudaFunction,
     pub embed_q5: CudaFunction,
     pub embed_q5k: CudaFunction,

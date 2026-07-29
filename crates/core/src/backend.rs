@@ -9,6 +9,7 @@ use crate::ModelConfig;
 pub enum BackendKind {
     Tara141,
     TaraMoe,
+    Qwen3Embedding,
     Qwen35,
     Qwen2,
     LlamaDense,
@@ -16,6 +17,13 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+    pub fn from_config_and_model_id(cfg: &ModelConfig, model_id: &str) -> Self {
+        if cfg.architecture == "qwen3" && model_id.to_ascii_lowercase().contains("embedding") {
+            return Self::Qwen3Embedding;
+        }
+        Self::from_config(cfg)
+    }
+
     pub fn from_config(cfg: &ModelConfig) -> Self {
         if cfg.architecture == "tara_moe_141" {
             return Self::Tara141;
@@ -35,11 +43,17 @@ impl BackendKind {
         match self {
             Self::Tara141 => "tara-1.4.1-moe",
             Self::TaraMoe => "tara-moe",
+            Self::Qwen3Embedding => "qwen3-embedding",
             Self::Qwen35 => "qwen3.5-hybrid",
             Self::Qwen2 => "qwen2-dense",
             Self::LlamaDense => "llama-dense",
             Self::OtherDense => "generic-dense",
         }
+    }
+
+    /// Whether this model family uses Qwen's `<think>` generation prefill.
+    pub fn uses_thinking_template(self) -> bool {
+        matches!(self, Self::Qwen35)
     }
 
     /// Apply only policy owned by this architecture family.
@@ -97,9 +111,22 @@ mod tests {
 
     #[test]
     fn dispatches_architecture_families() {
-        assert_eq!(BackendKind::from_config(&cfg("qwen35", 0)), BackendKind::Qwen35);
-        assert_eq!(BackendKind::from_config(&cfg("qwen2", 0)), BackendKind::Qwen2);
-        assert_eq!(BackendKind::from_config(&cfg("llama", 2)), BackendKind::TaraMoe);
+        assert_eq!(
+            BackendKind::from_config(&cfg("qwen35", 0)),
+            BackendKind::Qwen35
+        );
+        assert_eq!(
+            BackendKind::from_config(&cfg("qwen2", 0)),
+            BackendKind::Qwen2
+        );
+        assert_eq!(
+            BackendKind::from_config(&cfg("llama", 2)),
+            BackendKind::TaraMoe
+        );
+        assert_eq!(
+            BackendKind::from_config_and_model_id(&cfg("qwen3", 0), "Qwen3-Embedding-4B-Q4_K_M"),
+            BackendKind::Qwen3Embedding
+        );
         assert_eq!(
             BackendKind::from_config(&cfg("tara_moe_141", 4)),
             BackendKind::Tara141
@@ -109,5 +136,12 @@ mod tests {
     #[test]
     fn tara_policy_does_not_inherit_qwen_context_cap() {
         assert_eq!(BackendKind::TaraMoe.max_seq(4096, 4096, 3.0), 4096);
+    }
+
+    #[test]
+    fn thinking_template_is_only_enabled_for_qwen35() {
+        assert!(BackendKind::Qwen35.uses_thinking_template());
+        assert!(!BackendKind::Qwen2.uses_thinking_template());
+        assert!(!BackendKind::Qwen3Embedding.uses_thinking_template());
     }
 }

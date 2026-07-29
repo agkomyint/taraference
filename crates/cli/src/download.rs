@@ -37,6 +37,15 @@ pub struct ModelSpec {
 /// Models taraference is built/tested against (Unsloth Qwen3.5 Q4_K_M).
 pub const SUPPORTED_MODELS: &[ModelSpec] = &[
     ModelSpec {
+        file: "Qwen3-Embedding-4B-Q4_K_M.gguf",
+        repo: "Qwen/Qwen3-Embedding-4B-GGUF",
+        remote_file: "Qwen3-Embedding-4B-Q4_K_M.gguf",
+        tag: "embed-4b",
+        size: ModelSizeClass::Small,
+        approx_gib: 2.5,
+        note: "multilingual/code embeddings; 2560 dims; ~6GB+ recommended",
+    },
+    ModelSpec {
         file: "Qwen3.5-0.8B-Q4_K_M.gguf",
         repo: "unsloth/Qwen3.5-0.8B-GGUF",
         remote_file: "Qwen3.5-0.8B-Q4_K_M.gguf",
@@ -90,7 +99,9 @@ fn hf_url(repo: &str, remote_file: &str) -> String {
 
 /// Print catalog to stderr (for `--download list`).
 pub fn print_model_catalog() {
-    eprintln!("Supported GGUF downloads (Qwen3.5 Q4_K_M via unsloth; + legacy 3b-qwen25):\n");
+    eprintln!(
+        "Supported GGUF downloads (Qwen3.5 generation, Qwen3 embeddings, + legacy 3b-qwen25):\n"
+    );
     eprintln!("  {:10}  {:6}  {:40}  {}", "tag", "class", "file", "note");
     eprintln!("  {}", "-".repeat(90));
     for m in SUPPORTED_MODELS {
@@ -113,6 +124,7 @@ pub fn print_model_catalog() {
          everything / all-sizes → every listed model\n\n\
          Examples:\n  \
          tarafer --download 4b\n  \
+         tarafer --download embed-4b\n  \
          tarafer --download 0.8b\n  \
          tarafer --download list"
     );
@@ -124,6 +136,32 @@ fn known_tags_hint() -> String {
         "use list | all | small | medium | profile | everything | {}",
         tags.join(" | ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_official_qwen3_embedding_4b() {
+        let selected = select_models("embed-4b").unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].repo, "Qwen/Qwen3-Embedding-4B-GGUF");
+        assert_eq!(selected[0].remote_file, "Qwen3-Embedding-4B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn generation_groups_do_not_implicitly_download_embedding_model() {
+        for group in ["all", "small", "profile"] {
+            assert!(
+                select_models(group)
+                    .unwrap()
+                    .iter()
+                    .all(|model| model.tag != "embed-4b"),
+                "{group} unexpectedly contains embed-4b"
+            );
+        }
+    }
 }
 
 /// Parse `--download` selection.
@@ -144,7 +182,11 @@ pub fn select_models(which: &str) -> Result<Vec<&'static ModelSpec>> {
         "small" => Some(
             SUPPORTED_MODELS
                 .iter()
-                .filter(|m| m.size == ModelSizeClass::Small && !m.tag.contains("qwen25"))
+                .filter(|m| {
+                    m.size == ModelSizeClass::Small
+                        && !m.tag.contains("qwen25")
+                        && !m.tag.starts_with("embed-")
+                })
                 .collect(),
         ),
         "medium" | "mid" => Some(
@@ -295,9 +337,11 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
             if let Some(tot) = total {
                 let pct = 100.0 * done as f64 / tot as f64;
                 let mbps = (done as f64 / 1e6) / t0.elapsed().as_secs_f64().max(1e-6);
-                eprint!("\r  {pct:5.1}%  {:.1}/{:.1} MiB  {mbps:.1} MB/s   ", 
+                eprint!(
+                    "\r  {pct:5.1}%  {:.1}/{:.1} MiB  {mbps:.1} MB/s   ",
                     done as f64 / (1024.0 * 1024.0),
-                    tot as f64 / (1024.0 * 1024.0));
+                    tot as f64 / (1024.0 * 1024.0)
+                );
             } else {
                 eprint!("\r  {:.1} MiB   ", done as f64 / (1024.0 * 1024.0));
             }
@@ -307,13 +351,8 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
     }
     file.flush()?;
     drop(file);
-    fs::rename(&partial, dest).with_context(|| {
-        format!(
-            "rename {} → {}",
-            partial.display(),
-            dest.display()
-        )
-    })?;
+    fs::rename(&partial, dest)
+        .with_context(|| format!("rename {} → {}", partial.display(), dest.display()))?;
     eprintln!(
         "\r  done  {:.1} MiB in {:.1}s                    ",
         done as f64 / (1024.0 * 1024.0),
