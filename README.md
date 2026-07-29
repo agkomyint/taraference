@@ -1,6 +1,6 @@
 # ⚡ Taraference (`tarafer`)
 
-> **Blazingly fast, lightweight LLM inference & embeddings engine built in Rust & CUDA — tuned for maximum performance on NVIDIA GPUs.**
+> **Hyper-optimized single-user LLM & embedding inference engine built in Rust & CUDA — custom-engineered for maximum single-stream performance on specific NVIDIA GPUs & model families.**
 
 [![Release](https://img.shields.io/github/v/release/agkomyint/taraference?style=flat-square&color=blue)](https://github.com/agkomyint/taraference/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
@@ -9,26 +9,41 @@
 
 ---
 
+## 🎯 Design Philosophy & Scope
+
+> [!IMPORTANT]
+> **Taraference is NOT a general-purpose, multi-tenant LLM server.**  
+> It is a specialized, single-user performance engine built with hand-crafted CUDA kernels for specific model architectures.
+
+- **👤 Single-User Decode Speed**: Engineered exclusively for maximum tokens per second for **1 user** — not multi-user batching density or concurrent server throughput.
+- **🔬 Specialized Architecture Support**: Rather than supporting hundreds of arbitrary model types poorly, Taraference focuses on specialized, hand-tuned CUDA kernels for specific model families:
+  - **Qwen2.5** (Official baseline & 3B scoreboard model)
+  - **Qwen3.5** (High-speed kernel profiling & 4B evaluation)
+  - **Tara 1.4.1** (Custom sparse top-2 MoE architecture)
+  - **Qwen3 Embedding** (Dedicated 4B vector embedding & retrieval model)
+
+If you need multi-tenant batch serving across dozens of concurrent users or support for niche legacy architectures, use frameworks like vLLM or llama.cpp. If you want **maximum single-stream generation speed** and zero-overhead execution on supported models, use **Taraference**.
+
+---
+
 ## 🌟 What is Taraference?
 
-**Taraference** (CLI command: **`tarafer`**) is an ultra-optimized, native local inference engine for Large Language Models (LLMs) and **Text Embedding Models** in GGUF format.
+**Taraference** (CLI command: **`tarafer`**) is a native local inference engine for Large Language Models (LLMs) and **Text Embedding Models** in GGUF format.
 
-While traditional inference frameworks focus on heavy Python runtimes or multi-tenant server queues, **Taraference is built for raw speed, simplicity, and low latency**. It bypasses heavy Python overhead entirely by combining a high-performance **Rust control plane** with **just-in-time compiled CUDA kernels** (NVRTC) directly tuned to your specific NVIDIA GPU architecture.
-
-Whether you're generating streaming chat completions or calculating high-dimensional vector embeddings for RAG and semantic search, `tarafer` delivers instant startup and lightning-fast execution.
+By combining a lightweight **Rust control plane** with **just-in-time compiled CUDA kernels** (NVRTC) tuned directly to your NVIDIA GPU compute architecture, `tarafer` bypasses heavy Python overhead and delivers instant startup with lightning-fast streaming generation.
 
 ---
 
 ## 🚀 Key Features
 
-- **⚡ Blazing Token Generation**: Custom packed CUDA kernels (Q4_K, Q6_K, Q8_0) with 8-way split-KV flash decoding for maximum single-stream tokens per second.
-- **🔤 First-Class Text Embeddings**: Full support for dedicated embedding models (like `Qwen3-Embedding-4B`) via `POST /v1/embeddings`, with customizable Matryoshka dimensions and normalized FP32 vector output.
+- **⚡ Specialized Split-K CUDA Kernels**: Custom packed GEMV kernels (Q4_K, Q6_K, Q8_0) with 8-way split-KV flash decoding for maximum single-stream tokens per second.
+- **🔤 Native Text Embeddings**: Specialized support for `Qwen3-Embedding-4B` via `POST /v1/embeddings`, featuring Matryoshka dimension truncation and L2 vector normalization.
 - **📦 Zero-Dependency Single Binary**: A single ~10MB executable. No PyTorch, no Python runtime, no complex environment setups.
-- **🔌 Drop-In OpenAI API Server**: Run an OpenAI-compatible server supporting `/v1/chat/completions` (with streaming) and `/v1/embeddings` to plug into any app, web UI, or RAG pipeline.
-- **📥 Built-in Model Downloader**: Download popular quantized chat and embedding models directly from Hugging Face with one simple command (`tarafer --download 3b` or `tarafer --download embed-4b`).
+- **🔌 OpenAI-Compatible API Server**: Run a local server supporting `/v1/chat/completions` (streaming) and `/v1/embeddings` to plug into any app or web UI.
+- **📥 Built-in Model Downloader**: Download supported quantized chat and embedding models directly from Hugging Face (`tarafer --download 3b` or `tarafer --download embed-4b`).
 - **💬 Interactive Terminal Chat**: Rich terminal interface supporting multi-turn conversations, context resetting, and customized prompts.
 - **📊 Real-Time Benchmarking**: Measure exact tokens/second, prefill performance, and VRAM utilization with the built-in `--profile` command.
-- **🎯 Automatic GPU Tuning**: Automatically detects your GPU hardware compute capability (`sm_75`, `sm_86`, `sm_89`, `sm_90`, etc.) and compiles tuned kernels on launch.
+- **🎯 Dynamic Hardware Compilation**: Auto-detects your GPU hardware architecture (`sm_75`, `sm_86`, `sm_89`, `sm_90`, etc.) and compiles tuned kernels on launch.
 
 ---
 
@@ -153,27 +168,20 @@ tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile
 
 ---
 
-## 📥 Model Hub Catalog
+## 📥 Supported Models & Catalog
 
-`tarafer` includes a built-in catalog to instantly fetch popular GGUF model weights from Hugging Face:
+`tarafer` focuses on optimized support for the following model architectures:
 
-```bash
-tarafer --download <tag>
-```
-
-| Tag | Recommended VRAM | Model Size | Type | Best For |
-| :--- | :---: | :---: | :---: | :--- |
-| **`0.5b`** | 4 GB | ~0.4 GB | Chat | Ultra-fast response, laptop GPUs, quick tests |
-| **`1.5b`** | 4 GB - 6 GB | ~1.0 GB | Chat | Light coding & text generation tasks |
-| **`3b`** *(Default)* | 8 GB - 16 GB | ~1.9 GB | Chat | High quality balance, ideal for daily use |
-| **`7b`** | 12 GB - 16 GB | ~4.7 GB | Chat | Advanced reasoning & comprehensive answers |
-| **`14b`** | 16 GB+ | ~9.0 GB | Chat | Large-scale model performance on enterprise GPUs |
-| **`embed-4b`** | 6 GB - 8 GB | ~2.5 GB | **Embedding** | High-dimensional vector embeddings, RAG, & code retrieval |
-
-> **Useful Download Shortcuts:**  
-> - `tarafer --download list` — See full model catalog  
-> - `tarafer --download profile` — Download 0.5B, 3B, and 7B models for speed comparisons  
-> - `tarafer --download all` — Download standard default models  
+| Tag | Target Model | Recommended VRAM | Model Size | Type | Focus Area |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **`0.5b`** | Qwen2.5 0.5B Instruct | 4 GB | ~0.4 GB | Chat | Ultra-fast response, laptop GPUs |
+| **`1.5b`** | Qwen2.5 1.5B Instruct | 4 GB - 6 GB | ~1.0 GB | Chat | Light text generation |
+| **`3b`** *(Default)* | Qwen2.5 3B Instruct | 8 GB - 16 GB | ~1.9 GB | Chat | Official Scoreboard Baseline |
+| **`4b`** | Qwen3.5 4B Instruct | 8 GB - 16 GB | ~2.5 GB | Chat | Modern fast kernel evaluation |
+| **`7b`** | Qwen2.5 7B Instruct | 12 GB - 16 GB | ~4.7 GB | Chat | High-accuracy general tasks |
+| **`14b`** | Qwen2.5 14B Instruct | 16 GB+ | ~9.0 GB | Chat | Large model inference on T4/A10 |
+| **`embed-4b`** | Qwen3 Embedding 4B | 6 GB - 8 GB | ~2.5 GB | **Embedding** | Multilingual & Code retrieval |
+| *(Custom)* | Tara 1.4.1 | 8 GB - 16 GB | ~1.5 GB | **MoE Chat** | Custom sparse top-2 MoE architecture |
 
 ---
 

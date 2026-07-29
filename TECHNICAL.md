@@ -4,11 +4,24 @@ This document contains low-level technical specifications, internal kernel archi
 
 ---
 
-## 🏗 System Architecture & Design Principles
+## 🎯 Engine Philosophy: Single-User & Model Specialization
 
-Taraference is built from the ground up in **Rust** and **CUDA** with a single target in mind: **Maximum single-stream token generation throughput and embedding extraction performance on NVIDIA GPUs**.
+Taraference is **not** a general-purpose, multi-tenant batch serving engine. It is purposefully designed with two core constraints:
 
-Unlike multi-tenant engines (vLLM, TGI) that optimize for batch throughput and concurrent request density, Taraference optimizes for **zero-latency single-user interactive decode token generation and fast vector embedding inference**.
+1. **Single-User / Single-Stream Focus**:
+   - Optimizes exclusively for single-user generation speed (maximum tokens/second for 1 active user stream).
+   - Eliminates multi-tenant scheduling, dynamic batching complexity, and memory fragmentation overhead.
+
+2. **Hand-Crafted Model Architecture Specialization**:
+   - Rather than providing generic fallback implementations for arbitrary models, Taraference provides hand-crafted, fused CUDA kernels tuned for specific model families:
+     - **`Qwen2.5`** (Official baseline & 3B scoreboard model)
+     - **`Qwen3.5`** (Modern profiling & 4B fast GEMV evaluations)
+     - **`Tara 1.4.1`** (Custom sparse top-2 MoE architecture)
+     - **`Qwen3-Embedding-4B`** (Dedicated vector search & embedding model)
+
+---
+
+## 🏗 System Architecture & Execution Flow
 
 ```
                            +---------------------------+
