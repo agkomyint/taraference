@@ -8,6 +8,7 @@ use crate::tokenizer::Tokenizer;
 use crate::ModelConfig;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use taraference_gguf::GgufFile;
 
 fn dir_bytes(dir: &Path) -> u64 {
@@ -22,6 +23,17 @@ fn dir_bytes(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Find the exact reusable token prefix while leaving the final prompt token
+/// to be evaluated so fresh next-token logits are always produced.
+fn reusable_prefix_len(previous: &[u32], current: &[u32]) -> usize {
+    let shared = previous
+        .iter()
+        .zip(current)
+        .take_while(|(left, right)| left == right)
+        .count();
+    shared.min(current.len().saturating_sub(1))
 }
 
 /// Relative tokenizer GGUF candidates searched after env + pack-local paths.
@@ -85,6 +97,8 @@ pub struct EngineConfig {
     pub default_system: String,
     /// Attempt CUDA graph capture for single-token decode after warm-up.
     pub cuda_graph: bool,
+    /// Enable unstable, explicitly opted-in storage/runtime experiments.
+    pub experimental: bool,
 }
 
 impl Default for EngineConfig {
@@ -96,6 +110,7 @@ impl Default for EngineConfig {
             decode: DecodeBackend::default(),
             default_system: "You are a helpful assistant.".into(),
             cuda_graph: true,
+            experimental: false,
         }
     }
 }
@@ -106,6 +121,9 @@ pub struct InferenceEngine {
     tok: Tokenizer,
     /// Reused across requests (cleared per stateless completion).
     kv: CudaKv,
+    /// Token IDs for the most recent stateless prompt whose KV entries remain
+    /// at the start of `kv`. Used only on non-recurrent transformer models.
+    prompt_cache_tokens: Vec<u32>,
     pub model_path: PathBuf,
     /// GGUF file stem — the only model this process serves (OpenAI `model` id).
     pub model_id: String,
@@ -125,6 +143,13 @@ impl InferenceEngine {
         // Directory with meta.json → Tara MoE Q8 pack (sparse experts).
         if path.is_dir() {
             return Self::load_moe_pack(cfg, path);
+        }
+
+        if cfg.experimental {
+            bail!(
+                "--experimental currently supports Tara MoE pack directories only; {} is a GGUF file",
+                path.display()
+            );
         }
 
         let gguf = GgufFile::open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -158,6 +183,7 @@ impl InferenceEngine {
             model,
             tok,
             kv,
+            prompt_cache_tokens: Vec::new(),
             model_path: path,
             model_id,
             max_seq,
@@ -177,9 +203,12 @@ impl InferenceEngine {
                 path.display()
             );
         }
-        let mut model = CudaModel::load_tara_moe_pack(&path, cfg.decode)?;
+        if cfg.experimental {
+            eprintln!("experimental | route-first selected-expert streaming enabled");
+        }
+        let mut model = CudaModel::load_tara_moe_pack(&path, cfg.decode, cfg.experimental)?;
         // Device top-k + packed experts → fixed launch graph (real routing, no FIXED cheat).
-        model.set_cuda_graph(cfg.cuda_graph);
+        model.set_cuda_graph(cfg.cuda_graph && !cfg.experimental);
 
         let tok_gguf = resolve_tokenizer_gguf(&path)?;
         eprintln!("tokenizer | {}", tok_gguf.display());
@@ -219,6 +248,7 @@ impl InferenceEngine {
             model,
             tok,
             kv,
+            prompt_cache_tokens: Vec::new(),
             model_path: path,
             model_id,
             max_seq,
@@ -250,6 +280,7 @@ impl InferenceEngine {
         max_seq: usize,
         max_new: usize,
         cuda_graph: bool,
+        experimental: bool,
     ) -> Result<Self> {
         Self::load(EngineConfig {
             model_path: model.as_ref().to_path_buf(),
@@ -257,6 +288,7 @@ impl InferenceEngine {
             max_new,
             decode,
             cuda_graph,
+            experimental,
             ..EngineConfig::default()
         })
     }
@@ -306,6 +338,7 @@ impl InferenceEngine {
             );
         }
 
+        self.prompt_cache_tokens.clear();
         let mut vectors = Vec::with_capacity(inputs.len());
         let mut total_tokens = 0usize;
         for input in inputs {
@@ -341,6 +374,7 @@ impl InferenceEngine {
     pub fn session(&mut self, opts: SessionOptions) -> Session<'_> {
         let mut opts = opts;
         opts.uses_thinking_template = self.backend_kind.uses_thinking_template();
+        self.prompt_cache_tokens.clear();
         self.kv.clear();
         Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts)
     }
@@ -448,8 +482,73 @@ impl InferenceEngine {
             repetition_penalty,
             seed,
         };
-        self.kv.clear();
-        let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);
-        session.complete_prompt_stream(&prompt, on_token)
+        // Hybrid/linear-attention models carry recurrent SSM/conv state that
+        // cannot be rewound by changing KV length alone. Preserve the original
+        // full-reset behavior until prefix-state snapshots are supported.
+        // The environment switch provides a correctness/performance A/B escape
+        // hatch without changing the OpenAI request contract.
+        let prefix_cache_enabled =
+            std::env::var_os("TARAFER_PREFIX_CACHE_OFF").is_none();
+        if self.model.cfg.is_hybrid() || !prefix_cache_enabled {
+            self.prompt_cache_tokens.clear();
+            self.kv.clear();
+            let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);
+            return session.complete_prompt_stream(&prompt, on_token);
+        }
+
+        let tokenize_started = Instant::now();
+        let prompt_tokens = self.tok.encode(&prompt, false);
+        let tokenize_ms = tokenize_started.elapsed().as_secs_f64() * 1000.0;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("tokenizer produced 0 tokens for prompt");
+        }
+        let cached_prompt_tokens =
+            reusable_prefix_len(&self.prompt_cache_tokens, &prompt_tokens).min(self.kv.len);
+        self.kv.len = cached_prompt_tokens;
+
+        let result = {
+            let mut session = Session::with_kv(&mut self.model, &self.tok, &mut self.kv, opts);
+            session.complete_token_ids_stream_reusing(
+                &prompt_tokens,
+                cached_prompt_tokens,
+                tokenize_ms,
+                on_token,
+            )
+        };
+        match result {
+            Ok(stats) => {
+                self.prompt_cache_tokens = prompt_tokens;
+                Ok(stats)
+            }
+            Err(error) => {
+                self.prompt_cache_tokens.clear();
+                self.kv.clear();
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use super::reusable_prefix_len;
+
+    #[test]
+    fn exact_prompt_reuses_everything_except_final_token() {
+        assert_eq!(reusable_prefix_len(&[1, 2, 3, 4], &[1, 2, 3, 4]), 3);
+    }
+
+    #[test]
+    fn changed_prompt_reuses_only_exact_leading_tokens() {
+        assert_eq!(
+            reusable_prefix_len(&[10, 20, 30, 40], &[10, 20, 99, 40]),
+            2
+        );
+    }
+
+    #[test]
+    fn unrelated_or_empty_prompts_do_not_reuse_state() {
+        assert_eq!(reusable_prefix_len(&[1, 2], &[9, 2]), 0);
+        assert_eq!(reusable_prefix_len(&[1, 2], &[]), 0);
     }
 }

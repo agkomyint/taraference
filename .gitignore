@@ -7,3 +7,21 @@
 *.pdb
 .env
 /test
+
+# Local SSH credentials must never be committed.
+/.ssh/
+taraference_h100_ed25519
+taraference_h100_ed25519.pub
+taraference_h100_passkey_ed25519
+taraference_h100_passkey_ed25519.pub
+H100_SSH_KEY.md
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Local editor-generated reports can expose absolute workstation paths.
+/.VSCodeCounter/
+/.superstack/

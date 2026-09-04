@@ -95,6 +95,10 @@ pub struct CudaModel {
     pub(crate) moe_idx: CudaSlice<i32>,
     /// MoE: device top-k softmax weights.
     pub(crate) moe_w: CudaSlice<f32>,
+    /// K3-inspired experimental pager. When present, routed expert layers are
+    /// loaded from their packed files into one reusable layer-sized residency
+    /// window instead of keeping every expert layer on the GPU.
+    pub(crate) out_of_core: Option<super::moe_pack::OutOfCoreExpertCache>,
 }
 
 impl CudaModel {
@@ -251,5 +255,19 @@ impl CudaModel {
     pub fn invalidate_decode_graph(&mut self) {
         self.decode_graph = None;
         self.graph_tried = false;
+    }
+}
+
+impl Drop for CudaModel {
+    fn drop(&mut self) {
+        if let Some(pager) = &self.out_of_core {
+            eprintln!(
+                "experimental ooc summary | cache_hits={} expert_loads={} disk_gib={:.3} load_s={:.3}",
+                pager.hits,
+                pager.misses,
+                pager.bytes_read as f64 / 1073741824.0,
+                pager.load_time.as_secs_f64()
+            );
+        }
     }
 }

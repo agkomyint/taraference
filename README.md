@@ -3,7 +3,6 @@
 > **Hyper-optimized single-user LLM & embedding inference engine built in Rust & CUDA — custom-engineered for maximum single-stream performance on specific NVIDIA GPUs & model families.**
 
 [![Release](https://img.shields.io/github/v/release/agkomyint/taraference?style=flat-square&color=blue)](https://github.com/agkomyint/taraference/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey?style=flat-square)](#system-requirements)
 [![CUDA](https://img.shields.io/badge/CUDA-13.x-green?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-downloads)
 
@@ -117,6 +116,23 @@ tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --serve
 ```
 Default endpoint: `http://127.0.0.1:8787` *(or specify a port with `--serve 3000`)*.
 
+> [!WARNING]
+> The server listens on all network interfaces and does **not** implement
+> authentication. OpenAI client API-key or `Authorization` values are accepted
+> only for client compatibility and are not validated. Keep it behind a
+> firewall or an authenticating reverse proxy; do not expose it directly to an
+> untrusted network or the public internet.
+
+For non-recurrent transformer models, the server automatically reuses the
+exact token prefix shared with the preceding chat request. This accelerates
+repeated system prompts and any other identical leading prompt content without
+changing OpenAI request semantics. Non-streaming responses report the hit as
+`usage.prompt_tokens_details.cached_tokens`, and server logs include both
+`cached_prompt_tok` and `prefilled_prompt_tok`. Hybrid/recurrent models retain
+full-prefill behavior until recurrent prefix snapshots are supported. Set
+`TARAFER_PREFIX_CACHE_OFF=1` to disable reuse for correctness or performance
+A/B comparisons.
+
 #### Example Chat Request (via `curl`):
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -165,6 +181,23 @@ Measure your system's exact inference speed (tokens/sec) and performance metrics
 ```bash
 tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile
 ```
+
+### Experimental out-of-core MoE paging
+
+`--experimental` enables a Kimi-K3-inspired storage path for Tara MoE pack
+directories. Routed expert files remain packed on disk and only one complete
+MoE layer is resident on the GPU at a time:
+
+```bash
+tarafer path/to/tara-moe-pack --experimental --prompt "Hello" -n 8
+```
+
+This first implementation is a correctness and memory-capacity path, not a
+speed path. It synchronously reads all experts for each routed layer because
+the current CUDA router indexes a layer-wide expert slab. CUDA graph capture is
+disabled. Runtime logs report layer reads and a final summary containing cache
+hits, misses, disk traffic, and load time. GGUF files are rejected explicitly;
+normal inference is unchanged when the flag is absent.
 
 ---
 
@@ -216,9 +249,3 @@ Interested in low-level GPU kernel designs, Split-K GEMV matrix math, embedding 
 - Text Embedding pipeline execution (EOS hidden state extraction & Matryoshka L2 normalization)
 - Memory management & FP16 Key-Value cache design
 - Step-by-step instructions for building & hacking on the codebase
-
----
-
-## 📄 License
-
-Distributed under the [MIT License](LICENSE).

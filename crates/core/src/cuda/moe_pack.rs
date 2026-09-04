@@ -11,10 +11,13 @@ use super::types::{
 use crate::config::{LayerKind, ModelConfig, RouterWeightMode};
 use crate::quant::{f16_bits_to_f32_fast, f32_to_f16_bits_fast};
 use anyhow::{anyhow, bail, Context, Result};
+use cudarc::driver::CudaStream;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize)]
 struct PackMeta {
@@ -50,12 +53,120 @@ struct PackLayerMeta {
     kind: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PackFileMeta {
     n_rows: usize,
     n_cols: usize,
     #[allow(dead_code)]
     nbytes: usize,
+}
+
+/// Runtime state for experimental route-first expert streaming.
+pub(crate) struct OutOfCoreExpertCache {
+    dir: PathBuf,
+    files: HashMap<String, PackFileMeta>,
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) bytes_read: u64,
+    pub(crate) load_time: Duration,
+}
+
+impl OutOfCoreExpertCache {
+    fn new(dir: &Path, files: HashMap<String, PackFileMeta>) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            files,
+            hits: 0,
+            misses: 0,
+            bytes_read: 0,
+            load_time: Duration::ZERO,
+        }
+    }
+
+}
+
+fn load_expert_slab(
+    stream: &Arc<CudaStream>,
+    dir: &Path,
+    files: &HashMap<String, PackFileMeta>,
+    expert_ids: &[usize],
+    kind: &str,
+    n_rows: usize,
+    n_cols_e: usize,
+    layer_i: usize,
+) -> Result<(GpuMat, u64)> {
+    let mut packed = Vec::new();
+    let mut col_bytes = 0usize;
+    let mut wtype = WType::Q8_0;
+    for &e in expert_ids {
+        let stem = format!("blk.{layer_i}.exp{e}.ffn_{kind}");
+        let (name, is_q4_file) = if files.contains_key(&format!("{stem}.q4")) {
+            (format!("{stem}.q4"), true)
+        } else {
+            (format!("{stem}.q8"), false)
+        };
+        let fi = files
+            .get(&name)
+            .ok_or_else(|| anyhow!("meta.files missing {name}"))?;
+        if fi.n_rows != n_rows || fi.n_cols != n_cols_e {
+            bail!(
+                "{name}: shape {}x{}, expected {n_rows}x{n_cols_e}",
+                fi.n_rows,
+                fi.n_cols
+            );
+        }
+        let path = dir.join(&name);
+        let raw = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        if raw.len() != fi.nbytes {
+            bail!(
+                "{name}: got {} bytes, metadata says {}",
+                raw.len(),
+                fi.nbytes
+            );
+        }
+        if is_q4_file {
+            let expect = q4_col_bytes(n_rows) * n_cols_e;
+            if raw.len() != expect {
+                bail!("{name}: got {} bytes, expected {expect}", raw.len());
+            }
+            if std::env::var_os("TARAFER_MOE_F16").is_some() {
+                packed.extend_from_slice(&dequant_q4_0_to_f16(&raw, n_rows, n_cols_e)?);
+                col_bytes = n_rows * 2;
+                wtype = WType::F16;
+            } else if std::env::var_os("TARAFER_MOE_BM").is_some() {
+                packed.extend_from_slice(&repack_q4_0_block_major(&raw, n_rows, n_cols_e)?);
+                col_bytes = q4_col_bytes(n_rows);
+                wtype = WType::Q4_0_BM;
+            } else {
+                packed.extend_from_slice(&raw);
+                col_bytes = q4_col_bytes(n_rows);
+                wtype = WType::Q4_0;
+            }
+        } else {
+            let expect = q8_col_bytes(n_rows) * n_cols_e;
+            if raw.len() != expect {
+                bail!("{name}: got {} bytes, expected {expect}", raw.len());
+            }
+            packed.extend_from_slice(&raw);
+            col_bytes = q8_col_bytes(n_rows);
+            wtype = WType::Q8_0;
+        }
+    }
+    let bytes = packed.len() as u64;
+    Ok((
+        GpuMat {
+            data: stream.clone_htod(&packed)?,
+            decode_data: None,
+            compact_data: None,
+            n_rows,
+            n_cols: n_cols_e * expert_ids.len(),
+            col_bytes,
+            decode_col_bytes: col_bytes,
+            compact_col_bytes: 0,
+            wtype,
+        },
+        bytes,
+    ))
 }
 
 const Q8_0_BLOCK: usize = 34;
@@ -162,8 +273,78 @@ fn repack_q4_0_align32(src: &[u8], n_rows: usize, n_cols: usize) -> Result<Vec<u
 }
 
 impl CudaModel {
+    /// Bind only the experts selected by the device router into compact slots.
+    /// Normal CUDA execution never enters this path.
+    pub(crate) fn prepare_out_of_core_experts(
+        &mut self,
+        layer_i: usize,
+        expert_ids: &[usize],
+    ) -> Result<()> {
+        let Some(mut pager) = self.out_of_core.take() else {
+            return Ok(());
+        };
+        if !matches!(self.layers[layer_i].ffn, LayerFfn::Moe(_)) {
+            self.out_of_core = Some(pager);
+            return Ok(());
+        }
+        let started = Instant::now();
+        let expert_ff = self.cfg.expert_ff;
+        let n_embd = self.cfg.n_embd;
+        let (gate, bg) = load_expert_slab(
+            &self.stream,
+            &pager.dir,
+            &pager.files,
+            expert_ids,
+            "gate",
+            n_embd,
+            expert_ff,
+            layer_i,
+        )?;
+        let (up, bu) = load_expert_slab(
+            &self.stream,
+            &pager.dir,
+            &pager.files,
+            expert_ids,
+            "up",
+            n_embd,
+            expert_ff,
+            layer_i,
+        )?;
+        let (down, bd) = load_expert_slab(
+            &self.stream,
+            &pager.dir,
+            &pager.files,
+            expert_ids,
+            "down",
+            expert_ff,
+            n_embd,
+            layer_i,
+        )?;
+        if let LayerFfn::Moe(m) = &mut self.layers[layer_i].ffn {
+            m.gate_all = gate;
+            m.up_all = up;
+            m.down_all = down;
+        }
+        pager.misses += 1;
+        pager.bytes_read += bg + bu + bd;
+        pager.load_time += started.elapsed();
+        if std::env::var_os("TARAFER_OOC_TRACE").is_some() {
+            eprintln!(
+                "experimental ooc | layer={layer_i} experts={expert_ids:?} read_mib={:.1} cumulative_loads={}",
+                (bg + bu + bd) as f64 / 1048576.0,
+                pager.misses
+            );
+        }
+        self.out_of_core = Some(pager);
+        Ok(())
+    }
+
     /// Load a Tara MoE Q8 pack directory (`format: tara_moe_q8_v1`).
-    pub fn load_tara_moe_pack(dir: &Path, decode: DecodeBackend) -> Result<Self> {
+    pub fn load_tara_moe_pack(
+        dir: &Path,
+        decode: DecodeBackend,
+        experimental: bool,
+    ) -> Result<Self> {
         let meta_path = dir.join("meta.json");
         let meta_raw = fs::read_to_string(&meta_path)
             .with_context(|| format!("read {}", meta_path.display()))?;
@@ -416,6 +597,56 @@ impl CudaModel {
 
         let pack_experts =
             |kind: &str, n_rows: usize, n_cols_e: usize, layer_i: usize| -> Result<GpuMat> {
+                if experimental {
+                    // Validate the complete index now, but defer disk reads and
+                    // device allocation until this layer is executed.
+                    for e in 0..meta.n_experts {
+                        let stem = format!("blk.{layer_i}.exp{e}.ffn_{kind}");
+                        let name = if meta.files.contains_key(&format!("{stem}.q4")) {
+                            format!("{stem}.q4")
+                        } else {
+                            format!("{stem}.q8")
+                        };
+                        let fi = meta
+                            .files
+                            .get(&name)
+                            .ok_or_else(|| anyhow!("meta.files missing {name}"))?;
+                        if fi.n_rows != n_rows || fi.n_cols != n_cols_e {
+                            bail!("{name}: invalid expert shape");
+                        }
+                        let actual = fs::metadata(dir.join(&name))
+                            .with_context(|| format!("stat {name}"))?
+                            .len() as usize;
+                        if actual != fi.nbytes {
+                            bail!("{name}: got {actual} bytes, metadata says {}", fi.nbytes);
+                        }
+                    }
+                    let q4 = meta
+                        .files
+                        .contains_key(&format!("blk.{layer_i}.exp0.ffn_{kind}.q4"));
+                    let (wtype, col_bytes) = if q4 {
+                        if std::env::var_os("TARAFER_MOE_F16").is_some() {
+                            (WType::F16, n_rows * 2)
+                        } else if std::env::var_os("TARAFER_MOE_BM").is_some() {
+                            (WType::Q4_0_BM, q4_col_bytes(n_rows))
+                        } else {
+                            (WType::Q4_0, q4_col_bytes(n_rows))
+                        }
+                    } else {
+                        (WType::Q8_0, q8_col_bytes(n_rows))
+                    };
+                    return Ok(GpuMat {
+                        data: stream.alloc_zeros(1)?,
+                        decode_data: None,
+                        compact_data: None,
+                        n_rows,
+                        n_cols: n_cols_e * meta.n_experts,
+                        col_bytes,
+                        decode_col_bytes: col_bytes,
+                        compact_col_bytes: 0,
+                        wtype,
+                    });
+                }
                 let mut packed = Vec::new();
                 let mut col_bytes = 0usize;
                 let mut wtype = WType::Q8_0;
@@ -554,10 +785,17 @@ impl CudaModel {
             token_embd.wtype
         );
         ctx.synchronize().context("ctx sync after load")?;
-        eprintln!(
-            "ready | decode={} | MoE device top-k (packed experts, graph-ready)",
-            decode.name()
-        );
+        if experimental {
+            eprintln!(
+                "ready | decode={} | MoE route-first selected-expert slots (experimental)",
+                decode.name()
+            );
+        } else {
+            eprintln!(
+                "ready | decode={} | MoE device top-k (packed experts, graph-ready)",
+                decode.name()
+            );
+        }
 
         let n_embd = cfg.n_embd;
         let n_kv = cfg.n_head_kv * cfg.head_dim();
@@ -613,11 +851,14 @@ impl CudaModel {
             gdn_out: stream.alloc_zeros(1)?,
             decode_graph: None,
             graph_tried: false,
-            // Device-side top-k + packed experts → fixed launch structure → CUDA graphs OK.
-            cuda_graph: true,
+            // Paging changes expert device pointers between layers, which cannot
+            // be captured safely in a static CUDA graph.
+            cuda_graph: !experimental,
             graph_active: false,
             moe_idx: stream.alloc_zeros(8)?,
             moe_w: stream.alloc_zeros(8)?,
+            out_of_core: experimental
+                .then(|| OutOfCoreExpertCache::new(dir, meta.files.clone())),
             cfg,
             decode,
             gpu_name,

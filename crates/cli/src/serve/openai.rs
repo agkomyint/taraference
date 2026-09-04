@@ -98,6 +98,13 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
 }
 
 /// Streaming chunk (SSE `data:` payload).
@@ -167,5 +174,18 @@ mod tests {
             serde_json::from_str(r#"{"input":["hello","สวัสดี"],"encoding_format":"float"}"#)
                 .unwrap();
         assert!(matches!(many.input, EmbeddingInput::Many(ref values) if values.len() == 2));
+    }
+
+    #[test]
+    fn reports_openai_compatible_cached_prompt_tokens() {
+        let usage = Usage {
+            prompt_tokens: 120,
+            completion_tokens: 20,
+            total_tokens: 140,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 80 }),
+        };
+        let value = serde_json::to_value(usage).unwrap();
+        assert_eq!(value["prompt_tokens"], 120);
+        assert_eq!(value["prompt_tokens_details"]["cached_tokens"], 80);
     }
 }

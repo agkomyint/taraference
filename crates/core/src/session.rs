@@ -19,7 +19,12 @@ pub enum StopReason {
 #[derive(Debug, Clone)]
 pub struct TurnStats {
     pub reply: String,
+    /// Full logical prompt size reported to API clients.
     pub prompt_tokens: usize,
+    /// Prompt tokens whose KV state was reused from an earlier request.
+    pub cached_prompt_tokens: usize,
+    /// Prompt tokens actually evaluated by the model for this request.
+    pub prefilled_prompt_tokens: usize,
     pub gen_tokens: usize,
     pub prefill_ms: f64,
     pub decode_ms: f64,
@@ -303,27 +308,81 @@ impl<'a> Session<'a> {
         self.generate_with(prompt, true, on_token)
     }
 
-    fn generate_with<F>(&mut self, prompt: &str, first: bool, mut on_token: F) -> Result<TurnStats>
+    /// Stateless completion over an already-tokenized prompt while preserving
+    /// an exact prefix already committed in the bound KV arena.
+    pub(crate) fn complete_token_ids_stream_reusing<F>(
+        &mut self,
+        ids: &[u32],
+        cached_prompt_tokens: usize,
+        tokenize_ms: f64,
+        on_token: F,
+    ) -> Result<TurnStats>
     where
         F: FnMut(&str),
     {
-        let wall = Instant::now();
-        let ctx_before = self.cache.len;
+        if ids.is_empty() {
+            anyhow::bail!("tokenizer produced 0 tokens for prompt");
+        }
+        if cached_prompt_tokens >= ids.len() {
+            anyhow::bail!("cached prefix must leave at least one prompt token to evaluate");
+        }
+        if self.cache.len != cached_prompt_tokens {
+            anyhow::bail!(
+                "KV prefix length {} does not match cached token count {cached_prompt_tokens}",
+                self.cache.len
+            );
+        }
+        self.primed = true;
+        self.history.clear();
+        self.generate_token_ids(
+            ids,
+            cached_prompt_tokens,
+            tokenize_ms,
+            true,
+            on_token,
+        )
+    }
 
+    fn generate_with<F>(&mut self, prompt: &str, first: bool, on_token: F) -> Result<TurnStats>
+    where
+        F: FnMut(&str),
+    {
         let t_tok = Instant::now();
         let ids = self.tok.encode(prompt, false);
         let tokenize_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
         if ids.is_empty() {
             anyhow::bail!("tokenizer produced 0 tokens for prompt");
         }
+        self.generate_token_ids(&ids, 0, tokenize_ms, first, on_token)
+    }
+
+    fn generate_token_ids<F>(
+        &mut self,
+        ids: &[u32],
+        cached_prompt_tokens: usize,
+        tokenize_ms: f64,
+        first: bool,
+        mut on_token: F,
+    ) -> Result<TurnStats>
+    where
+        F: FnMut(&str),
+    {
+        let wall = Instant::now();
+        let ctx_before = self.cache.len;
         let prompt_tokens = ids.len();
+        let prefilled_prompt_tokens = prompt_tokens.saturating_sub(cached_prompt_tokens);
+        if prefilled_prompt_tokens == 0 {
+            anyhow::bail!("completion requires at least one uncached prompt token");
+        }
 
         let t0 = Instant::now();
-        let greedy = self.model.forward_greedy(&ids, self.cache)?;
+        let greedy = self
+            .model
+            .forward_greedy(&ids[cached_prompt_tokens..], self.cache)?;
         self.history.extend_from_slice(&ids);
         let mut next = self.choose_next(greedy)?;
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let ttft_ms = wall.elapsed().as_secs_f64() * 1000.0;
+        let ttft_ms = tokenize_ms + wall.elapsed().as_secs_f64() * 1000.0;
 
         let mut reply_ids = Vec::new();
         let mut reply = String::new();
@@ -468,8 +527,8 @@ impl<'a> Session<'a> {
         } else {
             0.0
         };
-        let prefill_tps = if prompt_tokens > 0 {
-            prompt_tokens as f64 / (prefill_ms / 1000.0).max(1e-6)
+        let prefill_tps = if prefilled_prompt_tokens > 0 {
+            prefilled_prompt_tokens as f64 / (prefill_ms / 1000.0).max(1e-6)
         } else {
             0.0
         };
@@ -497,6 +556,8 @@ impl<'a> Session<'a> {
         Ok(TurnStats {
             reply,
             prompt_tokens,
+            cached_prompt_tokens,
+            prefilled_prompt_tokens,
             gen_tokens: n,
             prefill_ms,
             decode_ms,
@@ -508,7 +569,7 @@ impl<'a> Session<'a> {
             ctx_len: self.cache.len,
             max_seq: self.cache.max_seq,
             max_new: self.max_new,
-            wall_ms: wall.elapsed().as_secs_f64() * 1000.0,
+            wall_ms: tokenize_ms + wall.elapsed().as_secs_f64() * 1000.0,
             stop,
             hit_max_new,
             first,

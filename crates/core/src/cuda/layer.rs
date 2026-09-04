@@ -1630,6 +1630,20 @@ impl CudaModel {
             }
         }
 
+        // Experimental Kimi-style path: routing happens first, then only the
+        // selected experts are read and packed into slots 0..top_k. Normal CUDA
+        // models keep their full expert slabs and skip this host round-trip.
+        if self.out_of_core.is_some() {
+            let routed = self.stream.clone_dtoh(&self.moe_idx)?;
+            let selected: Vec<usize> = routed[..top_k]
+                .iter()
+                .map(|&e| e as usize)
+                .collect();
+            self.prepare_out_of_core_experts(li, &selected)?;
+            let slots: Vec<i32> = (0..top_k as i32).collect();
+            self.stream.memcpy_htod(&slots, &mut self.moe_idx)?;
+        }
+
         let use_f16 = is_f16;
         let use_q4_bm = is_q4_bm;
         let use_q4_4w = is_q4 && std::env::var_os("TARAFER_MOE_4W").is_some();

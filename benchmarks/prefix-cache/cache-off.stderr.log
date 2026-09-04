@@ -1,0 +1,9 @@
+loading D:\taraference\models\Qwen2.5-3B-Instruct-Q4_K_M.gguf …
+GPU | qwen2 L=36 d=2048 heads=16/2 ff=11008 | 1.79 GiB Q-weights | decode=flash
+GPU device | NVIDIA GeForce RTX 3050 Ti Laptop GPU | compute 8.6 | NVRTC arch=sm_86
+tuning | q4_dual=4way | threads=128 | quantized_warps=16
+weights | Q4_K=216 (1.24 GiB) Q5_K=0 (0.00 GiB) Q5_0=0 (0.00 GiB) Q6_K=37 (0.55 GiB) Q8_0=0 (0.00 GiB)
+ready | decode=flash | Q4_K×Q8 DP4A | fused projections | CUDA-graph ready
+backend | qwen2-dense
+KV    | f16  max_seq=2048  ~72.0 MiB (all layers K+V)
+flags | cuda_graph=true | decode=flash

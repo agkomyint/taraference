@@ -75,6 +75,9 @@ struct Cli {
     /// Disable CUDA graph capture / replay.
     #[arg(long, default_value_t = false)]
     no_cuda_graph: bool,
+    /// Enable unstable out-of-core MoE expert paging. Tara MoE pack directories only.
+    #[arg(long, default_value_t = false)]
+    experimental: bool,
     /// Benchmark: multi-turn chat + CPU/GPU sampling + rich report.
     #[arg(long, default_value_t = false)]
     profile: bool,
@@ -98,7 +101,8 @@ struct Cli {
     /// Deterministic sampling seed.
     #[arg(long, default_value_t = 42)]
     seed: u64,
-    /// Start OpenAI-compatible HTTP server on PORT (default 8787). One GGUF = one model.
+    /// Start an unauthenticated OpenAI-compatible server on all interfaces.
+    /// Keep it behind a firewall or authenticating reverse proxy.
     #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "8787")]
     serve: Option<u16>,
 }
@@ -183,8 +187,14 @@ fn main() -> Result<()> {
     }
 
     let cuda_graph = !cli.no_cuda_graph;
-    let mut engine =
-        InferenceEngine::load_with_flags(&model, cli.decode, cli.ctx, cli.max_new, cuda_graph)?;
+    let mut engine = InferenceEngine::load_with_flags(
+        &model,
+        cli.decode,
+        cli.ctx,
+        cli.max_new,
+        cuda_graph,
+        cli.experimental,
+    )?;
     if cli.think && !engine.backend_kind.uses_thinking_template() {
         bail!(
             "--think is not supported by model family {}",
@@ -265,8 +275,14 @@ fn run_serve(cli: &Cli, model: &PathBuf, port: u16) -> Result<()> {
     );
 
     let cuda_graph = !cli.no_cuda_graph;
-    let engine =
-        InferenceEngine::load_with_flags(model, cli.decode, cli.ctx, cli.max_new, cuda_graph)?;
+    let engine = InferenceEngine::load_with_flags(
+        model,
+        cli.decode,
+        cli.ctx,
+        cli.max_new,
+        cuda_graph,
+        cli.experimental,
+    )?;
     tracing::info!(
         model_id = %engine.model_id,
         weight_gib = format!("{:.2}", engine.weight_gib),

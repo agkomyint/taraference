@@ -12,7 +12,8 @@ use axum::{Json, Router};
 use openai::{
     ChatChoice, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessageIn,
     ChunkChoice, Delta, EmbeddingInput, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, ErrorBody, ErrorResponse, ModelObject, ModelsResponse, Usage,
+    EmbeddingUsage, ErrorBody, ErrorResponse, ModelObject, ModelsResponse, PromptTokensDetails,
+    Usage,
 };
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -38,6 +39,8 @@ pub async fn run(engine: InferenceEngine, port: u16) -> Result<()> {
     let max_new = engine.max_new;
     let decode = engine.decode().name();
     let weight_gib = engine.weight_gib;
+    let prefix_cache =
+        !engine.cfg().is_hybrid() && std::env::var_os("TARAFER_PREFIX_CACHE_OFF").is_none();
 
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
@@ -60,7 +63,12 @@ pub async fn run(engine: InferenceEngine, port: u16) -> Result<()> {
         max_seq,
         max_new,
         weight_gib = format!("{weight_gib:.2}"),
+        prefix_cache,
         "OpenAI-compatible server ready"
+    );
+    warn!(
+        %addr,
+        "authentication is disabled; do not expose this server directly to an untrusted network"
     );
     info!("  GET  /health");
     info!("  GET  /v1/models");
@@ -270,6 +278,8 @@ async fn chat_completions(
         stream = false,
         finish,
         prompt_tok = stats.prompt_tokens,
+        cached_prompt_tok = stats.cached_prompt_tokens,
+        prefilled_prompt_tok = stats.prefilled_prompt_tokens,
         gen_tok = stats.gen_tokens,
         prefill_ms = format!("{:.0}", stats.prefill_ms),
         decode_tps = format!("{:.1}", stats.decode_tps),
@@ -297,6 +307,9 @@ async fn chat_completions(
             prompt_tokens: stats.prompt_tokens as u32,
             completion_tokens: stats.gen_tokens as u32,
             total_tokens: (stats.prompt_tokens + stats.gen_tokens) as u32,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: stats.cached_prompt_tokens as u32,
+            }),
         },
     };
 
@@ -420,6 +433,8 @@ fn stream_chat(
                     stream = true,
                     finish,
                     prompt_tok = stats.prompt_tokens,
+                    cached_prompt_tok = stats.cached_prompt_tokens,
+                    prefilled_prompt_tok = stats.prefilled_prompt_tokens,
                     gen_tok = stats.gen_tokens,
                     prefill_ms = format!("{:.0}", stats.prefill_ms),
                     decode_tps = format!("{:.1}", stats.decode_tps),

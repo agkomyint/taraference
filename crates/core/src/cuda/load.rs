@@ -788,6 +788,7 @@ impl CudaModel {
             graph_active: false,
             moe_idx: stream.alloc_zeros(8)?,
             moe_w: stream.alloc_zeros(8)?,
+            out_of_core: None,
             cfg,
             decode,
             gpu_name,
