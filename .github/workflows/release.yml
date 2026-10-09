@@ -66,7 +66,10 @@ jobs:
           test -x "$BIN"
           strip "$BIN" || true
           cp "$BIN" dist/tarafer
-          tar -C dist -czf dist/tarafer-linux-x86_64.tar.gz tarafer
+          for runtime in target/release/libonnxruntime_providers_*.so; do
+            if [ -f "$runtime" ]; then cp "$runtime" dist/; fi
+          done
+          (cd dist && tar -czf tarafer-linux-x86_64.tar.gz tarafer libonnxruntime_providers_*.so)
           (cd dist && sha256sum tarafer > tarafer.sha256)
           (cd dist && sha256sum tarafer-linux-x86_64.tar.gz > tarafer-linux-x86_64.tar.gz.sha256)
           ls -lh dist/
@@ -111,10 +114,13 @@ jobs:
           $bin = "target\release\tarafer.exe"
           if (-not (Test-Path $bin)) { throw "missing $bin" }
           Copy-Item $bin "dist\tarafer.exe"
+          $providerDlls = Get-ChildItem "target\release\onnxruntime_providers_*.dll" -ErrorAction SilentlyContinue
+          foreach ($providerDll in $providerDlls) { Copy-Item $providerDll.FullName "dist" }
           # Windows 10+ tar can create zip archives
           $zip = "dist\tarafer-windows-x86_64.zip"
           if (Test-Path $zip) { Remove-Item $zip }
-          tar -a -cf $zip -C dist tarafer.exe
+          $packageFiles = @("dist\tarafer.exe") + @($providerDlls | ForEach-Object { $_.FullName })
+          Compress-Archive -Path $packageFiles -DestinationPath $zip -CompressionLevel Optimal
           $exeHash = (Get-FileHash -Algorithm SHA256 "dist\tarafer.exe").Hash.ToLowerInvariant()
           $zipHash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           Set-Content -NoNewline -Path "dist\tarafer.exe.sha256" -Value "$exeHash  tarafer.exe`n"

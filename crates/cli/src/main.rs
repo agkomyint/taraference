@@ -8,6 +8,7 @@
 //! - **cli** — this binary (`download` + `profile` + `update` / `install`)
 
 mod download;
+mod image_commands;
 mod profile;
 mod self_update;
 mod serve;
@@ -27,6 +28,8 @@ Commands (no model path required):
   tarafer update              Download latest GitHub release and replace this binary
   tarafer update v0.2.0       Pin a release tag
   tarafer install             Copy tarafer to ~/.local/bin (add to PATH)
+  tarafer image model download    Install the background-removal model
+  tarafer image remove-bg photo.jpg  Create a transparent PNG
 
 Fast path on a new Linux GPU box:
   # Linux:  tarafer-linux-x86_64.tar.gz
@@ -43,7 +46,7 @@ Fast path on a new Linux GPU box:
 #[command(
     name = "tarafer",
     version,
-    about = "CUDA multi-turn GGUF inference (chat / profile / OpenAI server / model download)",
+    about = "Local inference (chat / profile / server / image background removal)",
     after_help = AFTER_HELP
 )]
 struct Cli {
@@ -115,6 +118,9 @@ fn main() -> Result<()> {
     // Lightweight subcommands so `tarafer update` does not conflict with a model path.
     let mut argv: Vec<String> = std::env::args().collect();
     if argv.len() >= 2 {
+        if argv[1] == "image" {
+            return image_commands::run_from_args(&argv);
+        }
         match argv[1].as_str() {
             "update" | "--update" => {
                 let tag = argv

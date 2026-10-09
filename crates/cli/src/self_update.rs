@@ -61,6 +61,7 @@ pub fn install_to_path(dir: Option<PathBuf>) -> Result<PathBuf> {
     let dest = dir.join(bin_name());
 
     if paths_equal(&src, &dest) {
+        copy_runtime_sidecars(src.parent().unwrap_or_else(|| Path::new(".")), &dir)?;
         eprintln!("already installed at {}", dest.display());
         ensure_path_hint(&dir);
         return Ok(dest);
@@ -68,6 +69,7 @@ pub fn install_to_path(dir: Option<PathBuf>) -> Result<PathBuf> {
 
     let tmp = dir.join(format!(".{}.installing", bin_name()));
     fs::copy(&src, &tmp).with_context(|| format!("copy {} → {}", src.display(), tmp.display()))?;
+    copy_runtime_sidecars(src.parent().unwrap_or_else(|| Path::new(".")), &dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -212,6 +214,10 @@ pub fn self_update(tag: Option<&str>, dest: Option<PathBuf>) -> Result<PathBuf> 
         fs::set_permissions(&new_bin, perms)?;
     }
 
+    copy_runtime_sidecars(
+        new_bin.parent().unwrap_or_else(|| Path::new(".")),
+        dest.parent().unwrap_or_else(|| Path::new(".")),
+    )?;
     replace_executable(&new_bin, &dest)?;
     let _ = fs::remove_dir_all(&tmp_dir);
 
@@ -228,6 +234,35 @@ pub fn self_update(tag: Option<&str>, dest: Option<PathBuf>) -> Result<PathBuf> 
         eprint!("{}", String::from_utf8_lossy(&out.stdout));
     }
     Ok(dest)
+}
+
+/// Copy ONNX Runtime execution-provider sidecars next to the installed binary.
+/// Releases without image support sidecars remain valid and simply copy nothing.
+fn copy_runtime_sidecars(source_dir: &Path, destination_dir: &Path) -> Result<()> {
+    fs::create_dir_all(destination_dir)
+        .with_context(|| format!("create runtime directory {}", destination_dir.display()))?;
+    for entry in fs::read_dir(source_dir)
+        .with_context(|| format!("read runtime directory {}", source_dir.display()))?
+    {
+        let entry = entry?;
+        let source = entry.path();
+        let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !source.is_file()
+            || !(name.starts_with("onnxruntime_providers_")
+                || name.starts_with("libonnxruntime_providers_"))
+        {
+            continue;
+        }
+        let destination = destination_dir.join(name);
+        if paths_equal(&source, &destination) {
+            continue;
+        }
+        fs::copy(&source, &destination)
+            .with_context(|| format!("copy runtime provider {} → {}", source.display(), destination.display()))?;
+    }
+    Ok(())
 }
 
 fn replace_executable(new_bin: &Path, dest: &Path) -> Result<()> {

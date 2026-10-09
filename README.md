@@ -21,7 +21,6 @@ release checks.
 - **🔬 Specialized Architecture Support**: Rather than supporting hundreds of arbitrary model types poorly, Taraference focuses on specialized, hand-tuned CUDA kernels for specific model families:
   - **Qwen2.5** (Official baseline & 3B scoreboard model)
   - **Qwen3.5** (High-speed kernel profiling & 4B evaluation)
-  - **Tara 1.4.1** (Custom sparse top-2 MoE architecture)
   - **Qwen3 Embedding** (Dedicated 4B vector embedding & retrieval model)
 
 If you need multi-tenant batch serving across dozens of concurrent users or support for niche legacy architectures, use frameworks like vLLM or llama.cpp. If you want **maximum single-stream generation speed** and zero-overhead execution on supported models, use **Taraference**.
@@ -40,12 +39,25 @@ By combining a lightweight **Rust control plane** with **just-in-time compiled C
 
 - **⚡ Specialized Split-K CUDA Kernels**: Custom packed GEMV kernels (Q4_K, Q6_K, Q8_0) with 8-way split-KV flash decoding for maximum single-stream tokens per second.
 - **🔤 Native Text Embeddings**: Specialized support for `Qwen3-Embedding-4B` via `POST /v1/embeddings`, featuring Matryoshka dimension truncation and L2 vector normalization.
-- **📦 Zero-Dependency Single Binary**: A single ~10MB executable. No PyTorch, no Python runtime, no complex environment setups.
+- **📦 Compact Native CLI**: A small Rust executable with no Python or PyTorch runtime. Optional image inference uses ONNX Runtime provider libraries and a separately downloaded model.
 - **🔌 OpenAI-Compatible API Server**: Run a local server supporting `/v1/chat/completions` (streaming) and `/v1/embeddings` to plug into any app or web UI.
 - **📥 Built-in Model Downloader**: Download supported quantized chat and embedding models directly from Hugging Face (`tarafer --download 3b` or `tarafer --download embed-4b`).
 - **💬 Interactive Terminal Chat**: Rich terminal interface supporting multi-turn conversations, context resetting, and customized prompts.
 - **📊 Real-Time Benchmarking**: Measure exact tokens/second, prefill performance, and VRAM utilization with the built-in `--profile` command.
 - **🎯 Dynamic Hardware Compilation**: Auto-detects your GPU hardware architecture (`sm_75`, `sm_86`, `sm_89`, `sm_90`, etc.) and compiles tuned kernels on launch.
+- **🖼️ Local Background Removal**: Run BiRefNet Lite locally and export transparent PNGs with `tarafer image remove-bg`.
+
+### Background removal
+
+Install the optional 115 MB FP16 model once, then create a transparent PNG:
+
+```bash
+tarafer image model download
+tarafer image remove-bg photo.jpg
+```
+
+This writes `photo-no-bg.png`. `--device auto` tries CUDA, DirectML on Windows,
+then CPU. See [the setup and model notes](docs/BACKGROUND_REMOVAL.md).
 
 ---
 

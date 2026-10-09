@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 pub const MODEL_FILE: &str = "birefnet-lite.onnx";
 pub const MODEL_REPO: &str = "onnx-community/BiRefNet_lite-ONNX";
 pub const MODEL_COMMIT: &str = "f82954f";
-pub const MODEL_SHA256: &str = "5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333";
-pub const MODEL_BYTES: u64 = 224_000_000;
+pub const MODEL_SHA256: &str = "d39b897ceb16ae654c1731f3dba0cf9b368d9cae74b5a57459b455cc8bfec402";
+pub const MODEL_BYTES: u64 = 115_000_000;
 const MODEL_SIZE: u32 = 1024;
 const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 
@@ -22,6 +22,7 @@ const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 pub enum Device {
     Auto,
     Cuda,
+    DirectMl,
     Cpu,
 }
 
@@ -32,8 +33,9 @@ impl std::str::FromStr for Device {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "cuda" | "gpu" => Ok(Self::Cuda),
+            "directml" | "dml" => Ok(Self::DirectMl),
             "cpu" => Ok(Self::Cpu),
-            _ => bail!("unknown image device {value:?}; choose auto, cuda, or cpu"),
+            _ => bail!("unknown image device {value:?}; choose auto, cuda, directml, or cpu"),
         }
     }
 }
@@ -41,6 +43,7 @@ impl std::str::FromStr for Device {
 #[derive(Debug)]
 pub struct RemovalResult {
     pub output: PathBuf,
+    pub session_ms: f64,
     pub inference_ms: f64,
     pub device: &'static str,
     pub width: u32,
@@ -63,14 +66,14 @@ pub fn download_model(model_path: &Path, force: bool) -> Result<PathBuf> {
     }
 
     let url = format!(
-        "https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_COMMIT}/onnx/model.onnx"
+        "https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_COMMIT}/onnx/model_fp16.onnx"
     );
     let partial = model_path.with_extension("onnx.partial");
     if partial.exists() {
         fs::remove_file(&partial).with_context(|| format!("remove {}", partial.display()))?;
     }
 
-    eprintln!("Downloading BiRefNet Lite (~224 MB; MIT license)\n  from {url}\n  to {}", model_path.display());
+    eprintln!("Downloading BiRefNet Lite FP16 (~115 MB; MIT license)\n  from {url}\n  to {}", model_path.display());
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(30))
         .timeout_read(Duration::from_secs(3600))
@@ -149,22 +152,54 @@ fn verify_model(model_path: &Path) -> Result<()> {
     }
     let actual = format!("{:x}", hasher.finalize());
     if actual != MODEL_SHA256 {
-        bail!("model checksum does not match the pinned BiRefNet Lite file; re-download with `tarafer image model download --force`");
+        bail!("model checksum does not match the pinned BiRefNet Lite FP16 file; re-download with `tarafer image model download --force`");
     }
     Ok(())
 }
 
 fn load_session(model_path: &Path, device: Device) -> Result<(Session, &'static str)> {
-    if device != Device::Cpu {
+    if matches!(device, Device::Auto | Device::Cuda) {
         let cuda_result = (|| -> Result<Session> {
+            let stem = model_path.file_stem().and_then(|value| value.to_str()).unwrap_or("model");
+            let optimized_path = model_path.with_file_name(format!(
+                "{stem}-{}-cuda-ort-rc13.onnx",
+                &MODEL_SHA256[..12]
+            ));
+            let (session_model, optimization_level, save_optimized) = if optimized_path.is_file() {
+                (
+                    optimized_path.as_path(),
+                    ort::session::builder::GraphOptimizationLevel::Disable,
+                    false,
+                )
+            } else {
+                (
+                    model_path,
+                    ort::session::builder::GraphOptimizationLevel::Level2,
+                    true,
+                )
+            };
             let cuda = ep::CUDA::default()
-                .with_memory_limit(2 * 1024 * 1024 * 1024)
+                // Let ONNX Runtime grow to the available device memory. A fixed
+                // arena cap blocked this model's 784 MiB intermediate allocation.
+                .with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
                 .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
                 .build()
                 .error_on_failure();
-            Ok(Session::builder()?
-                .with_execution_providers([cuda])?
-                .commit_from_file(model_path)?)
+            let builder = Session::builder()
+                .map_err(|error| anyhow!(error.to_string()))?
+                .with_optimization_level(optimization_level)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            let mut builder = builder
+                .with_execution_providers([cuda])
+                .map_err(|error| anyhow!(error.to_string()))?;
+            if save_optimized {
+                builder = builder
+                    .with_optimized_model_path(&optimized_path)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
+            builder
+                .commit_from_file(session_model)
+                .map_err(|error| anyhow!(error.to_string()))
         })();
         match cuda_result {
             Ok(session) => return Ok((session, "CUDA")),
@@ -175,13 +210,73 @@ fn load_session(model_path: &Path, device: Device) -> Result<(Session, &'static 
         }
     }
 
-    let session = Session::builder()?
+    #[cfg(windows)]
+    if matches!(device, Device::Auto | Device::DirectMl) {
+        let directml_result = (|| -> Result<Session> {
+            let provider = ep::DirectML::default().build().error_on_failure();
+            let builder = Session::builder()
+                .map_err(|error| anyhow!(error.to_string()))?;
+            let mut builder = builder
+                .with_execution_providers([provider])
+                .map_err(|error| anyhow!(error.to_string()))?;
+            builder
+                .commit_from_file(model_path)
+                .map_err(|error| anyhow!(error.to_string()))
+        })();
+        match directml_result {
+            Ok(session) => return Ok((session, "DirectML")),
+            Err(error) if device == Device::DirectMl => {
+                return Err(error).context("could not start BiRefNet Lite with ONNX Runtime DirectML");
+            }
+            Err(error) => eprintln!("DirectML image inference unavailable ({error:#}); falling back to CPU"),
+        }
+    }
+
+    #[cfg(not(windows))]
+    if device == Device::DirectMl {
+        bail!("DirectML is available only on Windows");
+    }
+
+    let session = Session::builder()
+        .map_err(|error| anyhow!(error.to_string()))?
         .commit_from_file(model_path)
         .context("start BiRefNet Lite with ONNX Runtime CPU")?;
     Ok((session, "CPU"))
 }
 
+fn predict_mask(session: &mut Session, input: Vec<f32>) -> Result<Vec<f32>> {
+    let input_name = session.inputs().first()
+        .ok_or_else(|| anyhow!("BiRefNet ONNX model has no inputs"))?.name().to_owned();
+    let tensor = Tensor::from_array(([1usize, 3, MODEL_SIZE as usize, MODEL_SIZE as usize], input))?;
+    let outputs = session.run(ort::inputs![input_name.as_str() => tensor])?;
+    let output = outputs.values().last()
+        .ok_or_else(|| anyhow!("BiRefNet ONNX model returned no outputs"))?;
+    let (shape, logits) = output.try_extract_tensor::<f32>()?;
+    if logits.len() != (MODEL_SIZE * MODEL_SIZE) as usize || shape.len() < 2 {
+        bail!("unexpected BiRefNet Lite output shape {shape:?}; expected one 1024×1024 mask");
+    }
+    Ok(logits.to_vec())
+}
+
 pub fn remove_background(
+    input_path: &Path,
+    output_path: &Path,
+    model_path: &Path,
+    device: Device,
+) -> Result<RemovalResult> {
+    let input_path = input_path.to_path_buf();
+    let output_path = output_path.to_path_buf();
+    let model_path = model_path.to_path_buf();
+    std::thread::Builder::new()
+        .name("tarafer-image-inference".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || remove_background_inner(&input_path, &output_path, &model_path, device))
+        .context("start image inference worker")?
+        .join()
+        .map_err(|_| anyhow!("image inference worker panicked"))?
+}
+
+fn remove_background_inner(
     input_path: &Path,
     output_path: &Path,
     model_path: &Path,
@@ -207,14 +302,9 @@ pub fn remove_background(
         bail!("image dimensions {width}×{height} exceed the supported 100-megapixel limit");
     }
 
-    let (mut session, selected_device) = load_session(model_path, device)?;
-    let input_name = session
-        .inputs()
-        .first()
-        .ok_or_else(|| anyhow!("BiRefNet ONNX model has no inputs"))?
-        .name
-        .to_owned();
-
+    let session_started = Instant::now();
+    let (mut session, mut selected_device) = load_session(model_path, device)?;
+    let mut session_ms = session_started.elapsed().as_secs_f64() * 1000.0;
     let rgb = image.to_rgb8();
     let resized = image::imageops::resize(&rgb, MODEL_SIZE, MODEL_SIZE, FilterType::Triangle);
     let means = [0.485f32, 0.456, 0.406];
@@ -228,17 +318,22 @@ pub fn remove_background(
         }
     }
 
-    let tensor = Tensor::from_array(([1usize, 3, MODEL_SIZE as usize, MODEL_SIZE as usize], input))?;
     let started = Instant::now();
-    let outputs = session.run(ort::inputs![input_name.as_str() => tensor])?;
+    let first_run = predict_mask(&mut session, input.clone()).map_err(|error| error.to_string());
+    let logits = match first_run {
+        Ok(logits) => logits,
+        Err(error) if device == Device::Auto && selected_device != "CPU" => {
+            eprintln!("{} inference failed ({error}); retrying on CPU", selected_device);
+            drop(session);
+            let session_started = Instant::now();
+            let (mut cpu_session, cpu_device) = load_session(model_path, Device::Cpu)?;
+            session_ms += session_started.elapsed().as_secs_f64() * 1000.0;
+            selected_device = cpu_device;
+            predict_mask(&mut cpu_session, input)?
+        }
+        Err(error) => return Err(anyhow!(error)),
+    };
     let inference_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let output = outputs
-        .get(0)
-        .ok_or_else(|| anyhow!("BiRefNet ONNX model returned no outputs"))?;
-    let (shape, logits) = output.try_extract_tensor::<f32>()?;
-    if logits.len() != plane || shape.len() < 2 {
-        bail!("unexpected BiRefNet Lite output shape {shape:?}; expected one 1024×1024 mask");
-    }
 
     let mask_small: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(MODEL_SIZE, MODEL_SIZE, |x, y| {
         let index = y as usize * MODEL_SIZE as usize + x as usize;
@@ -262,6 +357,7 @@ pub fn remove_background(
 
     Ok(RemovalResult {
         output: output_path.to_path_buf(),
+        session_ms,
         inference_ms,
         device: selected_device,
         width,

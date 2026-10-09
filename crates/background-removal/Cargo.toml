@@ -9,3 +9,6 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 ort = { version = "2.0.0-rc.13", features = ["cuda"] }
 sha2 = "0.10"
 ureq.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "2.0.0-rc.13", features = ["directml"] }

@@ -1,5 +1,0 @@
-# Same GGUF as taraference q35fast scoreboard path (not a different registry quant).
-FROM ../models/Qwen3.5-4B-Q4_K_M.gguf
-PARAMETER num_ctx 1024
-PARAMETER temperature 0
-PARAMETER seed 0
