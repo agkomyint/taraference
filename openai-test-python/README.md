@@ -55,6 +55,6 @@ python bench_1m.py --target 10000 --max-tokens 512   # short calibration
 # python bench_1m.py --target 1000000 --max-tokens 512  # full 1M (hours)
 ```
 
-Core metrics (see [GOAL.md](../GOAL.md)):
+Core metrics (see [v0.7.0 roadmap](../roadmap/0.7.0/ROADMAP.md)):
 - `aggregate_accepted_tps` — total completion tokens / wall (what this bench optimizes)
 - `single_stream_accepted_tps` — one client decode rate (server log `decode_tps`)

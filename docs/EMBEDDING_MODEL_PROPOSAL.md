@@ -14,7 +14,8 @@ size, official GGUF availability, and reuse of Taraference's existing dense Qwen
 CUDA implementation.
 
 This does not replace or modify the generation scoreboard. Generation performance
-claims remain attached to `Qwen2.5-3B-Instruct-Q4_K_M.gguf` under `GOAL.md`.
+claims remain attached to `Qwen2.5-3B-Instruct-Q4_K_M.gguf` under
+[`roadmap/0.7.0/ROADMAP.md`](../roadmap/0.7.0/ROADMAP.md).
 
 ## Why this model
 

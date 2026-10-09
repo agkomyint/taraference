@@ -3,10 +3,12 @@
 /models/**
 !/models/.gitkeep
 **/*.gguf
+**/*.onnx
 .DS_Store
 *.pdb
 .env
 /test
+/test-ference/
 
 # Local SSH credentials must never be committed.
 /.ssh/

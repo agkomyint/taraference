@@ -10,6 +10,9 @@
 
 ## 🎯 Design Philosophy & Scope
 
+See the [v0.7.0 roadmap](roadmap/0.7.0/ROADMAP.md) for planned priorities and
+release checks.
+
 > [!IMPORTANT]
 > **Taraference is NOT a general-purpose, multi-tenant LLM server.**  
 > It is a specialized, single-user performance engine built with hand-crafted CUDA kernels for specific model architectures.

@@ -4,6 +4,7 @@ members = [
     "crates/gguf",
     "crates/core",
     "crates/cli",
+    "crates/background-removal",
 ]
 
 [workspace.package]

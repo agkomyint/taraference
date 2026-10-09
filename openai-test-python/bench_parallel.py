@@ -2,7 +2,7 @@
 """
 Parallel / aggregate throughput bench for tarafer --serve.
 
-Core metrics (GOAL.md):
+Core metrics (roadmap/0.7.0/ROADMAP.md):
   - single_stream_accepted_tps : one client decode rate
   - aggregate_accepted_tps     : total completion tokens / wall across all clients
 

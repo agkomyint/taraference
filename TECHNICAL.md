@@ -164,5 +164,5 @@ cargo test --workspace
 
 For official contribution rules, model testing baselines, and performance scoreboard tracking:
 - Refer to [`AGENTS.md`](../AGENTS.md) for profiling rules.
-- Refer to [`GOAL.md`](../GOAL.md) for target throughput benchmarks.
-- Refer to [`WORKFLOW.md`](../WORKFLOW.md) for SSH development workflows.
+- Refer to [`roadmap/0.7.0/ROADMAP.md`](roadmap/0.7.0/ROADMAP.md) for benchmark
+  policy, release priorities, and validation workflow.

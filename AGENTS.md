@@ -12,4 +12,5 @@ You are permitted to run `--profile`, speed A/B testing, and kernel iteration on
 
 **Do not use 0.8B/0.5B** for claiming top-line speed wins or official scoreboard numbers.
 
-Policy details live in [GOAL.md](GOAL.md) and [WORKFLOW.md](WORKFLOW.md).
+Current release priorities, benchmark policy, and validation workflow live in
+[roadmap/0.7.0/ROADMAP.md](roadmap/0.7.0/ROADMAP.md).

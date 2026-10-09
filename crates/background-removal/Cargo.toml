@@ -1,0 +1,11 @@
+[package]
+name = "taraference-background-removal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp"] }
+ort = { version = "2.0.0-rc.13", features = ["cuda"] }
+sha2 = "0.10"
+ureq.workspace = true
