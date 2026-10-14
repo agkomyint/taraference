@@ -185,7 +185,7 @@ jobs:
             tar -xzf tarafer-linux-x86_64.tar.gz
             chmod +x tarafer
             ./tarafer install          # → ~/.local/bin/tarafer (on PATH)
-            tarafer --download 3b
+            tarafer models pull 3b-qwen25
             tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf
             ```
 
@@ -198,7 +198,7 @@ jobs:
             Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}/tarafer-windows-x86_64.zip" -OutFile tarafer-windows-x86_64.zip
             Expand-Archive .\tarafer-windows-x86_64.zip -DestinationPath .
             .\tarafer.exe install
-            .\tarafer.exe --download 3b
+            .\tarafer.exe models pull 3b-qwen25
             .\tarafer.exe models\Qwen2.5-3B-Instruct-Q4_K_M.gguf
             ```
 

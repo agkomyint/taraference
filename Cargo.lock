@@ -1530,7 +1530,7 @@ dependencies = [
 
 [[package]]
 name = "taraference"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-background-removal"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "image",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "cudarc",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-gguf"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-tts"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "hound",

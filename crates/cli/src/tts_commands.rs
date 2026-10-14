@@ -5,12 +5,17 @@ use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::path::PathBuf;
 use taraference_tts::{
-    mms::{Mms, MMS_MODEL_DIR},
-    missing_files, write_wav_rate, Device, SynthOptions, Tts, DEFAULT_MODEL_DIR,
+    mms::{self, Mms, MMS_MODEL_DIR},
+    missing_files,
+    normalize::{normalize, Lexicon},
+    write_wav_rate, Device, SynthOptions, Tts, DEFAULT_MODEL_DIR,
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "tarafer tts", about = "Local Burmese text-to-speech (F5-Myanmar-TTS, non-commercial)")]
+#[command(
+    name = "tarafer speech",
+    about = "Local Burmese text-to-speech: F5-Myanmar-TTS (best quality) and MMS-TTS (fast). Weights are CC BY-NC 4.0, non-commercial."
+)]
 struct TtsCli {
     #[command(subcommand)]
     command: TtsCommand,
@@ -55,11 +60,18 @@ enum TtsCommand {
         /// Exact transcript of --ref-audio.
         #[arg(long)]
         ref_text: Option<String>,
+        /// Word list (`English=Burmese` per line) for names and loanwords the models cannot read.
+        #[arg(long, value_name = "FILE")]
+        lexicon: Option<PathBuf>,
+        /// Skip number reading and cleanup; send the text to the model as given.
+        #[arg(long)]
+        no_normalize: bool,
     },
-    /// Check that the exported TTS model files are present.
+    /// Show which engines are installed and ready.
     Status {
-        #[arg(long, default_value = DEFAULT_MODEL_DIR)]
-        model_dir: PathBuf,
+        /// Check only this F5 directory (default: all engines at their default paths).
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
     },
 }
 
@@ -67,25 +79,35 @@ fn parse_device(value: &str) -> Result<Device, String> {
     value.parse::<Device>().map_err(|error| error.to_string())
 }
 
-pub fn run_from_args(argv: &[String]) -> Result<()> {
-    // Drop the `tts` word before handing the rest to this focused parser.
-    let args = std::iter::once(argv.first().map(String::as_str).unwrap_or("tarafer"))
-        .chain(argv.iter().skip(2).map(String::as_str));
+pub fn run(args: Vec<String>) -> Result<()> {
+    let args = std::iter::once("tarafer speech".to_string()).chain(args);
     match TtsCli::parse_from(args).command {
         TtsCommand::Status { model_dir } => {
-            let missing = missing_files(&model_dir);
-            if missing.is_empty() {
-                eprintln!("ready  | {}", model_dir.display());
-                eprintln!("next   | tarafer tts say \"မင်္ဂလာပါ\" -o hello.wav");
-            } else {
-                for path in &missing {
-                    eprintln!("missing| {}", path.display());
+            let f5_dir = model_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
+            let engines = [
+                ("f5 ", "F5-Myanmar-TTS v2 (best quality, CC BY-NC)", f5_dir.clone(), missing_files(&f5_dir),
+                 format!("python tools/tts/export_f5_myanmar.py --out {}", f5_dir.display())),
+                ("mms", "MMS-TTS Burmese (fast, CPU ok, CC BY-NC)", PathBuf::from(MMS_MODEL_DIR),
+                 mms::missing_files(std::path::Path::new(MMS_MODEL_DIR)),
+                 format!("put model.onnx + tokens.txt (willwade/mms-tts-multilingual-models-onnx, mya/) in {MMS_MODEL_DIR}")),
+            ];
+            let mut ready = 0;
+            for (id, name, dir, missing, hint) in &engines {
+                if missing.is_empty() {
+                    ready += 1;
+                    eprintln!("ready   | {id} | {name} | {}", dir.display());
+                } else {
+                    eprintln!("missing | {id} | {name}");
+                    for path in missing {
+                        eprintln!("          - {}", path.display());
+                    }
+                    eprintln!("          setup: {hint}");
                 }
-                bail!(
-                    "TTS model not installed; run `python tools/tts/export_f5_myanmar.py --out {}`",
-                    model_dir.display()
-                );
             }
+            if ready == 0 {
+                bail!("no TTS engine installed");
+            }
+            eprintln!("next    | tarafer speech say \"မင်္ဂလာပါ\" -o hello.wav [--engine f5|mms]");
         }
         TtsCommand::Say {
             text,
@@ -100,6 +122,8 @@ pub fn run_from_args(argv: &[String]) -> Result<()> {
             seed,
             ref_audio,
             ref_text,
+            lexicon,
+            no_normalize,
         } => {
             let text = match (text.as_deref(), file) {
                 (_, Some(path)) => std::fs::read_to_string(&path)
@@ -122,6 +146,28 @@ pub fn run_from_args(argv: &[String]) -> Result<()> {
             {
                 bail!("output must be a .wav file");
             }
+            let text = if no_normalize {
+                text
+            } else {
+                let lex = match &lexicon {
+                    Some(path) => Lexicon::from_file(path)?,
+                    None => Lexicon::default(),
+                };
+                let n = normalize(&text, &lex);
+                if !n.unknown_words.is_empty() {
+                    eprintln!(
+                        "warning| not speakable, skipped: {} (add `Word=Burmese` lines to a --lexicon file)",
+                        n.unknown_words.join(", ")
+                    );
+                }
+                if n.dropped_symbols > 0 {
+                    eprintln!("note   | removed {} emoji/symbol character(s)", n.dropped_symbols);
+                }
+                if n.text.trim().is_empty() {
+                    bail!("nothing speakable left after cleanup (is the text Burmese?)");
+                }
+                n.text
+            };
             let options = SynthOptions { steps, cfg, speed, seed, ref_audio, ref_text };
             let result = if engine == "mms" {
                 let dir = model_dir.unwrap_or_else(|| PathBuf::from(MMS_MODEL_DIR));
@@ -136,12 +182,12 @@ pub fn run_from_args(argv: &[String]) -> Result<()> {
             };
             write_wav_rate(&output, &result.samples, result.sample_rate)?;
             eprintln!(
-                "done   | {:.1} s audio | {} chunk(s) | {:.1} s synth | RTF {:.2} | {} steps",
+                "done   | {:.1} s audio | {} chunk(s) | {:.1} s synth | RTF {:.2}{}",
                 result.seconds(),
                 result.chunks,
                 result.synth_ms / 1000.0,
                 result.synth_ms / 1000.0 / result.seconds().max(1e-6),
-                steps
+                if engine == "f5" { format!(" | {steps} steps") } else { String::new() }
             );
             eprintln!("output | {}", output.display());
         }

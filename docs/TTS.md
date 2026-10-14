@@ -1,6 +1,6 @@
 # Burmese text-to-speech in taraference
 
-`tarafer tts` synthesises Burmese speech locally on ONNX Runtime (CUDA, DirectML or CPU).
+`tarafer speech` synthesises Burmese speech locally on ONNX Runtime (CUDA, DirectML or CPU).
 No Python is needed at run time. This document records which open models exist, which are
 integrated, what was measured, and what is still open.
 
@@ -24,15 +24,30 @@ excluded. Quality has **not** been scored by the author of this document; judge 
 ## Usage
 
 ```powershell
-tarafer tts status
-tarafer tts say "မင်္ဂလာပါ" -o hello.wav                          # F5, best quality so far
-tarafer tts say --file story.txt -o story.wav --steps 16          # F5, faster
-tarafer tts say --file story.txt --engine mms -o story.wav        # MMS, fastest, runs on CPU
-tarafer tts say "…" -o cloned.wav --ref-audio v.wav --ref-text "exact transcript of v.wav"   # F5 only
+tarafer speech status
+tarafer speech say "မင်္ဂလာပါ" -o hello.wav                          # F5, best quality so far
+tarafer speech say --file story.txt -o story.wav --steps 16          # F5, faster
+tarafer speech say --file story.txt --engine mms -o story.wav        # MMS, fastest, runs on CPU
+tarafer speech say "…" -o cloned.wav --ref-audio v.wav --ref-text "exact transcript of v.wav"   # F5 only
 ```
+
+### Text cleanup (all engines)
+
+The models only read Burmese script, so `say` first normalises the text:
+
+- Digits (`7`, `၅`, `1,250`, `3.5`) and `%` are read as Burmese number words (`7နာရီ` → `ခုနစ်နာရီ`).
+- Emoji and symbols are removed; the count is reported.
+- Latin words are not speakable. Give them Burmese spellings with `--lexicon FILE`
+  (`Client=ကလိုင်းယင့်`, see [tts-lexicon.example.txt](tts-lexicon.example.txt)). Unlisted words are
+  skipped and named in a warning, never dropped silently.
+- `--no-normalize` sends the text through unchanged.
+
+Number reading and the sample spellings follow common usage but have not been checked by a native speaker.
 
 | Option | Default | Notes |
 |---|---|---|
+| `--lexicon` | none | `English=Burmese` word list |
+| `--no-normalize` | off | skip cleanup |
 | `--engine` | `f5` | `f5` or `mms` |
 | `--model-dir` | per engine | `models/tts/f5-myanmar` or `models/tts/mms-mya` |
 | `--device` | `auto` | `auto` (CUDA → DirectML → CPU), `cuda`, `directml`, `cpu` |
@@ -124,7 +139,7 @@ TTS real-time factors, not LLM token rates, and are not comparable to the Qwen2.
 - F5 is capped at 8000 mel frames (~5.3 min) per chunk; long text is chunked.
 - Reference-voice cloning needs an exact transcript of the reference audio and is untested.
 - DirectML is untested; CPU works but F5 is impractically slow on CPU.
-- The F5 export needs Python today. Hosting the exported ONNX for a `tarafer tts model download`
+- The F5 export needs Python today. Hosting the exported ONNX for a `tarafer models pull`
   command would remove that, but publishing the files is a decision for the repo owner.
 
 ## Next steps
@@ -132,7 +147,7 @@ TTS real-time factors, not LLM token rates, and are not comparable to the Qwen2.
 1. Listen to the four engines' output on the same text and pick a default.
 2. Port MyanmarTTS (CC0) to ONNX and add `--engine myanmartts`, giving a commercially usable engine.
 3. Test VoxCPM2 feasibility on a 4 GB GPU (community GGUF Q8_0 or ONNX) for an Apache-2.0 option.
-4. Add `tarafer tts bench` to print the comparison table above automatically.
+4. Add `tarafer bench speech` to print the comparison table above automatically.
 5. Add a model download command so users do not need Python.
 
 ## Verification

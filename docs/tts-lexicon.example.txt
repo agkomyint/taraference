@@ -1,0 +1,7 @@
+# tarafer speech lexicon: Word=Burmese spelling, one per line. Use with --lexicon FILE.
+# The models only read Burmese script. Anything listed here is replaced before synthesis.
+# Latin keys are case-insensitive; longer keys win. Spellings below are suggestions:
+# check them with a native speaker.
+Client=ကလိုင်းယင့်
+Respect=ရိစ်စပက်
+Min Buri=မင်းဘူရီ

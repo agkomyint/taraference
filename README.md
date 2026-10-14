@@ -10,7 +10,7 @@
 
 ## 🎯 Design Philosophy & Scope
 
-See the [v0.7.0 roadmap](roadmap/0.7.0/ROADMAP.md) for planned priorities and
+See the [roadmap](roadmap/ROADMAP.md) for planned priorities and
 release checks.
 
 > [!IMPORTANT]
@@ -41,9 +41,9 @@ By combining a lightweight **Rust control plane** with **just-in-time compiled C
 - **🔤 Native Text Embeddings**: Specialized support for `Qwen3-Embedding-4B` via `POST /v1/embeddings`, featuring Matryoshka dimension truncation and L2 vector normalization.
 - **📦 Compact Native CLI**: A small Rust executable with no Python or PyTorch runtime. Optional image inference uses ONNX Runtime provider libraries and a separately downloaded model.
 - **🔌 OpenAI-Compatible API Server**: Run a local server supporting `/v1/chat/completions` (streaming) and `/v1/embeddings` to plug into any app or web UI.
-- **📥 Built-in Model Downloader**: Download supported quantized chat and embedding models directly from Hugging Face (`tarafer --download 3b` or `tarafer --download embed-4b`).
+- **📥 Built-in Model Downloader**: Download supported quantized chat and embedding models directly from Hugging Face (`tarafer models pull 4b` or `tarafer models pull embed-4b`).
 - **💬 Interactive Terminal Chat**: Rich terminal interface supporting multi-turn conversations, context resetting, and customized prompts.
-- **📊 Real-Time Benchmarking**: Measure exact tokens/second, prefill performance, and VRAM utilization with the built-in `--profile` command.
+- **📊 Real-Time Benchmarking**: Measure exact tokens/second, prefill performance, and VRAM utilization with the built-in `tarafer bench` command.
 - **🎯 Dynamic Hardware Compilation**: Auto-detects your GPU hardware architecture (`sm_75`, `sm_86`, `sm_89`, `sm_90`, etc.) and compiles tuned kernels on launch.
 - **🖼️ Local Background Removal**: Run BiRefNet Lite locally and export transparent PNGs with `tarafer image remove-bg`.
 
@@ -59,11 +59,27 @@ tarafer image remove-bg photo.jpg
 This writes `photo-no-bg.png`. `--device auto` tries CUDA, DirectML on Windows,
 then CPU. See [the setup and model notes](docs/BACKGROUND_REMOVAL.md).
 
+### Command overview
+
+One CLI, one task per noun:
+
+```text
+tarafer text gen "<prompt>" [-m 4b] [--json]   # also: text chat, text embed
+tarafer speech say "<burmese text>" -o out.wav # also: speech status
+tarafer image remove-bg photo.jpg
+tarafer serve [--port 8787]                    # OpenAI-compatible server
+tarafer models list | pull 4b | rm 4b | info 4b
+tarafer bench -m 4b                            # speed report
+tarafer doctor                                 # GPU + installed models
+```
+
+Weights are never shipped: `models pull` fetches them from the upstream repo, whose licence applies.
+
 ### Burmese text-to-speech (non-commercial)
 
 ```powershell
 python tools/tts/export_f5_myanmar.py
-tarafer tts say "မင်္ဂလာပါ" -o hello.wav --steps 16
+tarafer speech say "မင်္ဂလာပါ" -o hello.wav --steps 16
 ```
 
 Runs F5-Myanmar-TTS v2 (CC BY-NC 4.0) on ONNX Runtime. See [docs/TTS.md](docs/TTS.md).
@@ -87,8 +103,8 @@ chmod +x tarafer
 ./tarafer install
 
 # 3. Download a lightweight 0.5B model & start chatting!
-tarafer --download 0.5b
-tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+tarafer models pull 0.8b
+tarafer text chat -m 0.8b
 ```
 
 ---
@@ -104,8 +120,8 @@ Expand-Archive .\tarafer-windows-x86_64.zip -DestinationPath .
 .\tarafer.exe install
 
 # 3. Download model & run chat
-.\tarafer.exe --download 0.5b
-.\tarafer.exe models\Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+.\tarafer.exe models pull 0.8b
+.\tarafer.exe text chat -m 0.8b
 ```
 
 ---
@@ -136,9 +152,9 @@ tarafer models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
 ### 3️⃣ Run an OpenAI-Compatible API Server (Chat & Completion)
 Turn your GPU machine into a local OpenAI-compatible inference API:
 ```bash
-tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --serve
+tarafer serve -m 3b-qwen25
 ```
-Default endpoint: `http://127.0.0.1:8787` *(or specify a port with `--serve 3000`)*.
+Default endpoint: `http://127.0.0.1:8787` *(or specify a port with `--port 3000`)*.
 
 > [!WARNING]
 > The server listens on all network interfaces and does **not** implement
@@ -175,12 +191,12 @@ Taraference supports high-performance vector embeddings for semantic search, vec
 
 #### Step 1: Download the official 4B Embedding Model
 ```bash
-tarafer --download embed-4b
+tarafer models pull embed-4b
 ```
 
 #### Step 2: Serve the Embedding Model
 ```bash
-tarafer models/Qwen3-Embedding-4B-Q4_K_M.gguf --serve
+tarafer serve -m embed-4b
 ```
 
 #### Step 3: Query the OpenAI-Compatible Embeddings Endpoint
@@ -203,7 +219,7 @@ curl http://127.0.0.1:8787/v1/embeddings \
 ### 5️⃣ Benchmark & Speed Test
 Measure your system's exact inference speed (tokens/sec) and performance metrics:
 ```bash
-tarafer models/Qwen2.5-3B-Instruct-Q4_K_M.gguf --profile
+tarafer bench -m 3b-qwen25
 ```
 
 ### Experimental out-of-core MoE paging

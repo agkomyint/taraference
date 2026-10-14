@@ -13,6 +13,7 @@ use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
 pub mod mms;
+pub mod normalize;
 
 pub const SAMPLE_RATE: u32 = 24_000;
 pub const DIT_FILE: &str = "dit.onnx";

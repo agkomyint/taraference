@@ -66,11 +66,8 @@ fn default_output(input: &Path) -> Result<PathBuf> {
     Ok(input.with_file_name(format!("{stem}-no-bg.png")))
 }
 
-pub fn run_from_args(argv: &[String]) -> Result<()> {
-    // The legacy top-level parser treats its first positional argument as a GGUF.
-    // Strip the `image` command before handing the rest to this focused parser.
-    let args = std::iter::once(argv.first().map(String::as_str).unwrap_or("tarafer"))
-        .chain(argv.iter().skip(2).map(String::as_str));
+pub fn run(args: Vec<String>) -> Result<()> {
+    let args = std::iter::once("tarafer image".to_string()).chain(args);
     let cli = ImageCli::parse_from(args);
 
     match cli.command {
