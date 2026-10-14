@@ -13,6 +13,7 @@ axum.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 taraference-core = { path = "../core" }
 taraference-gguf = { path = "../gguf" }
 taraference-background-removal = { path = "../background-removal" }

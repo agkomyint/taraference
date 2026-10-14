@@ -1,12 +1,12 @@
 //! `tarafer`: lean local runtime for small specialised AI models.
 //!
 //! - `cmd` command layer, `bench` speed report, `serve` OpenAI-compatible server
-//! - `download` model registry, `tts_commands` / `image_commands` task front-ends
+//! - `registry` models, `tts_commands` / `image_commands` task front-ends
 
 mod bench;
 mod cmd;
-mod download;
 mod image_commands;
+mod registry;
 mod self_update;
 mod serve;
 mod tts_commands;

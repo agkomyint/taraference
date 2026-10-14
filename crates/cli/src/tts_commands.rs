@@ -89,7 +89,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
                  format!("python tools/tts/export_f5_myanmar.py --out {}", f5_dir.display())),
                 ("mms", "MMS-TTS Burmese (fast, CPU ok, CC BY-NC)", PathBuf::from(MMS_MODEL_DIR),
                  mms::missing_files(std::path::Path::new(MMS_MODEL_DIR)),
-                 format!("put model.onnx + tokens.txt (willwade/mms-tts-multilingual-models-onnx, mya/) in {MMS_MODEL_DIR}")),
+                 "tarafer models pull mms-mya".to_string()),
             ];
             let mut ready = 0;
             for (id, name, dir, missing, hint) in &engines {

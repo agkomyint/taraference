@@ -3,9 +3,7 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
-use taraference_background_removal::{
-    default_model_path, download_model, remove_background, Device, MODEL_FILE,
-};
+use taraference_background_removal::{default_model_path, remove_background, Device, MODEL_FILE};
 
 #[derive(Debug, Parser)]
 #[command(name = "tarafer image", about = "Local image tools (background removal)")]
@@ -30,27 +28,6 @@ enum ImageCommand {
         /// Inference device: auto (CUDA, DirectML, then CPU), cuda, directml, or cpu.
         #[arg(long, default_value = "auto", value_parser = parse_device)]
         device: Device,
-    },
-    /// Manage the optional BiRefNet Lite model.
-    Model {
-        #[command(subcommand)]
-        command: ImageModelCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ImageModelCommand {
-    /// Download the 115 MB FP16 MIT-licensed model from Hugging Face.
-    Download {
-        /// Model file destination. Defaults to models/background-removal/birefnet-lite.onnx.
-        #[arg(long)]
-        model: Option<PathBuf>,
-        /// Directory used for default model storage.
-        #[arg(long, default_value = "models")]
-        models_dir: PathBuf,
-        /// Replace and verify an existing model file.
-        #[arg(long)]
-        force: bool,
     },
 }
 
@@ -85,6 +62,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 None => default_output(&input)?,
             };
             let model = model.unwrap_or_else(|| default_model_path(Path::new("models")));
+            if !model.is_file() {
+                bail!("model not installed: {}. Run: tarafer models pull birefnet-lite", model.display());
+            }
             eprintln!("input  | {}", input.display());
             eprintln!("model  | {} ({MODEL_FILE})", model.display());
             let result = remove_background(&input, &output, &model, device)?;
@@ -93,18 +73,6 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 result.width, result.height, result.device, result.session_ms, result.inference_ms
             );
             eprintln!("output | {}", result.output.display());
-        }
-        ImageCommand::Model {
-            command: ImageModelCommand::Download {
-                model,
-                models_dir,
-                force,
-            },
-        } => {
-            let model = model.unwrap_or_else(|| default_model_path(&models_dir));
-            let installed = download_model(&model, force)?;
-            eprintln!("ready  | {}", installed.display());
-            eprintln!("next   | tarafer image remove-bg input.jpg");
         }
     }
     Ok(())

@@ -73,7 +73,8 @@ tarafer bench -m 4b                            # speed report
 tarafer doctor                                 # GPU + installed models
 ```
 
-Weights are never shipped: `models pull` fetches them from the upstream repo, whose licence applies.
+Weights are never shipped: `models pull <id>` fetches from the upstream repo at a pinned revision,
+verifies SHA-256, and asks you to confirm non-commercial licences. See [docs/MODELS.md](docs/MODELS.md).
 
 ### Burmese text-to-speech (non-commercial)
 

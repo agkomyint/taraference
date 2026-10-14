@@ -1,8 +1,8 @@
 //! Command layer: `text`, `speech`, `image`, `serve`, `models`, `bench`, `doctor`, `update`, `install`.
 
-use crate::download::{self, download_models, SUPPORTED_MODELS};
+use crate::registry::{self, State, Task, REGISTRY};
 use crate::{bench, image_commands, self_update, serve, tts_commands};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -118,32 +118,65 @@ enum TextCmd {
 
 #[derive(Subcommand, Debug)]
 enum ModelsCmd {
-    /// Catalog and installed files.
+    /// Catalog of every model (text, embed, speech, image) with install state and licence.
     List {
-        #[arg(long, default_value = "models")]
-        models_dir: PathBuf,
+        /// Only one task: text, embed, speech or image.
+        #[arg(long, value_parser = parse_task)]
+        task: Option<Task>,
+        /// Hide non-commercial models.
+        #[arg(long)]
+        commercial: bool,
+        #[command(flatten)]
+        root: Root,
     },
-    /// Download by tag or group (4b, 0.8b, small, everything, ...).
+    /// Download one or more models by id; shows the licence and verifies SHA-256.
     Pull {
-        which: String,
-        #[arg(long, default_value = "models")]
-        models_dir: PathBuf,
-        /// Re-download even if the file exists.
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Re-download even if installed and verified.
         #[arg(long)]
         force: bool,
+        /// Confirm non-commercial licences without prompting.
+        #[arg(long)]
+        accept_license: bool,
+        #[command(flatten)]
+        root: Root,
     },
-    /// Delete an installed model by tag or file name.
+    /// Re-check installed files against pinned SHA-256 (all installed models if no id).
+    Verify {
+        id: Option<String>,
+        #[command(flatten)]
+        root: Root,
+    },
+    /// Delete an installed model.
     Rm {
-        which: String,
-        #[arg(long, default_value = "models")]
-        models_dir: PathBuf,
+        id: String,
+        #[command(flatten)]
+        root: Root,
     },
-    /// Show source, size and local path for one model.
+    /// Source, revision, licence, files and local state for one model.
     Info {
-        which: String,
-        #[arg(long, default_value = "models")]
-        models_dir: PathBuf,
+        id: String,
+        #[command(flatten)]
+        root: Root,
     },
+}
+
+#[derive(Args, Debug, Clone)]
+struct Root {
+    /// Models directory.
+    #[arg(long, default_value = "models", global = true)]
+    models_dir: PathBuf,
+}
+
+fn parse_task(s: &str) -> Result<Task, String> {
+    match s {
+        "text" => Ok(Task::Text),
+        "embed" => Ok(Task::Embed),
+        "speech" => Ok(Task::Speech),
+        "image" => Ok(Task::Image),
+        _ => Err("expected text, embed, speech or image".into()),
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -195,12 +228,15 @@ fn resolve_model(arg: Option<&str>) -> Result<PathBuf> {
         if as_path.exists() {
             return Ok(as_path);
         }
-        if let Some(spec) = SUPPORTED_MODELS.iter().find(|s| s.tag.eq_ignore_ascii_case(m)) {
-            let p = Path::new("models").join(spec.file);
+        if let Ok(e) = registry::find(m) {
+            if !matches!(e.task, Task::Text | Task::Embed) {
+                bail!("'{m}' is a {} model, not a text model", e.task.name());
+            }
+            let p = e.main_path(Path::new("models"));
             if p.exists() {
                 return Ok(p);
             }
-            bail!("model '{m}' is not installed. Run: tarafer models pull {}", spec.tag);
+            bail!("model '{m}' is not installed. Run: tarafer models pull {}", e.id);
         }
         bail!("model not found: {m}");
     }
@@ -377,63 +413,25 @@ fn run_serve(rt: &Runtime, model: &Path, port: u16) -> Result<()> {
         .block_on(serve::run(engine, port))
 }
 
-fn find_spec(which: &str) -> Result<&'static download::ModelSpec> {
-    SUPPORTED_MODELS
-        .iter()
-        .find(|s| s.tag.eq_ignore_ascii_case(which) || s.file.eq_ignore_ascii_case(which))
-        .with_context(|| format!("unknown model '{which}' (see `tarafer models list`)"))
-}
-
 fn run_models(cmd: ModelsCmd) -> Result<()> {
     match cmd {
-        ModelsCmd::List { models_dir } => {
-            eprintln!("{:10}  {:9}  {:9}  {}", "tag", "state", "size", "source / note");
-            eprintln!("{}", "-".repeat(96));
-            for m in SUPPORTED_MODELS {
-                let state = if models_dir.join(m.file).exists() { "installed" } else { "-" };
-                eprintln!(
-                    "{:10}  {:9}  ~{:.1} GiB    huggingface.co/{} - {}",
-                    m.tag, state, m.approx_gib, m.repo, m.note
-                );
-            }
-            eprintln!(
-                "\nWeights come straight from the upstream repo above. Check its licence before use;\n\
-                 taraference does not ship or host model files."
-            );
+        ModelsCmd::List { task, commercial, root } => {
+            registry::list(&root.models_dir, task, commercial);
             Ok(())
         }
-        ModelsCmd::Pull { which, models_dir, force } => {
-            eprintln!("note: weights are fetched from the upstream Hugging Face repo; review its licence terms.");
-            download_models(&models_dir, &which, force)?;
+        ModelsCmd::Pull { ids, force, accept_license, root } => {
+            registry::pull(&root.models_dir, &ids, force, accept_license)?;
             Ok(())
         }
-        ModelsCmd::Rm { which, models_dir } => {
-            let path = models_dir.join(find_spec(&which)?.file);
-            if !path.exists() {
-                bail!("{} is not installed", path.display());
-            }
-            std::fs::remove_file(&path)?;
-            eprintln!("removed {}", path.display());
-            Ok(())
-        }
-        ModelsCmd::Info { which, models_dir } => {
-            let spec = find_spec(&which)?;
-            let path = models_dir.join(spec.file);
-            eprintln!("tag      {}", spec.tag);
-            eprintln!("file     {}", spec.file);
-            eprintln!("source   https://huggingface.co/{}", spec.repo);
-            eprintln!("size     ~{:.1} GiB", spec.approx_gib);
-            eprintln!("note     {}", spec.note);
-            match std::fs::metadata(&path) {
-                Ok(md) => eprintln!(
-                    "local    {} ({:.2} GiB)",
-                    path.display(),
-                    md.len() as f64 / (1u64 << 30) as f64
-                ),
-                Err(_) => eprintln!("local    not installed (tarafer models pull {})", spec.tag),
+        ModelsCmd::Verify { id, root } => {
+            let failures = registry::verify(&root.models_dir, id.as_deref())?;
+            if failures > 0 {
+                bail!("{failures} file(s) failed verification");
             }
             Ok(())
         }
+        ModelsCmd::Rm { id, root } => registry::remove(&root.models_dir, &id),
+        ModelsCmd::Info { id, root } => registry::info(&root.models_dir, &id),
     }
 }
 
@@ -448,33 +446,15 @@ fn run_doctor(models_dir: &Path) -> Result<()> {
         }
         _ => eprintln!("gpu      nvidia-smi not available (text engine needs a CUDA GPU)"),
     }
-    let mut any = false;
-    for m in SUPPORTED_MODELS {
-        if models_dir.join(m.file).exists() {
-            any = true;
-            eprintln!("text     {} ({})", m.tag, m.file);
+    for e in REGISTRY {
+        match e.state(models_dir) {
+            State::Installed => eprintln!("{:8} {:12} installed", e.task.name(), e.id),
+            State::Partial => eprintln!("{:8} {:12} PARTIAL (tarafer models pull {} --force)", e.task.name(), e.id, e.id),
+            State::Missing => {}
         }
     }
-    if !any {
-        eprintln!("text     no models in {} (tarafer models pull 4b)", models_dir.display());
-    }
-    for (name, dir, missing) in [
-        (
-            "speech/f5",
-            taraference_tts::DEFAULT_MODEL_DIR,
-            taraference_tts::missing_files(Path::new(taraference_tts::DEFAULT_MODEL_DIR)),
-        ),
-        (
-            "speech/mms",
-            taraference_tts::mms::MMS_MODEL_DIR,
-            taraference_tts::mms::missing_files(Path::new(taraference_tts::mms::MMS_MODEL_DIR)),
-        ),
-    ] {
-        if missing.is_empty() {
-            eprintln!("{name:10} ready ({dir})");
-        } else {
-            eprintln!("{name:10} not installed ({} file(s) missing in {dir})", missing.len());
-        }
+    if REGISTRY.iter().all(|e| e.state(models_dir) == State::Missing) {
+        eprintln!("no models installed; try `tarafer models list`, then `tarafer models pull 4b`");
     }
     Ok(())
 }

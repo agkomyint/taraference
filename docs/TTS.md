@@ -82,8 +82,8 @@ The export checks the ONNX graph against PyTorch at a different sequence length 
 ### MMS-TTS Burmese
 
 A ready-made ONNX build is published in `willwade/mms-tts-multilingual-models-onnx` under `mya/`.
-Put `model.onnx` (114 MB) and `tokens.txt` in `models/tts/mms-mya/`. (There is no download command
-yet.) Inputs: blank-interleaved character ids, `x_length`, `noise_scale` 0.667,
+Install with `tarafer models pull mms-mya` (files go to `models/tts/mms-mya/`, SHA-256 verified).
+Inputs: blank-interleaved character ids, `x_length`, `noise_scale` 0.667,
 `length_scale` 1/speed, `noise_scale_w` 0.8. Output: 16 kHz waveform.
 
 ## Findings
@@ -148,7 +148,7 @@ TTS real-time factors, not LLM token rates, and are not comparable to the Qwen2.
 2. Port MyanmarTTS (CC0) to ONNX and add `--engine myanmartts`, giving a commercially usable engine.
 3. Test VoxCPM2 feasibility on a 4 GB GPU (community GGUF Q8_0 or ONNX) for an Apache-2.0 option.
 4. Add `tarafer bench speech` to print the comparison table above automatically.
-5. Add a model download command so users do not need Python.
+5. Host or script the F5 export so users do not need Python (`models pull f5-myanmar` is manual today).
 
 ## Verification
 

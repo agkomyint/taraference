@@ -1,8 +1,9 @@
 # Taraference roadmap
 
 > The noun/verb CLI (`text`, `speech`, `image`, `serve`, `models`, `bench`, `doctor`) is the only
-> interface; the old flag-style spellings are gone. Registry pinning, licence prompts and
-> `speech transcribe` are open.
+> interface; the old flag-style spellings are gone. The model registry (pinned revision + SHA-256, licence prompt,
+> `list|info|pull|verify|rm`) covers text, embeddings, speech and image; see
+> [docs/MODELS.md](../docs/MODELS.md). `speech transcribe` is open.
 
 ## Direction
 
@@ -79,7 +80,7 @@ taraference is a runtime and installer, not a model distributor.
 
 ## Model registry
 
-One `models` registry replaces `--download` tags and per-feature download commands. Each entry
+One `models` registry (implemented, `docs/MODELS.md`) covers every task. Each entry
 records: id, task, source, pinned revision and SHA-256, size, **licence and whether it is
 non-commercial**, and the runtime. `models list` shows the licence so non-commercial weights are
 never a surprise. Weights stay out of releases. Hosting converted ONNX files (F5, MMS) so users
@@ -95,12 +96,58 @@ need no Python export is a **decision for the repo owner**; it is not assumed he
   the exact model name. Task numbers are never compared across tasks, and the Qwen2.5 scoreboard
   stays separate.
 
+## 0.8.0 focus: native F5 engine (no ONNX, no Python)
+
+**Goal:** `tarafer models pull f5-myanmar` fetches the original upstream safetensors and
+`tarafer speech say` runs the DiT and vocoder on our own CUDA code. No export step, no Python,
+no ONNX Runtime for this model. Until it lands, MMS is the default speech engine so a fresh
+install works on the first run.
+
+Why: we control the code and the speed path (fp16, fused kernels, CUDA graph over the step loop),
+and the model installs like every other one. Baseline to beat: F5-Myanmar-TTS v2, 16 steps,
+RTF 0.76 on an RTX 3050 Ti 4 GB via ONNX Runtime (22 s text, 24 steps: 0.91).
+
+### Tasks
+
+- [ ] **T0 Default engine:** make `speech say` default to `mms`; keep `--engine f5` opt-in.
+- [ ] **T1 Scope:** list every tensor name, shape and dtype in the upstream checkpoint and map it
+      to the DiT layers (text embed + ConvNeXt, input/time embed, ~22 AdaLN blocks, rotary
+      attention, MLP, final norm) and the Vocos backbone. Write the table to `docs/F5_ENGINE.md`.
+- [ ] **T2 Weights:** safetensors loader (fp32/fp16 to our tensor type), registry entry for the
+      upstream repo with pinned revision and SHA-256, `Install::Download`.
+- [ ] **T3 Reference harness:** dump per-layer activations from PyTorch for a fixed text, noise
+      and step, plus the final mel; store as test fixtures outside the repo (not committed).
+- [ ] **T4 DiT forward (correct first):** straightforward implementation; each layer within
+      tolerance of PyTorch on the fixtures; end-to-end log-mel correlation >= 0.985 (the current
+      ONNX figure) with identical noise.
+- [ ] **T5 Vocos network:** ConvNeXt backbone to complex spectrogram, reuse the existing inverse
+      FFT; waveform correlation against the ONNX/PyTorch output.
+- [ ] **T6 Speed:** reuse the GEMM/attention kernels, fp16 weights, CUDA graph over the sampler
+      step loop, then measure with `bench speech`.
+- [ ] **T7 Cutover:** `--engine f5` uses the native engine; delete the ONNX export script and the
+      F5 ONNX path once parity holds; update `docs/TTS.md`, `docs/MODELS.md`.
+
+### Acceptance
+
+- Fixed noise and seed: log-mel correlation vs PyTorch >= 0.985 and listening check on the
+  donation and office test texts (author judges quality; not claimed otherwise).
+- RTF at 16 steps no worse than the ONNX baseline (0.76), measured on the same text and machine,
+  with the exact model name reported.
+- Fits 4 GB VRAM at the default settings; fresh machine with no Python can `pull` and `say`.
+- Licence stays CC BY-NC 4.0 and is shown at pull time.
+
+### Risks
+
+- Numerical drift in fp16 attention or AdaLN; keep an fp32 fallback until parity is shown.
+- The kernel work benefits F5 only; other TTS models need their own engine.
+
 ## Milestones
 
 1. **CLI restructure (done):** noun/verb parser, `doctor`, one `--help`, no legacy spellings,
    slimmed `bench`. No change to inference.
-2. **Registry (0.8.0):** `models list|pull|rm|info`, pinned hashes, licence column. Migrate image
-   and tts model setup into it.
+2. **Registry (done):** `models list|info|pull|verify|rm`, pinned hashes, licence prompt, image and
+   speech migrated. Open: update check. The F5 export step is replaced by the native engine below.
+   - **Native F5 engine (0.8.0):** see "0.8.0 focus" above.
 3. **Speech-to-text (0.9.0):** pick a model by benchmark, add `speech transcribe`
    and `/v1/audio/transcriptions`. Candidates, all to be verified for licence, Burmese accuracy
    and 4 GB fit: Whisper tiny/base/small (multilingual, ONNX exports exist), and
@@ -121,7 +168,7 @@ need no Python export is a **decision for the repo owner**; it is not assumed he
 ## Out of scope
 
 - Agents, tool calling, retrieval pipelines, long-term memory, plugin systems.
-- Serving large language models (target ceiling is roughly the 9B class that already runs on the
-  reference machine).
+- Serving large language models (target ceiling is the 4B class; the 9B model was dropped from the
+  registry as too slow for the reference machine).
 - Training or fine-tuning.
 - Claiming quality results that have not been checked by listening or by a labelled test set.

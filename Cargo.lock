@@ -1537,6 +1537,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "taraference-background-removal",
  "taraference-core",
  "taraference-gguf",
