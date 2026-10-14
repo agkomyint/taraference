@@ -12,6 +12,7 @@ mod image_commands;
 mod profile;
 mod self_update;
 mod serve;
+mod tts_commands;
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -30,6 +31,7 @@ Commands (no model path required):
   tarafer install             Copy tarafer to ~/.local/bin (add to PATH)
   tarafer image model download    Install the background-removal model
   tarafer image remove-bg photo.jpg  Create a transparent PNG
+  tarafer tts say \"<burmese text>\" -o hello.wav  Burmese text-to-speech
 
 Fast path on a new Linux GPU box:
   # Linux:  tarafer-linux-x86_64.tar.gz
@@ -120,6 +122,9 @@ fn main() -> Result<()> {
     if argv.len() >= 2 {
         if argv[1] == "image" {
             return image_commands::run_from_args(&argv);
+        }
+        if argv[1] == "tts" {
+            return tts_commands::run_from_args(&argv);
         }
         match argv[1].as_str() {
             "update" | "--update" => {

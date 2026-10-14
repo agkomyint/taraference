@@ -1,0 +1,15 @@
+[package]
+name = "taraference-tts"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hound = "3.5"
+ort = { version = "2.0.0-rc.13", features = ["cuda"] }
+regex = "1"
+rustfft = "6"
+unicode-normalization = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "2.0.0-rc.13", features = ["directml"] }

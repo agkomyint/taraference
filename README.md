@@ -59,6 +59,15 @@ tarafer image remove-bg photo.jpg
 This writes `photo-no-bg.png`. `--device auto` tries CUDA, DirectML on Windows,
 then CPU. See [the setup and model notes](docs/BACKGROUND_REMOVAL.md).
 
+### Burmese text-to-speech (non-commercial)
+
+```powershell
+python tools/tts/export_f5_myanmar.py
+tarafer tts say "မင်္ဂလာပါ" -o hello.wav --steps 16
+```
+
+Runs F5-Myanmar-TTS v2 (CC BY-NC 4.0) on ONNX Runtime. See [docs/TTS.md](docs/TTS.md).
+
 ---
 
 ## ⏱️ Quick Start (30 Seconds)
