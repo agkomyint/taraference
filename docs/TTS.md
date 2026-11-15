@@ -1,6 +1,7 @@
 # Burmese text-to-speech in taraference
 
-`tarafer speech` synthesises Burmese speech locally on ONNX Runtime (CUDA, DirectML or CPU).
+`tarafer speech` synthesises Burmese speech locally on ONNX Runtime (CUDA, DirectML or CPU),
+with an opt-in native wgpu backend for F5-Myanmar-TTS v2.
 No Python is needed at run time. This document records which open models exist, which are
 integrated, what was measured, and what is still open.
 
@@ -50,7 +51,7 @@ Number reading and the sample spellings follow common usage but have not been ch
 | `--no-normalize` | off | skip cleanup |
 | `--engine` | `f5` | `f5` or `mms` |
 | `--model-dir` | per engine | `models/tts/f5-myanmar` or `models/tts/mms-mya` |
-| `--device` | `auto` | `auto` (CUDA → DirectML → CPU), `cuda`, `directml`, `cpu` |
+| `--device` | `auto` | `auto` (ORT CUDA → DirectML → CPU), `cuda`, `directml`, `cpu`, or native `wgpu` (F5 only; build feature required) |
 | `--steps` | 32 | F5 only. 12–16 is ~2× faster with a small quality loss |
 | `--cfg` | 2.0 | F5 only. Guidance strength |
 | `--speed` | 1.0 | Speaking-rate multiplier |
@@ -59,6 +60,91 @@ Number reading and the sample spellings follow common usage but have not been ch
 Text is split at `။` and newlines; chunks are synthesised separately and joined with short pauses.
 
 ## Setup
+
+### Native F5 on wgpu (experimental)
+
+F5's DiT, attention, sampler updates and the Vocos network run through Burn 0.18's
+wgpu/WGSL backend. Text cleanup, reference-mel extraction and inverse FFT run in Rust
+on the CPU. Selecting `wgpu` does not create ONNX sessions or silently fall back to ORT.
+CUDA text inference remains available in the main executable.
+
+The native backend accepts the original `freococo/F5-Myanmar-TTS` v2 checkpoint
+(1024 hidden width, 22 DiT blocks) and `charactr/vocos-mel-24khz` weights. Prepare
+the files locally after obtaining the checkpoints under their upstream licences:
+
+```powershell
+pip install torch safetensors
+python tools/tts/prepare_f5_wgpu.py --f5-dir PATH/TO/F5-CHECKPOINT --vocos PATH/TO/pytorch_model.bin
+```
+
+The F5 directory must contain `model.safetensors`, `vocab.txt` and `ref_sample.wav`.
+The preparation script copies these unchanged and repacks Vocos' PyTorch state dict
+as `vocos.safetensors`. Python is needed for this one-time repacking only; inference
+needs neither Python nor ONNX files. `models pull f5-myanmar` does not yet install
+this native layout automatically.
+
+Build and run the standalone speech executable without the CUDA text engine or ORT:
+
+```powershell
+cargo run -p taraference-tts --release --no-default-features --features wgpu --bin tarafer-speech -- "မင်္ဂလာပါ။" --steps 16 -o speech-wgpu.wav
+```
+
+Or enable it alongside the existing engines in the main CLI:
+
+```powershell
+cargo run -p taraference --release --features wgpu -- speech say "မင်္ဂလာပါ။" --engine f5 --device wgpu --steps 16 -o speech-wgpu.wav
+```
+
+The backend prints the adapter and graphics API. It currently uses fp32 computation,
+even for the original fp16 F5 checkpoint, and caps each chunk at 2048 total mel frames
+including reference audio. Shorten the reference or split the input if this limit is
+exceeded. Only the exact F5/Vocos architecture above is supported; MMS remains on ORT.
+AMD, Intel and Apple hardware require their own validation before support is claimed.
+Use release builds for performance measurements; first-use shader compilation affects
+latency. No CUDA performance parity is assumed.
+
+Reproduce fixed-input parity checks against the existing ONNX exports:
+
+```powershell
+python tools/tts/f5_wgpu_fixtures.py --frames 160 --steps 4
+cargo run -p taraference-tts --release --no-default-features --features wgpu --example wgpu_parity -- models/tts/f5-myanmar target/f5-wgpu-fixtures
+cargo test -p taraference-tts --no-default-features --features wgpu
+```
+
+The parity executable checks DiT velocity, sampled final mel, and real/imaginary Vocos
+spectrograms. It fails on nonfinite outputs, shape mismatches, cosine similarity below
+0.985, relative RMSE above 5% for DiT/final mel, or above 1% for Vocos. The 160-frame
+case also exercises the attention query-chunk boundary. These numeric checks do not
+replace a Burmese listening evaluation.
+
+Initial validation (2026-11-12): Windows, RTX 3050 Ti Laptop GPU (4 GB), Vulkan,
+wgpu fp32, F5-Myanmar-TTS v2 checkpoint revision
+`f6365609e33412c833382c3481653e0b0ca0c43b`, Vocos revision
+`0feb3fdd929bcd6649e0e7c5a688cf7dd012ef21`:
+
+| Check | Result |
+|---|---|
+| 160-frame DiT velocity vs ORT | cosine 0.9999986; relative RMSE 0.0016665 |
+| Four-step sampled final mel vs ORT | cosine 0.9999966; relative RMSE 0.0025961 |
+| Vocos real / imaginary vs ORT | relative RMSE 0.0000069 / 0.0000068 |
+| `မင်္ဂလာပါ။`, 16 steps, CFG 2, speed 1, seed 42, bundled reference | 37,632 samples at 24 kHz (1.568 s), non-silent |
+| Reconstructed log-mel correlation vs same-seed ORT WAV | 0.9972936 (threshold 0.985) |
+| Final debug run after vectorized weight loading | 5.814 s load; 23.241 s synthesis; RTF 14.822 |
+| Sampled total GPU memory during that run (1 s polling) | 1,544 MiB maximum; includes other GPU users |
+
+Debug timings include shader compilation and are correctness results, not release
+performance benchmarks. The first run before the loading improvement took 37.345 s
+synthesis (RTF 23.817). Waveform correlation was 0.7782794; numeric mel agreement does not establish
+perceptual equivalence. No listening-quality or non-NVIDIA hardware result is claimed.
+The reference WAV was generated with the existing ORT CPU engine using identical inputs.
+All eight tests in the wgpu-only build and seven tests in the default ORT build pass;
+the main CLI checks with `--features wgpu`. The standalone wgpu dependency tree contains
+neither ORT nor CUDA backends.
+To compare regenerated WAVs:
+
+```powershell
+python tools/tts/compare_tts_wav.py target/f5-ort-reference.wav target/f5-wgpu.wav
+```
 
 ### F5-Myanmar-TTS
 

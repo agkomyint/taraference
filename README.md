@@ -37,6 +37,7 @@ By combining a lightweight **Rust control plane** with **just-in-time compiled C
 
 ## 🚀 Key Features
 
+- **Experimental native wgpu text**: Qwen2/Qwen2.5 GGUF inference through Rust/WGSL alongside CUDA. Enable `--features wgpu` and use `text gen --backend wgpu`, or build the CUDA-independent `tarafer-wgpu` executable. See [supported models, limits and CUDA comparison](docs/WGPU_TEXT.md).
 - **⚡ Specialized Split-K CUDA Kernels**: Custom packed GEMV kernels (Q4_K, Q6_K, Q8_0) with 8-way split-KV flash decoding for maximum single-stream tokens per second.
 - **🔤 Native Text Embeddings**: Specialized support for `Qwen3-Embedding-4B` via `POST /v1/embeddings`, featuring Matryoshka dimension truncation and L2 vector normalization.
 - **📦 Compact Native CLI**: A small Rust executable with no Python or PyTorch runtime. Optional image inference uses ONNX Runtime provider libraries and a separately downloaded model.

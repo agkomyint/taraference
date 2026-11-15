@@ -10,10 +10,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 taraference-gguf = { path = "../gguf" }
 thiserror.workspace = true
-cudarc = { version = "0.19", default-features = false, features = [
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
     "cuda-13020",
     "std",
     "driver",
     "nvrtc",
     "fallback-dynamic-loading",
 ] }
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc"]

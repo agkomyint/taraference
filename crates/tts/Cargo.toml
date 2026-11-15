@@ -5,11 +5,26 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+burn = { version = "0.18", default-features = false, features = ["std", "webgpu"], optional = true }
+half = { version = "2", features = ["bytemuck"], optional = true }
+bytemuck = { version = "1", optional = true }
+safetensors = { version = "0.6", optional = true }
+clap = { workspace = true, optional = true }
 hound = "3.5"
-ort = { version = "2.0.0-rc.13", features = ["cuda"] }
+ort = { version = "2.0.0-rc.13", features = ["cuda"], optional = true }
 regex = "1"
 rustfft = "6"
 unicode-normalization = "0.1"
 
+[features]
+default = ["ort"]
+ort = ["dep:ort"]
+wgpu = ["dep:burn", "dep:half", "dep:bytemuck", "dep:safetensors", "dep:clap"]
+
+[[bin]]
+name = "tarafer-speech"
+path = "src/bin/speech.rs"
+required-features = ["wgpu"]
+
 [target.'cfg(windows)'.dependencies]
-ort = { version = "2.0.0-rc.13", features = ["directml"] }
+ort = { version = "2.0.0-rc.13", features = ["directml"], optional = true }

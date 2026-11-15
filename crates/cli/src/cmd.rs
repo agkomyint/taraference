@@ -100,6 +100,9 @@ enum TextCmd {
         /// Print the reply and token stats as one JSON object.
         #[arg(long)]
         json: bool,
+        /// Native compute backend (wgpu currently supports Qwen2/Qwen2.5).
+        #[arg(long, default_value = "cuda", value_parser = ["cuda", "wgpu"])]
+        backend: String,
     },
     /// Interactive chat (thin REPL).
     Chat {
@@ -334,12 +337,27 @@ pub fn run() -> Result<()> {
 
 fn run_text(cmd: TextCmd) -> Result<()> {
     match cmd {
-        TextCmd::Gen { prompt, rt, sampling, raw, json } => {
+        TextCmd::Gen { prompt, rt, sampling, raw, json, backend } => {
             let prompt = read_text(prompt)?;
             if prompt.trim().is_empty() {
                 bail!("no prompt provided");
             }
             let model = resolve_model(rt.model.as_deref())?;
+            if backend == "wgpu" {
+                #[cfg(not(feature = "wgpu"))]
+                bail!("native wgpu text requires a build with --features wgpu");
+                #[cfg(feature = "wgpu")]
+                {
+                    if rt.think || rt.experimental { bail!("--think and --experimental are not supported by the Qwen2 wgpu backend"); }
+                    let context = rt.ctx.min(2048);
+                    if context != rt.ctx { eprintln!("wgpu   | context {} -> {context} (current backend limit)", rt.ctx); }
+                    let options = taraference_core::sampler::SamplingOptions { temperature: sampling.temperature, top_p: sampling.top_p, top_k: sampling.top_k, repetition_penalty: sampling.repetition_penalty };
+                    let result = taraference_wgpu::runner::generate_file(&model, &prompt, raw, rt.max_new, context, options, sampling.seed, !json)?;
+                    if json { println!("{}", serde_json::to_string(&result)?); }
+                    else { eprintln!("wgpu | {} | {:.2} tok/s decode | {:.2} tok/s prefill | {:.0} ms TTFT", result.model, result.decode_tps, result.prefill_tps, result.ttft_ms); }
+                    return Ok(());
+                }
+            }
             let mut engine = load_engine(&rt, &model)?;
             let mut opts = session_opts(&rt, &sampling);
             if json {

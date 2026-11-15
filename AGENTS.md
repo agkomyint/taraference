@@ -4,7 +4,8 @@
 
 **Official Scoreboard & Baseline (`Qwen2.5`):**
 - `models/Qwen2.5-3B-Instruct-Q4_K_M.gguf` (download: `tarafer models pull 3b-qwen25`)
-Use this for historical v0.4/v0.5 regression comparisons and the 750 tok/s north star.
+Use this for historical v0.4/v0.5 regression comparisons. There is no fixed throughput target;
+report measured results with the exact model, hardware and backend.
 
 **Modern Profiling & Evaluation (`Qwen3.5`):**
 - `models/Qwen3.5-4B-Q4_K_M.gguf` (download: `tarafer models pull 4b`)

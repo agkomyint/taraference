@@ -39,7 +39,7 @@ enum TtsCommand {
         /// Model directory (default models/tts/f5-myanmar or models/tts/mms-mya).
         #[arg(long)]
         model_dir: Option<PathBuf>,
-        /// Inference device: auto (CUDA, DirectML, then CPU), cuda, directml, or cpu.
+        /// Inference device: auto (ORT CUDA/DirectML/CPU), cuda, directml, cpu, or native wgpu (F5).
         #[arg(long, default_value = "auto", value_parser = parse_device)]
         device: Device,
         /// Flow-matching steps (8 is fast, 32 is the quality default).

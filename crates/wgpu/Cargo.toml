@@ -1,0 +1,22 @@
+[package]
+name = "taraference-wgpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+taraference-core = { path = "../core", default-features = false }
+taraference-gguf = { path = "../gguf" }
+wgpu = "25.0.2"
+pollster = "0.4"
+bytemuck = "1"
+
+[features]
+cuda-compare = ["taraference-core/cuda"]
+
+[[bin]]
+name = "tarafer-wgpu"
+path = "src/main.rs"

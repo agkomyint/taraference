@@ -7,10 +7,13 @@
 pub mod backend;
 pub mod chat;
 pub mod config;
+#[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "cuda")]
 pub mod engine;
 pub mod quant;
 pub mod sampler;
+#[cfg(feature = "cuda")]
 pub mod session;
 pub mod tokenizer;
 
@@ -20,8 +23,11 @@ pub use chat::{
     CHATML_ASSISTANT_PROMPT,
 };
 pub use config::ModelConfig;
+#[cfg(feature = "cuda")]
 pub use cuda::{CudaKv, CudaModel, DecodeBackend};
+#[cfg(feature = "cuda")]
 pub use engine::{EngineConfig, InferenceEngine};
 pub use sampler::{sample_logits, SamplingOptions};
+#[cfg(feature = "cuda")]
 pub use session::{Session, SessionOptions, StopReason, TurnStats};
 pub use tokenizer::Tokenizer;

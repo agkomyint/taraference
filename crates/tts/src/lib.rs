@@ -1,10 +1,11 @@
-//! Local Burmese text-to-speech with F5-Myanmar-TTS (flow-matching DiT + Vocos) on ONNX Runtime.
+//! Local Burmese text-to-speech with F5-Myanmar-TTS on native wgpu or ONNX Runtime.
 //!
-//! The DiT denoiser and the Vocos spectrogram head run as ONNX graphs; the text frontend,
-//! reference-mel extraction, Euler/CFG sampler and ISTFT live here. Model files are produced
-//! by `tools/tts/export_f5_myanmar.py` (weights are CC BY-NC 4.0, non-commercial).
+//! The DiT and Vocos networks use either native Rust/wgpu forward passes or ONNX graphs.
+//! The text frontend, reference-mel extraction and ISTFT are shared Rust code. See
+//! `docs/TTS.md` for both weight layouts (F5 weights: CC BY-NC 4.0, non-commercial).
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "ort")]
 use ort::{ep, session::Session, value::Tensor};
 use regex::Regex;
 use rustfft::{num_complex::Complex32, FftPlanner};
@@ -12,8 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
+#[cfg(feature = "ort")]
 pub mod mms;
 pub mod normalize;
+#[cfg(feature = "wgpu")]
+pub mod wgpu_f5;
 
 pub const SAMPLE_RATE: u32 = 24_000;
 pub const DIT_FILE: &str = "dit.onnx";
@@ -37,6 +41,7 @@ pub enum Device {
     Cuda,
     DirectMl,
     Cpu,
+    Wgpu,
 }
 
 impl std::str::FromStr for Device {
@@ -47,7 +52,8 @@ impl std::str::FromStr for Device {
             "cuda" | "gpu" => Ok(Self::Cuda),
             "directml" | "dml" => Ok(Self::DirectMl),
             "cpu" => Ok(Self::Cpu),
-            _ => bail!("unknown tts device {value:?}; choose auto, cuda, directml, or cpu"),
+            "wgpu" => Ok(Self::Wgpu),
+            _ => bail!("unknown tts device {value:?}; choose auto, cuda, directml, cpu, or wgpu"),
         }
     }
 }
@@ -64,7 +70,14 @@ pub struct SynthOptions {
 
 impl Default for SynthOptions {
     fn default() -> Self {
-        Self { steps: 32, cfg: 2.0, speed: 1.0, seed: 0, ref_audio: None, ref_text: None }
+        Self {
+            steps: 32,
+            cfg: 2.0,
+            speed: 1.0,
+            seed: 0,
+            ref_audio: None,
+            ref_text: None,
+        }
     }
 }
 
@@ -89,10 +102,17 @@ pub fn model_files(dir: &Path) -> [PathBuf; 4] {
 }
 
 pub fn missing_files(dir: &Path) -> Vec<PathBuf> {
-    model_files(dir).into_iter().filter(|p| !p.is_file()).collect()
+    model_files(dir)
+        .into_iter()
+        .filter(|p| !p.is_file())
+        .collect()
 }
 
+#[cfg(feature = "ort")]
 pub(crate) fn load_session(path: &Path, device: Device) -> Result<(Session, &'static str)> {
+    if device == Device::Wgpu {
+        bail!("wgpu is supported only by the native F5 engine; MMS still uses ONNX Runtime");
+    }
     if matches!(device, Device::Auto | Device::Cuda) {
         let attempt = (|| -> Result<Session> {
             let cuda = ep::CUDA::default()
@@ -137,13 +157,20 @@ pub(crate) fn load_session(path: &Path, device: Device) -> Result<(Session, &'st
     if device == Device::DirectMl {
         bail!("DirectML is available only on Windows");
     }
-    let s = Session::builder().map_err(|e| anyhow!(e.to_string()))?.commit_from_file(path).map_err(|e| anyhow!(e.to_string()))?;
+    let s = Session::builder()
+        .map_err(|e| anyhow!(e.to_string()))?
+        .commit_from_file(path)
+        .map_err(|e| anyhow!(e.to_string()))?;
     Ok((s, "CPU"))
 }
 
 pub struct Tts {
-    dit: Session,
-    vocos: Session,
+    #[cfg(feature = "ort")]
+    dit: Option<Session>,
+    #[cfg(feature = "ort")]
+    vocos: Option<Session>,
+    #[cfg(feature = "wgpu")]
+    native: Option<wgpu_f5::NativeF5>,
     vocab: std::collections::HashMap<char, i64>,
     ref_wave: Vec<f32>,
     mel_fb: Vec<f32>, // [N_MELS][N_FFT/2+1]
@@ -153,26 +180,76 @@ pub struct Tts {
 
 impl Tts {
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
-        let missing = missing_files(model_dir);
+        let native = device == Device::Wgpu;
+        #[cfg(not(feature = "wgpu"))]
+        if native {
+            bail!("native wgpu speech requires a build with the `wgpu` feature");
+        }
+        let missing = if native {
+            [
+                "model.safetensors",
+                "vocos.safetensors",
+                VOCAB_FILE,
+                REF_AUDIO_FILE,
+            ]
+            .map(|f| model_dir.join(f))
+            .into_iter()
+            .filter(|p| !p.is_file())
+            .collect()
+        } else {
+            missing_files(model_dir)
+        };
         if !missing.is_empty() {
             let list: Vec<_> = missing.iter().map(|p| p.display().to_string()).collect();
             bail!(
-                "TTS model files missing: {}\nCreate them with `python tools/tts/export_f5_myanmar.py --out {}`",
+                "TTS model files missing: {}\nSee docs/TTS.md for ONNX and native wgpu setup (model directory: {})",
                 list.join(", "),
                 model_dir.display()
             );
         }
         let started = Instant::now();
-        let (dit, device_name) = load_session(&model_dir.join(DIT_FILE), device)?;
-        // Vocos runs on the provider the denoiser ended up on.
-        let vocos_device = match device_name {
-            "CUDA" => Device::Cuda,
-            "DirectML" => Device::DirectMl,
-            _ => Device::Cpu,
-        };
-        let (vocos, _) = load_session(&model_dir.join(VOCOS_FILE), vocos_device)?;
+        #[cfg(feature = "ort")]
+        let (dit, vocos);
+        let device_name;
+        #[cfg(feature = "wgpu")]
+        let native_engine;
+        if native {
+            #[cfg(feature = "wgpu")]
+            {
+                native_engine = Some(wgpu_f5::NativeF5::load(model_dir)?);
+            }
+            #[cfg(feature = "ort")]
+            {
+                dit = None;
+                vocos = None;
+            }
+            device_name = "wgpu";
+        } else {
+            #[cfg(all(feature = "wgpu", feature = "ort"))]
+            {
+                native_engine = None;
+            }
+            #[cfg(not(feature = "ort"))]
+            bail!("this speech build supports only --device wgpu; enable `ort` for other devices");
+            #[cfg(feature = "ort")]
+            {
+                let (dit_session, selected_device) =
+                    load_session(&model_dir.join(DIT_FILE), device)?;
+                device_name = selected_device;
+                // Vocos runs on the provider the denoiser ended up on.
+                let vocos_device = match device_name {
+                    "CUDA" => Device::Cuda,
+                    "DirectML" => Device::DirectMl,
+                    _ => Device::Cpu,
+                };
+                let (vocos_session, _) = load_session(&model_dir.join(VOCOS_FILE), vocos_device)?;
+                dit = Some(dit_session);
+                vocos = Some(vocos_session);
+            }
+        }
 
-        let vocab_text = std::fs::read_to_string(model_dir.join(VOCAB_FILE)).context("read vocab.txt")?;
+        let vocab_text =
+            std::fs::read_to_string(model_dir.join(VOCAB_FILE)).context("read vocab.txt")?;
         let mut vocab = std::collections::HashMap::new();
         for (i, line) in vocab_text.split('\n').enumerate() {
             let line = line.strip_suffix('\r').unwrap_or(line);
@@ -183,8 +260,12 @@ impl Tts {
         }
         let ref_wave = read_wav_mono_24k(&model_dir.join(REF_AUDIO_FILE))?;
         Ok(Self {
+            #[cfg(feature = "ort")]
             dit,
+            #[cfg(feature = "ort")]
             vocos,
+            #[cfg(feature = "wgpu")]
+            native: native_engine,
             vocab,
             ref_wave,
             mel_fb: mel_filterbank(),
@@ -194,6 +275,14 @@ impl Tts {
     }
 
     pub fn synthesize(&mut self, text: &str, opts: &SynthOptions) -> Result<SynthResult> {
+        if opts.steps == 0
+            || opts.steps > 128
+            || !opts.cfg.is_finite()
+            || !opts.speed.is_finite()
+            || opts.speed <= 0.0
+        {
+            bail!("F5 requires 1..=128 steps, finite guidance and a finite positive speed");
+        }
         let started = Instant::now();
         let (ref_wave, ref_text) = match &opts.ref_audio {
             Some(path) => {
@@ -224,9 +313,13 @@ impl Tts {
             let gen_frames = (target_sec * SAMPLE_RATE as f64 / HOP as f64) as usize;
             let total = ref_len + gen_frames.max(1);
             if total > MAX_FRAMES {
-                bail!("chunk {} is too long ({total} frames); split the text into shorter sentences", index + 1);
+                bail!(
+                    "chunk {} is too long ({total} frames); split the text into shorter sentences",
+                    index + 1
+                );
             }
-            let wave = self.generate(&clean, &ref_text, &cond_mel, ref_len, total, opts, &mut rng)?;
+            let wave =
+                self.generate(&clean, &ref_text, &cond_mel, ref_len, total, opts, &mut rng)?;
             if index > 0 {
                 out.extend(std::iter::repeat(0f32).take(SAMPLE_RATE as usize / 8));
             }
@@ -270,22 +363,33 @@ impl Tts {
         };
 
         let ts = sway_timesteps(opts.steps);
-        let scalar = |v: f32| Tensor::from_array(([0usize; 0], vec![v]));
-        for i in 0..opts.steps {
-            let outputs = self.dit.run(ort::inputs![
-                "x" => Tensor::from_array(([1usize, total, N_MELS], x.clone()))?,
-                "cond" => Tensor::from_array(([1usize, total, N_MELS], cond.clone()))?,
-                "text" => Tensor::from_array(([1usize, total], text_ids.clone()))?,
-                "time" => scalar(ts[i])?,
-                "cfg" => scalar(opts.cfg)?,
-            ])?;
-            let (_, v) = outputs[0].try_extract_tensor::<f32>()?;
-            if v.len() != x.len() {
-                bail!("unexpected DiT output size {} (expected {})", v.len(), x.len());
-            }
-            let dt = ts[i + 1] - ts[i];
-            for (xi, vi) in x.iter_mut().zip(v) {
-                *xi += dt * vi;
+        #[cfg(feature = "wgpu")]
+        if let Some(native) = &self.native {
+            x = native.sample(&x, &cond, &text_ids, &ts, opts.cfg)?;
+        }
+        #[cfg(feature = "ort")]
+        if let Some(dit) = &mut self.dit {
+            let scalar = |v: f32| Tensor::from_array(([0usize; 0], vec![v]));
+            for i in 0..opts.steps {
+                let outputs = dit.run(ort::inputs![
+                    "x" => Tensor::from_array(([1usize, total, N_MELS], x.clone()))?,
+                    "cond" => Tensor::from_array(([1usize, total, N_MELS], cond.clone()))?,
+                    "text" => Tensor::from_array(([1usize, total], text_ids.clone()))?,
+                    "time" => scalar(ts[i])?,
+                    "cfg" => scalar(opts.cfg)?,
+                ])?;
+                let (_, v) = outputs[0].try_extract_tensor::<f32>()?;
+                if v.len() != x.len() {
+                    bail!(
+                        "unexpected DiT output size {} (expected {})",
+                        v.len(),
+                        x.len()
+                    );
+                }
+                let dt = ts[i + 1] - ts[i];
+                for (xi, vi) in x.iter_mut().zip(v) {
+                    *xi += dt * vi;
+                }
             }
         }
         // The prompt region stays equal to the reference mel.
@@ -298,12 +402,24 @@ impl Tts {
                 mel[m * n + t] = x[(ref_len + t) * N_MELS + m];
             }
         }
-        let outputs = self
-            .vocos
-            .run(ort::inputs!["mel" => Tensor::from_array(([1usize, N_MELS, n], mel))?])?;
-        let (_, re) = outputs[0].try_extract_tensor::<f32>()?;
-        let (_, im) = outputs[1].try_extract_tensor::<f32>()?;
-        Ok(istft(re, im, n))
+        #[cfg(feature = "wgpu")]
+        if let Some(native) = &self.native {
+            let (re, im) = native.spectrogram(&mel, n)?;
+            return Ok(istft(&re, &im, n));
+        }
+        #[cfg(feature = "ort")]
+        {
+            let outputs = self
+                .vocos
+                .as_mut()
+                .context("F5 vocoder is not loaded")?
+                .run(ort::inputs!["mel" => Tensor::from_array(([1usize, N_MELS, n], mel))?])?;
+            let (_, re) = outputs[0].try_extract_tensor::<f32>()?;
+            let (_, im) = outputs[1].try_extract_tensor::<f32>()?;
+            Ok(istft(re, im, n))
+        }
+        #[cfg(not(feature = "ort"))]
+        bail!("F5 native vocoder is not loaded")
     }
 }
 
@@ -321,8 +437,8 @@ pub fn write_wav_rate(path: &Path, samples: &[f32], sample_rate: u32) -> Result<
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer =
-        hound::WavWriter::create(path, spec).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("create {}", path.display()))?;
     for &s in samples {
         writer.write_sample((s.clamp(-1.0, 1.0) * 32767.0).round() as i16)?;
     }
@@ -331,18 +447,24 @@ pub fn write_wav_rate(path: &Path, samples: &[f32], sample_rate: u32) -> Result<
 }
 
 fn read_wav_mono_24k(path: &Path) -> Result<Vec<f32>> {
-    let mut reader = hound::WavReader::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader =
+        hound::WavReader::open(path).with_context(|| format!("open {}", path.display()))?;
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
     let interleaved: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
         hound::SampleFormat::Int => {
             let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader.samples::<i32>().map(|s| s.map(|v| v as f32 * scale)).collect::<Result<_, _>>()?
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 * scale))
+                .collect::<Result<_, _>>()?
         }
     };
-    let mono: Vec<f32> =
-        interleaved.chunks(channels).map(|c| c.iter().sum::<f32>() / channels as f32).collect();
+    let mono: Vec<f32> = interleaved
+        .chunks(channels)
+        .map(|c| c.iter().sum::<f32>() / channels as f32)
+        .collect();
     if mono.is_empty() {
         bail!("{} contains no audio", path.display());
     }
@@ -367,9 +489,17 @@ fn read_wav_mono_24k(path: &Path) -> Result<Vec<f32>> {
 fn read_f32_file(path: &Path, count: usize) -> Result<Vec<f32>> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     if bytes.len() != count * 4 {
-        bail!("{} has {} bytes; expected {} f32 values", path.display(), bytes.len(), count);
+        bail!(
+            "{} has {} bytes; expected {} f32 values",
+            path.display(),
+            bytes.len(),
+            count
+        );
     }
-    Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect())
 }
 
 fn trim_silence(wave: &[f32]) -> Vec<f32> {
@@ -411,7 +541,9 @@ pub fn clean_burmese(text: &str, speed: f32) -> (String, f64) {
     let syllables = chars
         .iter()
         .enumerate()
-        .filter(|(i, &c)| ('\u{1000}'..='\u{1021}').contains(&c) && chars.get(i + 1) != Some(&'\u{103a}'))
+        .filter(|(i, &c)| {
+            ('\u{1000}'..='\u{1021}').contains(&c) && chars.get(i + 1) != Some(&'\u{103a}')
+        })
         .count()
         .max(1);
     let secs = (syllables as f64 * 0.28 / speed as f64) + 0.45;
@@ -602,8 +734,7 @@ mod tests {
 
     #[test]
     fn frontend_spaces_punctuation_and_estimates_duration() {
-        let (clean, secs) =
-            clean_burmese("မင်္ဂလာပါ၊ကျွန်တော်တို့ တရားဖြေရှင်းချက် စနစ်ကို စမ်းသပ်နေပါတယ်။", 1.0);
+        let (clean, secs) = clean_burmese("မင်္ဂလာပါ၊ကျွန်တော်တို့ တရားဖြေရှင်းချက် စနစ်ကို စမ်းသပ်နေပါတယ်။", 1.0);
         assert!(clean.contains("၊ ကျွန်တော်တို့"));
         assert!(secs > 3.0 && secs < 10.0, "{secs}");
     }

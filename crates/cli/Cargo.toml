@@ -7,6 +7,9 @@ edition.workspace = true
 name = "tarafer"
 path = "src/main.rs"
 
+[features]
+wgpu = ["taraference-tts/wgpu", "dep:taraference-wgpu"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -16,6 +19,7 @@ serde_json.workspace = true
 sha2 = "0.10"
 taraference-core = { path = "../core" }
 taraference-gguf = { path = "../gguf" }
+taraference-wgpu = { path = "../wgpu", optional = true }
 taraference-background-removal = { path = "../background-removal" }
 taraference-tts = { path = "../tts" }
 tokio.workspace = true
