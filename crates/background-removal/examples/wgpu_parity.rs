@@ -2,19 +2,25 @@
 //! `tools/image/birefnet_wgpu_fixtures.py`.
 //!
 //! cargo run --release -p taraference-background-removal --features wgpu \
-//!     --example wgpu_parity -- MODEL.safetensors FIXTURES [deform]
+//!     --example wgpu_parity -- MODEL.safetensors FIXTURES [auto|fp16|fp32]
 #[cfg(feature = "wgpu")]
 fn main() -> anyhow::Result<()> {
     use anyhow::{ensure, Context};
     use std::{collections::HashMap, path::Path, time::Instant};
-    use taraference_background_removal::wgpu_birefnet::NativeBiRefNet;
+    use taraference_background_removal::wgpu_birefnet::{NativeBiRefNet, Precision};
 
     const DEFORM: &str = "decoder.decoder_block4.dec_att.aspp_deforms.1.atrous_conv";
     let args: Vec<_> = std::env::args().collect();
     ensure!(
         matches!(args.len(), 3 | 4),
-        "usage: wgpu_parity MODEL.safetensors FIXTURES [deform]"
+        "usage: wgpu_parity MODEL.safetensors FIXTURES [auto|fp16|fp32]"
     );
+    let precision = match args.get(3).map(String::as_str) {
+        None | Some("auto") => Precision::Auto,
+        Some("fp16") => Precision::Half,
+        Some("fp32") => Precision::Full,
+        Some(other) => anyhow::bail!("unknown precision {other:?}"),
+    };
     let dir = Path::new(&args[2]);
     let manifest = std::fs::read_to_string(dir.join("manifest.txt"))
         .with_context(|| format!("read {}", dir.join("manifest.txt").display()))?;
@@ -61,10 +67,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let started = Instant::now();
-    let model = NativeBiRefNet::load(Path::new(&args[1]))?;
+    let model = NativeBiRefNet::load(Path::new(&args[1]), precision)?;
     eprintln!(
         "BiRefNet Lite (upstream fp32 safetensors) on {}: load {:.2} s",
-        model.adapter,
+        model.adapter(),
         started.elapsed().as_secs_f64()
     );
     let mut pass = true;
@@ -79,9 +85,9 @@ fn main() -> anyhow::Result<()> {
         &fixture("deform_out")?,
         0.01,
     )?;
-    if args.len() == 4 {
-        ensure!(args[3] == "deform", "unknown mode {:?}", args[3]);
-    } else {
+    {
+        // Half precision keeps about three significant digits per operation.
+        let half = model.adapter().ends_with("fp16)");
         let size = *shapes
             .get("input")
             .and_then(|dims| dims.last())
@@ -94,27 +100,31 @@ fn main() -> anyhow::Result<()> {
             started.elapsed().as_secs_f64()
         );
         for (name, got) in &trace {
-            let limit = if name == "logits" { 0.02 } else { 0.01 };
+            let limit = match (half, name.as_str()) {
+                (true, _) => 0.03,
+                (false, "logits") => 0.02,
+                (false, _) => 0.01,
+            };
             pass &= compare(name, got, &fixture(name)?, limit)?;
         }
         let (_, logits) = trace.last().context("empty trace")?;
-        let reference = fixture("logits")?;
-        let both = logits
-            .iter()
-            .zip(&reference)
-            .filter(|(a, b)| **a > 0.0 && **b > 0.0)
-            .count();
-        let either = logits
-            .iter()
-            .zip(&reference)
-            .filter(|(a, b)| **a > 0.0 || **b > 0.0)
-            .count();
-        if either > 0 {
-            let iou = both as f64 / either as f64;
-            eprintln!("mask IoU vs PyTorch: {iou:.5} ({either} foreground pixels)");
-            pass &= iou >= 0.99;
-        } else {
-            eprintln!("mask IoU vs PyTorch: both masks are empty");
+        // `onnx_logits` (optional) comes from the shipped ONNX Runtime model.
+        for (label, name) in [("PyTorch", "logits"), ("ONNX Runtime", "onnx_logits")] {
+            if !shapes.contains_key(name) {
+                continue;
+            }
+            let reference = fixture(name)?;
+            ensure!(reference.len() == logits.len(), "{name}: size mismatch");
+            let pairs = || logits.iter().zip(&reference);
+            let both = pairs().filter(|(a, b)| **a > 0.0 && **b > 0.0).count();
+            let either = pairs().filter(|(a, b)| **a > 0.0 || **b > 0.0).count();
+            if either > 0 {
+                let iou = both as f64 / either as f64;
+                eprintln!("mask IoU vs {label}: {iou:.5} ({either} foreground pixels)");
+                pass &= iou >= 0.99;
+            } else {
+                eprintln!("mask IoU vs {label}: both masks are empty");
+            }
         }
         for run in 1..=2 {
             let started = Instant::now();
