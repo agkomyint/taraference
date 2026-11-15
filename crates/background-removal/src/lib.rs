@@ -1,5 +1,8 @@
 //! Local BiRefNet Lite inference and transparent PNG output.
 
+#[cfg(feature = "wgpu")]
+pub mod wgpu_birefnet;
+
 use anyhow::{anyhow, bail, Context, Result};
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Luma, Rgba};

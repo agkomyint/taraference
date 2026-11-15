@@ -3794,8 +3794,10 @@ name = "taraference-background-removal"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "burn",
  "image",
  "ort",
+ "safetensors 0.6.2",
  "sha2",
  "ureq 2.12.1",
 ]
