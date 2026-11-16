@@ -38,7 +38,7 @@ enum Q5kDecodeMode {
     Native,
     /// Default hybrid path: expand to Q8_0 for fast DP4A GEMV (more BW).
     ToQ8,
-    /// A/B fast path (`TARAFER_Q35_FAST=1`): requantize to Q4_K for less BW +
+    /// Hybrid Qwen3.5 default: requantize Q5_K to Q4_K for less BW +
     /// existing Q4 DP4A kernels. Slight quality trade for ~15% less traffic.
     ToQ4,
 }
@@ -51,20 +51,10 @@ fn q5k_decode_mode(is_hybrid: bool) -> Q5kDecodeMode {
     if std::env::var_os("TARAFER_Q5K_TRANSCODE").is_some() {
         return Q5kDecodeMode::ToQ8;
     }
-    // Qwen3.5-4B speed variant: keep default binary, opt-in via env.
-    if is_hybrid
-        && (std::env::var_os("TARAFER_Q35_FAST").is_some()
-            || std::env::var("TARAFER_VARIANT")
-                .map(|v| {
-                    let v = v.to_ascii_lowercase();
-                    v == "q35fast" || v == "fast" || v == "q4"
-                })
-                .unwrap_or(false))
-    {
-        return Q5kDecodeMode::ToQ4;
-    }
+    // Hybrid Qwen3.5 default: Q5_K -> Q4_K (less weight traffic, ~+12% decode on
+    // 0.8B/RTX 3050 Ti). Slight quality trade; TARAFER_Q5K_TRANSCODE=1 keeps Q8_0.
     if is_hybrid {
-        Q5kDecodeMode::ToQ8
+        Q5kDecodeMode::ToQ4
     } else {
         Q5kDecodeMode::Native
     }
@@ -366,11 +356,11 @@ impl CudaModel {
 
         // Q5_K f32-dot GEMV is much slower than Q8/Q4 DP4A on sm_86 decode.
         // Hybrid Qwen3.5 puts Q5_K on the hot path (attn_qkv / ssm_out).
-        //   default:          Q5_K → Q8_0  (quality, more BW)
-        //   TARAFER_Q35_FAST: Q5_K → Q4_K  (A/B speed variant, less BW)
+        //   default:          Q5_K → Q4_K  (speed, less BW)
+        //   TARAFER_Q5K_TRANSCODE: Q5_K → Q8_0 (quality, more BW)
         //   TARAFER_Q5K_NATIVE: keep Q5_K
         let q5k_mode = q5k_decode_mode(cfg.is_hybrid());
-        if matches!(q5k_mode, Q5kDecodeMode::ToQ4) {
+        if matches!(q5k_mode, Q5kDecodeMode::ToQ4) && std::env::var_os("TARAFER_VERBOSE").is_some() {
             eprintln!(
                 "variant | q35fast  Q5_K→Q4_K + DP4A prefill tiles={} (PLD opt-in: TARAFER_Q35_SPEC=1)",
                 super::types::GEMM_DP4A_MAX_TOK
@@ -610,7 +600,7 @@ impl CudaModel {
         }
         if q5k_to_q8.get() != 0 || q5k_to_q4.get() != 0 || q5_1_transcoded.get() != 0 {
             eprintln!(
-                "load fast-path | Q5_K->Q8_0={} Q5_K->Q4_K={} Q5_1->Q8_0={} (native: TARAFER_Q5K_NATIVE=1; q35fast: TARAFER_Q35_FAST=1)",
+                "load fast-path | Q5_K->Q8_0={} Q5_K->Q4_K={} Q5_1->Q8_0={} (native: TARAFER_Q5K_NATIVE=1; Q8 quality: TARAFER_Q5K_TRANSCODE=1)",
                 q5k_to_q8.get(),
                 q5k_to_q4.get(),
                 q5_1_transcoded.get()
