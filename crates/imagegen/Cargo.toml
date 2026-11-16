@@ -1,0 +1,16 @@
+[package]
+name = "taraference-imagegen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+half = "2"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+ort = { version = "2.0.0-rc.13", features = ["cuda", "half"] }
+regex = "1"
+unicode-normalization = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "2.0.0-rc.13", features = ["directml", "half"] }

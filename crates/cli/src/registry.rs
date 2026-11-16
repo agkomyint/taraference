@@ -244,6 +244,25 @@ pub const REGISTRY: &[Entry] = &[
         install: Install::Download,
         note: "background removal (BiRefNet Lite FP16)",
     },
+    Entry {
+        id: "sdxs-512",
+        task: Task::Image,
+        runtime: "onnx",
+        repo: "creador/sdxs-512-dreamshaper-onnx",
+        rev: "7a623d0",
+        dir: "image/sdxs-512",
+        files: &[
+            f("unet_fp16.onnx", "unet_fp16.onnx", 631_778_188, "ada19736853c36825524d73eadf4ef91e827e5f5e6a90c2315f52a08bdc4650b"),
+            f("text_encoder_fp16.onnx", "text_encoder_fp16.onnx", 246_315_807, "76dae5ad8080f53edda5743a69583d8a446a0bc6b2316c43b13477e41db9ae93"),
+            f("vae_large_decoder_fp16.onnx", "vae_large_decoder_fp16.onnx", 99_085_225, "b53bb46ab03cd86aa43bb146c963fa2270c5b66771be1dd2d82462cdbfa00276"),
+            f("taesd_decoder_fp16.onnx", "taesd_decoder_fp16.onnx", 2_468_339, "4e3b6894e1d10aa4e3c9cf5426b505e7da42c7dc3455226b9fe7f9c506b245bd"),
+            f("tokenizer.json", "tokenizer.json", 3_642_034, "5f120510b5c01ccdb9a7d29d2beca07cac667f76472cab123ffb1c2f0b27cdeb"),
+        ],
+        licence: "OpenRAIL++ (use restrictions apply)",
+        commercial: true,
+        install: Install::Download,
+        note: "text-to-image (SDXS-512 DreamShaper, 1-step, 512x512): tarafer image gen",
+    },
 ];
 
 pub fn find(id: &str) -> Result<&'static Entry> {

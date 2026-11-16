@@ -21,6 +21,7 @@ taraference-core = { path = "../core" }
 taraference-gguf = { path = "../gguf" }
 taraference-wgpu = { path = "../wgpu", optional = true }
 taraference-background-removal = { path = "../background-removal" }
+taraference-imagegen = { path = "../imagegen" }
 taraference-tts = { path = "../tts" }
 tokio.workspace = true
 tokio-stream.workspace = true
