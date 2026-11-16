@@ -217,6 +217,11 @@ struct Runtime {
     /// Open the model's <think> block (Qwen3 / Qwen3.5).
     #[arg(long)]
     think: bool,
+    /// Speculative decoding via prompt lookup (CUDA, greedy). Same output, faster on repetitive
+    /// text (code edits, quoting), slower on free-form text. MODE: smart (default) or aggressive.
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "smart",
+          value_parser = ["smart", "aggressive"])]
+    speculative: Option<String>,
     #[arg(long, hide = true, default_value_t = DecodeBackend::default(), value_parser = parse_decode)]
     decode: DecodeBackend,
     #[arg(long, hide = true)]
@@ -283,6 +288,15 @@ fn resolve_model(arg: Option<&str>) -> Result<PathBuf> {
 }
 
 fn load_engine(rt: &Runtime, model: &Path) -> Result<InferenceEngine> {
+    // Read once by the session on first use, so set it before anything loads.
+    match rt.speculative.as_deref() {
+        Some("aggressive") => std::env::set_var("TARAFER_PLD", "1"),
+        Some(_) => {
+            std::env::set_var("TARAFER_PLD", "1");
+            std::env::set_var("TARAFER_PLD_SMART", "1");
+        }
+        None => {}
+    }
     let engine = InferenceEngine::load_with_flags(
         model,
         rt.decode,
