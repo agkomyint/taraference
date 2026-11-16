@@ -1568,14 +1568,17 @@ __device__ __forceinline__ float dot_q8_0_col_q8_range(
         const unsigned char* base = col + bi * 34;
         float dw = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
         const signed char* qs = (const signed char*)(base + 2);
-        const signed char* xv = xq + (bi << 5);
-        int sum = 0;
-        #pragma unroll
-        for (int t = 0; t < 32; t += 4) {
-            int w4 = load_int_unaligned(qs + t);
-            int x4 = load_int_unaligned(xv + t);
-            sum = __dp4a(w4, x4, sum);
-        }
+        const int4* xv = reinterpret_cast<const int4*>(xq + (bi << 5));
+        const unsigned short* qh = reinterpret_cast<const unsigned short*>(qs); // 2-byte aligned
+        int4 xa = xv[0], xb = xv[1];
+        int sum = __dp4a((int)((unsigned)qh[0] | ((unsigned)qh[1] << 16)), xa.x, 0);
+        sum = __dp4a((int)((unsigned)qh[2] | ((unsigned)qh[3] << 16)), xa.y, sum);
+        sum = __dp4a((int)((unsigned)qh[4] | ((unsigned)qh[5] << 16)), xa.z, sum);
+        sum = __dp4a((int)((unsigned)qh[6] | ((unsigned)qh[7] << 16)), xa.w, sum);
+        sum = __dp4a((int)((unsigned)qh[8] | ((unsigned)qh[9] << 16)), xb.x, sum);
+        sum = __dp4a((int)((unsigned)qh[10] | ((unsigned)qh[11] << 16)), xb.y, sum);
+        sum = __dp4a((int)((unsigned)qh[12] | ((unsigned)qh[13] << 16)), xb.z, sum);
+        sum = __dp4a((int)((unsigned)qh[14] | ((unsigned)qh[15] << 16)), xb.w, sum);
         acc += dw * xd[bi] * (float)sum;
     }
     return warp_sum(acc);
