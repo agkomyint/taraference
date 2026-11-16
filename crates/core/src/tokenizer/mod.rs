@@ -3,7 +3,7 @@
 mod bytes;
 mod special;
 
-use bytes::{bpe_chars_to_text, text_to_bpe_chars};
+use bytes::text_to_bpe_chars;
 use special::split_special;
 
 use anyhow::{anyhow, bail, Result};
@@ -131,6 +131,15 @@ impl Tokenizer {
 
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut s = String::new();
+        // Byte-level BPE: multi-byte characters can be split across tokens, so
+        // pending bytes are only converted at special tokens / the end.
+        let mut pending: Vec<u8> = Vec::new();
+        let flush = |pending: &mut Vec<u8>, s: &mut String| {
+            if !pending.is_empty() {
+                s.push_str(&String::from_utf8_lossy(pending));
+                pending.clear();
+            }
+        };
         for &id in ids {
             if let Some(t) = self.tokens.get(id as usize) {
                 if self.sentencepiece {
@@ -139,12 +148,14 @@ impl Tokenizer {
                     }
                     s.push_str(&t.replace('▁', " "));
                 } else if t.starts_with("<|") && t.ends_with("|>") {
+                    flush(&mut pending, &mut s);
                     s.push_str(t);
                 } else {
-                    s.push_str(&bpe_chars_to_text(t));
+                    bytes::bpe_chars_to_bytes(t, &mut pending);
                 }
             }
         }
+        flush(&mut pending, &mut s);
         s
     }
 

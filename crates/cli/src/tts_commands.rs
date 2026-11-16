@@ -74,7 +74,7 @@ enum TtsCommand {
         /// Audio file, any sample rate, mono or stereo.
         audio: PathBuf,
         /// Speech-to-text model.
-        #[arg(short, long, default_value = "myanmar-asr", value_parser = ["myanmar-asr"])]
+        #[arg(short, long, default_value = "myanmar-asr", value_parser = ["myanmar-asr", "raj"])]
         model: String,
         /// Spoken language; only Burmese (my) has a model so far.
         #[arg(long, default_value = "my", value_parser = ["my"])]
@@ -91,6 +91,15 @@ enum TtsCommand {
         /// Also write the transcript to this UTF-8 file.
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
+    },
+    /// Live Burmese/English speech-to-text server (Raj-0.6B, CUDA). Models stay loaded; POST 16 kHz f32 PCM to /transcribe.
+    Live {
+        /// Port to listen on (localhost only).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// Raj model directory.
+        #[arg(long, default_value = "models/stt/raj-0.6b")]
+        model_dir: PathBuf,
     },
     /// Show which engines are installed and ready.
     Status {
@@ -137,6 +146,24 @@ pub fn run(args: Vec<String>) -> Result<()> {
             }
             eprintln!("next    | tarafer speech say \"မင်္ဂလာပါ\" -o hello.wav [--engine f5|mms]");
             eprintln!("        | tarafer speech transcribe hello.wav");
+        }
+        TtsCommand::Live { port, model_dir } => live_server(port, model_dir)?,
+        TtsCommand::Transcribe { audio, model, lang: _, model_dir, device: _, syllables: _, output } if model == "raj" => {
+            let dir = model_dir.unwrap_or_else(|| PathBuf::from("models/stt/raj-0.6b"));
+            let (gguf, mmproj) = raj_files(&dir)?;
+            let samples = asr::read_audio(&audio)?;
+            let r = taraference_core::rajasr::transcribe(&gguf, &mmproj, &samples, 512)?;
+            println!("{}", r.text);
+            if let Some(path) = &output {
+                std::fs::write(path, format!("{}
+", r.text))
+                    .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+            }
+            eprintln!(
+                "done   | Raj (Q8_0, CUDA) | lang={} | {:.1} s audio -> {} audio tok -> {} text tok | mel {:.0} ms, encode {:.0} ms, prefill {:.0} ms, decode {:.0} ms ({:.1} tok/s)",
+                r.language, r.audio_seconds, r.audio_tokens, r.text_tokens, r.mel_ms, r.encode_ms, r.prefill_ms, r.decode_ms,
+                r.text_tokens as f64 / (r.decode_ms / 1000.0).max(1e-9)
+            );
         }
         TtsCommand::Transcribe { audio, model: _, lang: _, model_dir, device, syllables, output } => {
             let dir = model_dir.unwrap_or_else(|| PathBuf::from(ASR_MODEL_DIR));
@@ -362,4 +389,90 @@ pub fn bench(device: Device, runs: usize, steps: usize, audio: Option<PathBuf>) 
         println!("stt text | {text}");
     }
     Ok(())
+}
+
+fn live_server(port: u16, dir: PathBuf) -> Result<()> {
+    use axum::{body::Bytes, extract::State, http::StatusCode, routing::{get, post}, Json, Router};
+    use std::sync::mpsc;
+    use tokio::sync::oneshot;
+
+    type Job = (Vec<f32>, oneshot::Sender<Result<serde_json::Value, String>>);
+    let (gguf, mmproj) = raj_files(&dir)?;
+    let (tx, rx) = mpsc::channel::<Job>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<f64, String>>();
+    // The CUDA models live on one dedicated thread; HTTP handlers send it jobs.
+    std::thread::spawn(move || {
+        let mut session = match taraference_core::rajasr::RajSession::load(&gguf, &mmproj) {
+            Ok(s) => {
+                let _ = ready_tx.send(Ok(s.load_ms));
+                s
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("{e:#}")));
+                return;
+            }
+        };
+        while let Ok((samples, reply)) = rx.recv() {
+            let out = session.transcribe(&samples, 512).map_err(|e| format!("{e:#}")).map(|r| {
+                serde_json::json!({
+                    "text": r.text, "language": r.language, "audio_s": r.audio_seconds,
+                    "mel_ms": r.mel_ms, "encode_ms": r.encode_ms, "prefill_ms": r.prefill_ms,
+                    "decode_ms": r.decode_ms, "text_tokens": r.text_tokens,
+                    "total_ms": r.mel_ms + r.encode_ms + r.prefill_ms + r.decode_ms,
+                })
+            });
+            let _ = reply.send(out);
+        }
+    });
+    match ready_rx.recv() {
+        Ok(Ok(ms)) => eprintln!("ready  | Raj (Q8_0, CUDA) loaded in {ms:.0} ms"),
+        Ok(Err(e)) => bail!("load failed: {e}"),
+        Err(_) => bail!("model thread died"),
+    }
+    let tx = std::sync::Mutex::new(tx);
+    let state = std::sync::Arc::new(tx);
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async move {
+        async fn transcribe(
+            State(tx): State<std::sync::Arc<std::sync::Mutex<mpsc::Sender<Job>>>>,
+            body: Bytes,
+        ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+            let samples: Vec<f32> = body.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let (rtx, rrx) = oneshot::channel();
+            tx.lock().unwrap().send((samples, rtx)).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            match rrx.await {
+                Ok(Ok(v)) => Ok(Json(v)),
+                Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            }
+        }
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/transcribe", post(transcribe))
+            .layer(tower_http::cors::CorsLayer::permissive())
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        eprintln!("listen | http://127.0.0.1:{port}  (POST /transcribe, body = little-endian f32 PCM @16 kHz)");
+        axum::serve(listener, app).await?;
+        anyhow::Ok(())
+    })?;
+    Ok(())
+}
+
+/// Find the decoder GGUF and its `mmproj-*.gguf` audio encoder inside a Raj model directory.
+fn raj_files(dir: &std::path::Path) -> Result<(PathBuf, PathBuf)> {
+    let (mut model, mut mmproj) = (None, None);
+    for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if !name.ends_with(".gguf") {
+            continue;
+        }
+        if name.starts_with("mmproj") { mmproj = Some(path) } else { model = Some(path) }
+    }
+    match (model, mmproj) {
+        (Some(a), Some(b)) => Ok((a, b)),
+        _ => bail!("{} needs a model .gguf and an mmproj-*.gguf", dir.display()),
+    }
 }

@@ -454,6 +454,55 @@ impl CudaModel {
         use_device_pos: bool,
         cache: &mut CudaKv,
     ) -> Result<()> {
+        self.forward_chunk_src(tokens, None, pos0, compute_logits, use_device_pos, cache)
+    }
+
+    /// Prefill from precomputed input embeddings (`n_tok * n_embd` f32, row-major),
+    /// e.g. audio-encoder output. Returns the greedy next token after the last row.
+    pub fn forward_greedy_embeds(&mut self, embeds: &[f32], cache: &mut CudaKv) -> Result<u32> {
+        let n_embd = self.cfg.n_embd;
+        if embeds.is_empty() || embeds.len() % n_embd != 0 {
+            bail!("embeddings length {} is not a multiple of n_embd {n_embd}", embeds.len());
+        }
+        let n_total = embeds.len() / n_embd;
+        if cache.len + n_total > cache.max_seq {
+            bail!("context full ({} + {n_total} > {})", cache.len, cache.max_seq);
+        }
+        let max_chunk = std::env::var("TARAFER_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(GEMM_DP4A_MAX_TOK).min(MAX_BATCH);
+        let dummy = vec![0u32; max_chunk];
+        let mut offset = 0usize;
+        while offset < n_total {
+            let n = (n_total - offset).min(max_chunk);
+            let is_last = offset + n == n_total;
+            let tc = std::time::Instant::now();
+            self.forward_chunk_src(
+                &dummy[..n],
+                Some(&embeds[offset * n_embd..(offset + n) * n_embd]),
+                cache.len + offset,
+                is_last,
+                false,
+                cache,
+            )?;
+            if std::env::var_os("TARAFER_PROFILE").is_some() {
+                self.stream.synchronize()?;
+                eprintln!("profile | chunk pos0={} n={n} {:.1} ms", cache.len + offset, tc.elapsed().as_secs_f64() * 1e3);
+            }
+            offset += n;
+        }
+        cache.len += n_total;
+        let idx = self.stream.clone_dtoh(&self.argmax_buf)?;
+        Ok(self.map_output_id(idx[0] as u32))
+    }
+
+    fn forward_chunk_src(
+        &mut self,
+        tokens: &[u32],
+        embeds: Option<&[f32]>,
+        pos0: usize,
+        compute_logits: bool,
+        use_device_pos: bool,
+        cache: &mut CudaKv,
+    ) -> Result<()> {
         let n_tok_u = tokens.len();
         let head_dim = self.cfg.head_dim();
         let n_kv_heads = self.cfg.n_head_kv;
@@ -479,7 +528,10 @@ impl CudaModel {
             use_device_pos: use_device_pos && n_tok_u == 1,
         };
 
-        if d.use_device_pos {
+        if let Some(e) = embeds {
+            let mut dst = self.x.slice_mut(0..e.len());
+            self.stream.memcpy_htod(e, &mut dst)?;
+        } else if d.use_device_pos {
             self.embed_one_device()?;
         } else {
             let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();

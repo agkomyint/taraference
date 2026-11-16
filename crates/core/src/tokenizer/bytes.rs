@@ -45,14 +45,19 @@ pub fn text_to_bpe_chars(text: &str) -> String {
     text.as_bytes().iter().map(|&b| table[b as usize]).collect()
 }
 
-/// BPE unicode string → UTF-8 text.
-pub fn bpe_chars_to_text(s: &str) -> String {
+/// BPE unicode string → raw bytes (a character may span several tokens).
+pub fn bpe_chars_to_bytes(s: &str, out: &mut Vec<u8>) {
     let u2b = unicode_to_bytes();
-    let mut bytes = Vec::with_capacity(s.len());
     for ch in s.chars() {
         if let Some(&b) = u2b.get(&ch) {
-            bytes.push(b);
+            out.push(b);
         }
     }
+}
+
+/// BPE unicode string → UTF-8 text.
+pub fn bpe_chars_to_text(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    bpe_chars_to_bytes(s, &mut bytes);
     String::from_utf8_lossy(&bytes).into_owned()
 }

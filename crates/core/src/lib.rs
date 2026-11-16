@@ -12,6 +12,8 @@ pub mod cuda;
 #[cfg(feature = "cuda")]
 pub mod engine;
 pub mod quant;
+#[cfg(feature = "cuda")]
+pub mod rajasr;
 pub mod sampler;
 #[cfg(feature = "cuda")]
 pub mod session;

@@ -3854,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "taraference"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3878,7 +3878,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-background-removal"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "burn",
@@ -3891,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "cudarc 0.19.8",
@@ -3904,7 +3904,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-gguf"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -3914,7 +3914,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-tts"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "burn",
@@ -3933,7 +3933,7 @@ dependencies = [
 
 [[package]]
 name = "taraference-wgpu"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "bytemuck",

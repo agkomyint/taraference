@@ -3245,17 +3245,46 @@ extern "C" __global__ void gemm_q8_0_q8_ntok(
     float* __restrict__ out,
     int n_rows, int n_cols, int col_bytes, int n_tok
 ) {
+    // Each weight block is decoded once and applied to every token (registers),
+    // instead of re-streaming the whole weight column per token.
     const int j = (int)blockIdx.x;
     if (j >= n_cols) return;
     const int lane = (int)threadIdx.x & 31;
     const unsigned char* col = w + (size_t)j * (size_t)col_bytes;
     const int n_groups = n_rows >> 5;
     const int nt = n_tok < GEMM_DP4A_MAX_TOK ? n_tok : GEMM_DP4A_MAX_TOK;
-    #pragma unroll 1
-    for (int t = 0; t < nt; t++) {
-        float acc = dot_q8_0_col_q8_range(
-            col, xq + (size_t)t * (size_t)n_rows, xd + (size_t)t * (size_t)n_groups, 0, n_groups, lane);
-        if (lane == 0) out[(size_t)t * (size_t)n_cols + j] = acc;
+    float acc[GEMM_DP4A_MAX_TOK];
+    #pragma unroll
+    for (int t = 0; t < GEMM_DP4A_MAX_TOK; t++) acc[t] = 0.f;
+    for (int bi = lane; bi < n_groups; bi += 32) {
+        const unsigned char* base = col + bi * 34;
+        float dw = half_to_float((unsigned short)(base[0] | (base[1] << 8)));
+        const signed char* qs = (const signed char*)(base + 2);
+        int w4[8];
+        {
+            const unsigned short* qh = reinterpret_cast<const unsigned short*>(qs); // 2-byte aligned
+            #pragma unroll
+            for (int q = 0; q < 8; q++) w4[q] = (int)((unsigned)qh[2 * q] | ((unsigned)qh[2 * q + 1] << 16));
+        }
+        #pragma unroll
+        for (int t = 0; t < GEMM_DP4A_MAX_TOK; t++) {
+            if (t < nt) {
+                const int4* xv = reinterpret_cast<const int4*>(xq + (size_t)t * (size_t)n_rows + (bi << 5));
+                int4 xa = xv[0], xb = xv[1];
+                int sum = __dp4a(w4[0], xa.x, 0);
+                sum = __dp4a(w4[1], xa.y, sum); sum = __dp4a(w4[2], xa.z, sum); sum = __dp4a(w4[3], xa.w, sum);
+                sum = __dp4a(w4[4], xb.x, sum); sum = __dp4a(w4[5], xb.y, sum);
+                sum = __dp4a(w4[6], xb.z, sum); sum = __dp4a(w4[7], xb.w, sum);
+                acc[t] += dw * xd[(size_t)t * (size_t)n_groups + bi] * (float)sum;
+            }
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < GEMM_DP4A_MAX_TOK; t++) {
+        if (t < nt) {
+            float r = warp_sum(acc[t]);
+            if (lane == 0) out[(size_t)t * (size_t)n_cols + j] = r;
+        }
     }
 }
 
