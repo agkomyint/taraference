@@ -14,6 +14,8 @@ use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
 #[cfg(feature = "ort")]
+pub mod asr;
+#[cfg(feature = "ort")]
 pub mod mms;
 pub mod normalize;
 #[cfg(feature = "wgpu")]
@@ -216,14 +218,19 @@ impl Tts {
         if native {
             #[cfg(feature = "wgpu")]
             {
-                native_engine = Some(wgpu_f5::NativeF5::load(model_dir)?);
+                let engine = wgpu_f5::NativeF5::load(model_dir)?;
+                device_name = if engine.adapter().ends_with("fp16)") { "wgpu fp16" } else { "wgpu fp32" };
+                native_engine = Some(engine);
+            }
+            #[cfg(not(feature = "wgpu"))]
+            {
+                device_name = "wgpu";
             }
             #[cfg(feature = "ort")]
             {
                 dit = None;
                 vocos = None;
             }
-            device_name = "wgpu";
         } else {
             #[cfg(all(feature = "wgpu", feature = "ort"))]
             {

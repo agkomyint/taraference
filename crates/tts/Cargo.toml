@@ -5,7 +5,10 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-burn = { version = "0.18", default-features = false, features = ["std", "webgpu"], optional = true }
+burn = { version = "0.18", default-features = false, features = ["std", "webgpu", "vulkan", "fusion", "autotune"], optional = true }
+# Only for pinning the autotune cache location (wgpu_f5::NativeF5::load).
+cubecl-runtime = { version = "0.6", default-features = false, features = ["std"], optional = true }
+serde_json = { workspace = true, optional = true }
 half = { version = "2", features = ["bytemuck"], optional = true }
 bytemuck = { version = "1", optional = true }
 safetensors = { version = "0.6", optional = true }
@@ -19,7 +22,7 @@ unicode-normalization = "0.1"
 [features]
 default = ["ort"]
 ort = ["dep:ort"]
-wgpu = ["dep:burn", "dep:half", "dep:bytemuck", "dep:safetensors", "dep:clap"]
+wgpu = ["dep:burn", "dep:cubecl-runtime", "dep:serde_json", "dep:half", "dep:bytemuck", "dep:safetensors", "dep:clap"]
 
 [[bin]]
 name = "tarafer-speech"

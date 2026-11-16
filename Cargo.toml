@@ -8,6 +8,7 @@ members = [
     "crates/tts",
     "crates/wgpu",
 ]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.7.0"
@@ -30,3 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "2", default-features = true }
 uuid = { version = "1", features = ["v4"] }
+
+# cubecl-wgpu 0.6.0 plus a persistent kernel cache; see vendor/cubecl-wgpu/TARAFERENCE.md.
+[patch.crates-io]
+cubecl-wgpu = { path = "vendor/cubecl-wgpu" }

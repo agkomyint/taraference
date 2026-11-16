@@ -210,6 +210,23 @@ pub const REGISTRY: &[Entry] = &[
         note: "Burmese F5-TTS v2, best quality, GPU recommended",
     },
     Entry {
+        id: "myanmar-asr",
+        task: Task::Speech,
+        runtime: "onnx",
+        repo: "freococo/myanmar_asr",
+        rev: "e40d48e354f6ee1b8e15e4fc513cfba7d624e80a",
+        dir: "stt/myanmar-asr",
+        files: &[f("model.onnx", "", 77_400_000, ""), f("tokens.txt", "", 36_000, "")],
+        licence: "Apache-2.0",
+        commercial: true,
+        install: Install::Manual(
+            "export from the PyTorch weights on this machine:\n    \
+             pip install torch safetensors onnx onnxruntime huggingface_hub\n    \
+             python tools/stt/export_myanmar_asr.py",
+        ),
+        note: "Burmese speech-to-text (Conformer CTC, 24M params), CPU ok",
+    },
+    Entry {
         id: "birefnet-lite",
         task: Task::Image,
         runtime: "onnx",

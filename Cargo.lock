@@ -295,6 +295,7 @@ dependencies = [
  "burn-candle",
  "burn-core",
  "burn-cuda",
+ "burn-ir",
  "burn-ndarray",
  "burn-rocm",
  "burn-router",
@@ -416,6 +417,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a0d9909ff711c13a416a5212111a6c85defce9a5e194752a012e79b27a107f9"
 dependencies = [
  "burn-cubecl",
+ "burn-fusion",
  "burn-tensor",
  "bytemuck",
  "cubecl",
@@ -495,6 +497,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f2e74851c0e2fc600a0362544cd4cfccf0519ba11ab530734be30a79683c0ff"
 dependencies = [
  "burn-cubecl",
+ "burn-fusion",
  "burn-tensor",
  "bytemuck",
  "cubecl",
@@ -544,6 +547,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d59fcb1d419fe44700cac10b59e5dda0e1512e8f8d7199073c172d88ba964b8f"
 dependencies = [
  "burn-cubecl",
+ "burn-fusion",
  "burn-tensor",
  "cubecl",
 ]
@@ -1145,8 +1149,6 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d3f068c9a81201f43cdd3f6385201b330f2499f6c24d688d82a70d705261a32"
 dependencies = [
  "ash",
  "async-channel",
@@ -3918,12 +3920,14 @@ dependencies = [
  "burn",
  "bytemuck",
  "clap",
+ "cubecl-runtime",
  "half",
  "hound",
  "ort",
  "regex",
  "rustfft",
  "safetensors 0.6.2",
+ "serde_json",
  "unicode-normalization",
 ]
 

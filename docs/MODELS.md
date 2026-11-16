@@ -28,6 +28,7 @@ taraference never hosts or ships weights.
 | `embed-4b` | embeddings (Qwen3-Embedding-4B) | Apache-2.0 | yes | `models pull` |
 | `mms-mya` | speech, Burmese (MMS-TTS) | CC BY-NC 4.0 | **no** | `models pull` |
 | `f5-myanmar` | speech, Burmese (F5-TTS v2) | CC BY-NC 4.0 | **no** | manual export (`tools/tts/export_f5_myanmar.py`) |
+| `myanmar-asr` | speech-to-text, Burmese (Conformer CTC) | Apache-2.0 | yes | manual export (`tools/stt/export_myanmar_asr.py`) |
 | `birefnet-lite` | image background removal | MIT | yes | `models pull` |
 
 Licences come from the upstream Hugging Face model metadata (checked 2026-10-14). This is

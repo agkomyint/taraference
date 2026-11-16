@@ -36,13 +36,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TextCmd,
     },
-    /// Burmese text-to-speech: `say <text|-> -o out.wav [--engine f5|mms]`, `status`.
+    /// Burmese speech: `say <text|-> -o out.wav [--engine f5|mms]`, `transcribe <audio>`, `status`.
     #[command(disable_help_flag = true)]
     Speech {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Image tools: `remove-bg <file>`, `model download`.
+    /// Image tools: `remove-bg <file>` (get the model with `models pull`).
     #[command(disable_help_flag = true)]
     Image {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -67,6 +67,8 @@ enum Cmd {
         /// Single custom prompt instead of the built-in multi-turn script.
         #[arg(long)]
         prompt: Option<String>,
+        #[command(subcommand)]
+        task: Option<BenchTask>,
     },
     /// Download the latest release and replace this binary.
     Update {
@@ -82,6 +84,25 @@ enum Cmd {
     Doctor {
         #[arg(long, default_value = "models")]
         models_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BenchTask {
+    /// Text-to-speech and speech-to-text: load, first run, warm run and RTF per installed engine.
+    Speech {
+        /// Inference device: auto (ORT CUDA/DirectML/CPU), cuda, directml or cpu.
+        #[arg(long, default_value = "auto")]
+        device: taraference_tts::Device,
+        /// Warm runs per engine; the best one is reported.
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+        /// F5 flow-matching steps.
+        #[arg(long, default_value_t = 32)]
+        steps: usize,
+        /// Audio for speech-to-text (default: the benchmark sentence spoken by a TTS engine).
+        #[arg(long, value_name = "FILE")]
+        audio: Option<PathBuf>,
     },
 }
 
@@ -305,6 +326,7 @@ pub fn run() -> Result<()> {
             if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
                 eprintln!(
                     "tarafer speech say <text|-> [-o out.wav] [--engine f5|mms] [--lexicon FILE]\n\
+                     tarafer speech transcribe <audio> [-o out.txt] [--syllables]\n\
                      tarafer speech status\n(`tarafer speech say --help` lists all options)"
                 );
                 return Ok(());
@@ -316,7 +338,10 @@ pub fn run() -> Result<()> {
             let model = resolve_model(rt.model.as_deref())?;
             run_serve(&rt, &model, port)
         }
-        Cmd::Bench { rt, prompt } => {
+        Cmd::Bench { task: Some(BenchTask::Speech { device, runs, steps, audio }), .. } => {
+            tts_commands::bench(device, runs, steps, audio)
+        }
+        Cmd::Bench { rt, prompt, task: None } => {
             let model = resolve_model(rt.model.as_deref())?;
             let mut engine = load_engine(&rt, &model)?;
             bench::run(&mut engine, prompt, rt.max_new)

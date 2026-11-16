@@ -408,8 +408,27 @@ fn read_checkpoint(path: &Path) -> Result<Raw> {
     Ok(raw)
 }
 
+/// Per-user cache directory for compiled GPU kernels.
+fn kernel_cache_dir() -> Option<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+    } else if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
+        std::path::PathBuf::from(cache)
+    } else {
+        std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cache")
+    };
+    Some(base.join("taraference").join("wgpu-kernels"))
+}
+
 /// Starts the wgpu runtime; returns the device, graphics backend and adapter name.
 fn init_device() -> (WgpuDevice, String, String) {
+    // Compiling the SPIR-V kernels takes several seconds, so keep them between runs
+    // (vendor/cubecl-wgpu/TARAFERENCE.md). Must be set before the runtime starts.
+    if std::env::var_os("CUBECL_KERNEL_CACHE").is_none() {
+        if let Some(dir) = kernel_cache_dir() {
+            std::env::set_var("CUBECL_KERNEL_CACHE", dir);
+        }
+    }
     let device = WgpuDevice::default();
     // Exclusive pages return freed feature maps instead of keeping multi-GiB slabs,
     // which is what keeps this model inside a 4 GiB adapter.

@@ -3,7 +3,8 @@
 > The noun/verb CLI (`text`, `speech`, `image`, `serve`, `models`, `bench`, `doctor`) is the only
 > interface; the old flag-style spellings are gone. The model registry (pinned revision + SHA-256, licence prompt,
 > `list|info|pull|verify|rm`) covers text, embeddings, speech and image; see
-> [docs/MODELS.md](../docs/MODELS.md). `speech transcribe` is open.
+> [docs/MODELS.md](../docs/MODELS.md). `speech transcribe` (Burmese) and `bench speech` exist on ONNX Runtime, unreleased; see
+> [docs/STT.md](../docs/STT.md).
 
 ## Direction
 
@@ -21,7 +22,7 @@ One CLI, one model registry, one OpenAI-compatible server, many small tasks:
 | Text embeddings | shipped | custom CUDA GGUF engine |
 | Image background removal (BiRefNet Lite) | shipped in 0.7 | ONNX Runtime |
 | Text-to-speech, Burmese (F5-Myanmar-TTS, MMS-TTS) | shipped, unreleased | ONNX Runtime |
-| Speech-to-text | not started | ONNX Runtime (candidates below) |
+| Speech-to-text, Burmese (`freococo/myanmar_asr`) | working, unreleased | ONNX Runtime |
 | Video (e.g. small segmentation/captioning) | research only | undecided |
 | More specialised models (OCR, translation, classification) | backlog | by demand |
 
@@ -32,7 +33,7 @@ tarafer text   gen <prompt|->  [-m MODEL] [-n N] [--temperature …] [--json]
 tarafer text   chat            [-m MODEL]            # thin REPL; may be dropped (see below)
 tarafer text   embed <text|->  [-m MODEL]
 tarafer speech say <text|->    -o out.wav [--engine f5|mms] [--lexicon FILE]
-tarafer speech transcribe <audio>  [-m MODEL] [--lang my|en]     # new
+tarafer speech transcribe <audio>  [-m MODEL] [--lang my]        # en needs a second model
 tarafer image  remove-bg <file>
 tarafer serve  [--port 8787]                          # one server, all tasks
 tarafer models list | pull <id> | rm <id> | info <id> # one registry, all task types
@@ -273,13 +274,16 @@ them and ports the other two ORT models.
    speech migrated. Open: update check. The F5 export step is replaced by the native engine below.
    - **Native F5 engine (0.8.0):** see "0.8.0 focus" above.
    - **Own every engine (0.9.0):** see "0.9.0 focus" above (MMS, BiRefNet, shared ops, no ORT).
-3. **Speech-to-text (0.10.0):** pick a model by benchmark, add `speech transcribe`
-   and `/v1/audio/transcriptions`. Candidates, all to be verified for licence, Burmese accuracy
-   and 4 GB fit: Whisper tiny/base/small (multilingual, ONNX exports exist), and
-   `freococo/myanmar_asr` (Burmese-specific, reported Apache-2.0).
+3. **Speech-to-text (0.10.0):** `speech transcribe` runs `freococo/myanmar_asr` (Burmese
+   Conformer CTC, Apache-2.0 per the upstream model card, 74 MiB, RTF 0.004 on the 4 GB GPU and
+   0.006 on CPU; [docs/STT.md](../docs/STT.md)). Still open: `/v1/audio/transcriptions`, an
+   independent Burmese accuracy measurement, and an English/multilingual model (Whisper
+   tiny/base/small, ONNX exports exist; licence and 4 GB fit to be verified).
 4. **TTS completion (0.10.0):** MyanmarTTS (CC0) native port as the commercially usable engine
-   (built on the 0.9.0 op library, not ONNX); VoxCPM2 (Apache-2.0) feasibility on 4 GB;
-   `bench speech`.
+   (built on the 0.9.0 op library, not ONNX); VoxCPM2 (Apache-2.0) feasibility on 4 GB.
+   `bench speech` times the ONNX Runtime engines and, in a `--features wgpu` build, native F5
+   (fp16, 10.0-11.2 s against 9.5-10.2 s on ONNX Runtime CUDA for 7.4 s of speech, RTX 3050 Ti
+   Laptop GPU, Vulkan; 5-10% slower, not yet faster).
 5. **Specialised models (0.11.0+):** add by demand, one at a time, each with a licence check and a
    benchmark. Video is research only until a model is small enough and clearly useful.
 

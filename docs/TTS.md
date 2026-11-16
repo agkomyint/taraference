@@ -95,8 +95,13 @@ Or enable it alongside the existing engines in the main CLI:
 cargo run -p taraference --release --features wgpu -- speech say "မင်္ဂလာပါ။" --engine f5 --device wgpu --steps 16 -o speech-wgpu.wav
 ```
 
-The backend prints the adapter and graphics API. It currently uses fp32 computation,
-even for the original fp16 F5 checkpoint, and caps each chunk at 2048 total mel frames
+The backend prints the adapter and graphics API. The DiT runs in half precision on Vulkan
+adapters and in fp32 elsewhere (`TARAFER_WGPU_PRECISION=fp16|fp32` overrides this; the text
+encoder and Vocos stay in fp32), and `TARAFER_WGPU_TRACE=1` prints per-step times. Compiled
+kernels and Burn's autotune results are kept in the user cache directory
+(`taraference/wgpu-kernels`, `taraference/wgpu-autotune`); the first run for a new class of
+sentence length is tuned once and can take tens of seconds longer. Measured speed is in
+[STT.md](STT.md). The backend caps each chunk at 2048 total mel frames
 including reference audio. Shorten the reference or split the input if this limit is
 exceeded. Only the exact F5/Vocos architecture above is supported; MMS remains on ORT.
 AMD, Intel and Apple hardware require their own validation before support is claimed.
@@ -233,7 +238,7 @@ TTS real-time factors, not LLM token rates, and are not comparable to the Qwen2.
 1. Listen to the four engines' output on the same text and pick a default.
 2. Port MyanmarTTS (CC0) to ONNX and add `--engine myanmartts`, giving a commercially usable engine.
 3. Test VoxCPM2 feasibility on a 4 GB GPU (community GGUF Q8_0 or ONNX) for an Apache-2.0 option.
-4. Add `tarafer bench speech` to print the comparison table above automatically.
+4. Done: `tarafer bench speech` prints load, first run, warm run and RTF per engine ([STT.md](STT.md)).
 5. Host or script the F5 export so users do not need Python (`models pull f5-myanmar` is manual today).
 
 ## Verification

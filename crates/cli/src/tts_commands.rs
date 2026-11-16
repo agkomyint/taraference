@@ -1,10 +1,12 @@
-//! Focused CLI for local text-to-speech. TTS inference stays separate from GGUF chat.
+//! Focused CLI for local speech: text-to-speech, speech-to-text and the speech benchmark.
+//! Speech inference stays separate from GGUF chat.
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::path::PathBuf;
 use taraference_tts::{
+    asr::{self, Asr, ASR_MODEL_DIR, ASR_MODEL_NAME, ASR_SAMPLE_RATE},
     mms::{self, Mms, MMS_MODEL_DIR},
     missing_files,
     normalize::{normalize, Lexicon},
@@ -14,7 +16,7 @@ use taraference_tts::{
 #[derive(Debug, Parser)]
 #[command(
     name = "tarafer speech",
-    about = "Local Burmese text-to-speech: F5-Myanmar-TTS (best quality) and MMS-TTS (fast). Weights are CC BY-NC 4.0, non-commercial."
+    about = "Local Burmese speech. Text-to-speech: F5-Myanmar-TTS (best quality) and MMS-TTS (fast), weights CC BY-NC 4.0, non-commercial. Speech-to-text: freococo/myanmar_asr, Apache-2.0."
 )]
 struct TtsCli {
     #[command(subcommand)]
@@ -67,6 +69,29 @@ enum TtsCommand {
         #[arg(long)]
         no_normalize: bool,
     },
+    /// Transcribe Burmese speech to text (stdout). WAV is read directly; other formats need ffmpeg.
+    Transcribe {
+        /// Audio file, any sample rate, mono or stereo.
+        audio: PathBuf,
+        /// Speech-to-text model.
+        #[arg(short, long, default_value = "myanmar-asr", value_parser = ["myanmar-asr"])]
+        model: String,
+        /// Spoken language; only Burmese (my) has a model so far.
+        #[arg(long, default_value = "my", value_parser = ["my"])]
+        lang: String,
+        /// Model directory (default models/stt/myanmar-asr).
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+        /// Inference device: auto (ORT CUDA/DirectML/CPU), cuda, directml or cpu.
+        #[arg(long, default_value = "auto", value_parser = parse_device)]
+        device: Device,
+        /// Print syllables separated by spaces instead of running text.
+        #[arg(long)]
+        syllables: bool,
+        /// Also write the transcript to this UTF-8 file.
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
     /// Show which engines are installed and ready.
     Status {
         /// Check only this F5 directory (default: all engines at their default paths).
@@ -90,6 +115,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 ("mms", "MMS-TTS Burmese (fast, CPU ok, CC BY-NC)", PathBuf::from(MMS_MODEL_DIR),
                  mms::missing_files(std::path::Path::new(MMS_MODEL_DIR)),
                  "tarafer models pull mms-mya".to_string()),
+                ("asr", "myanmar_asr Burmese speech-to-text (Apache-2.0)", PathBuf::from(ASR_MODEL_DIR),
+                 asr::missing_files(std::path::Path::new(ASR_MODEL_DIR)),
+                 "python tools/stt/export_myanmar_asr.py".to_string()),
             ];
             let mut ready = 0;
             for (id, name, dir, missing, hint) in &engines {
@@ -105,9 +133,34 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 }
             }
             if ready == 0 {
-                bail!("no TTS engine installed");
+                bail!("no speech engine installed");
             }
             eprintln!("next    | tarafer speech say \"မင်္ဂလာပါ\" -o hello.wav [--engine f5|mms]");
+            eprintln!("        | tarafer speech transcribe hello.wav");
+        }
+        TtsCommand::Transcribe { audio, model: _, lang: _, model_dir, device, syllables, output } => {
+            let dir = model_dir.unwrap_or_else(|| PathBuf::from(ASR_MODEL_DIR));
+            let mut engine = Asr::load(&dir, device)?;
+            eprintln!("model  | {ASR_MODEL_NAME} on {} ({:.0} ms load)", engine.device, engine.load_ms);
+            let samples = asr::read_audio(&audio)?;
+            let result = engine.transcribe(&samples)?;
+            let text = if syllables { result.syllables.join(" ") } else { result.text() };
+            println!("{text}");
+            if let Some(path) = &output {
+                std::fs::write(path, format!("{text}\n"))
+                    .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+            }
+            eprintln!(
+                "done   | {:.1} s audio | {} chunk(s) | {} syllables | {:.2} s run | RTF {:.3}",
+                result.audio_seconds,
+                result.chunks,
+                result.syllables.len(),
+                result.run_ms / 1000.0,
+                result.run_ms / 1000.0 / result.audio_seconds.max(1e-6),
+            );
+            if result.syllables.is_empty() {
+                eprintln!("note   | no speech recognised (clips under 0.5 s are skipped)");
+            }
         }
         TtsCommand::Say {
             text,
@@ -191,6 +244,122 @@ pub fn run(args: Vec<String>) -> Result<()> {
             );
             eprintln!("output | {}", output.display());
         }
+    }
+    Ok(())
+}
+
+const BENCH_TEXT: &str = "မင်္ဂလာပါ။ ဒီနေ့ ရာသီဥတု အရမ်း သာယာပါတယ်။ ကျွန်တော် မြန်မာစကား ပြောနေပါတယ်။";
+
+struct BenchRow {
+    task: &'static str,
+    model: String,
+    device: &'static str,
+    load_s: f64,
+    first_s: f64,
+    warm_s: f64,
+    audio_s: f64,
+}
+
+/// Times `run` (returning run ms and audio seconds) once cold, then `runs` more times.
+fn bench_row(
+    task: &'static str,
+    model: String,
+    device: &'static str,
+    load_ms: f64,
+    runs: usize,
+    mut run: impl FnMut() -> Result<(f64, f64)>,
+) -> Result<BenchRow> {
+    let (first, audio_s) = run()?;
+    let mut warm = f64::INFINITY;
+    for _ in 0..runs {
+        warm = warm.min(run()?.0);
+    }
+    Ok(BenchRow { task, model, device, load_s: load_ms / 1e3, first_s: first / 1e3, warm_s: warm / 1e3, audio_s })
+}
+
+/// `tarafer bench speech`: load, first run, best warm run and RTF for every installed engine.
+/// Speech-to-text is timed on `audio`, or on the benchmark sentence spoken by a TTS engine.
+pub fn bench(device: Device, runs: usize, steps: usize, audio: Option<PathBuf>) -> Result<()> {
+    use std::path::Path;
+    let runs = runs.max(1);
+    let options = SynthOptions { steps, ..SynthOptions::default() };
+    let text = normalize(BENCH_TEXT, &Lexicon::default()).text;
+    let mut rows = Vec::new();
+    let mut spoken: Option<(Vec<f32>, String)> = None;
+
+    if mms::missing_files(Path::new(MMS_MODEL_DIR)).is_empty() {
+        let mut tts = Mms::load(Path::new(MMS_MODEL_DIR), device)?;
+        let name = "MMS-TTS Burmese (facebook/mms-tts-mya, VITS ONNX)".to_string();
+        rows.push(bench_row("tts", name, tts.device, tts.load_ms, runs, || {
+            let result = tts.synthesize(&text, &options)?;
+            let timing = (result.synth_ms, result.seconds());
+            let samples = asr::resample(&result.samples, result.sample_rate, ASR_SAMPLE_RATE);
+            spoken = Some((samples, "the benchmark sentence spoken by MMS-TTS".into()));
+            Ok(timing)
+        })?);
+    }
+    if missing_files(Path::new(DEFAULT_MODEL_DIR)).is_empty() {
+        let mut tts = Tts::load(Path::new(DEFAULT_MODEL_DIR), device)?;
+        let name = format!("F5-Myanmar-TTS v2 (ONNX, {steps} steps)");
+        rows.push(bench_row("tts", name, tts.device, tts.load_ms, runs, || {
+            let result = tts.synthesize(&text, &options)?;
+            let timing = (result.synth_ms, result.seconds());
+            let samples = asr::resample(&result.samples, result.sample_rate, ASR_SAMPLE_RATE);
+            spoken = Some((samples, "the benchmark sentence spoken by F5-Myanmar-TTS".into()));
+            Ok(timing)
+        })?);
+    }
+    // The native engine reads the safetensors checkpoints, not the ONNX graphs.
+    #[cfg(feature = "wgpu")]
+    if ["model.safetensors", "vocos.safetensors", "vocab.txt"]
+        .iter()
+        .all(|f| Path::new(DEFAULT_MODEL_DIR).join(f).is_file())
+    {
+        let mut tts = Tts::load(Path::new(DEFAULT_MODEL_DIR), Device::Wgpu)?;
+        let name = format!("F5-Myanmar-TTS v2 (native wgpu, {steps} steps)");
+        rows.push(bench_row("tts", name, tts.device, tts.load_ms, runs, || {
+            let result = tts.synthesize(&text, &options)?;
+            Ok((result.synth_ms, result.seconds()))
+        })?);
+    }
+    let mut transcript = None;
+    if asr::missing_files(Path::new(ASR_MODEL_DIR)).is_empty() {
+        let input = match &audio {
+            Some(path) => Some((asr::read_audio(path)?, path.display().to_string())),
+            None => spoken.take(),
+        };
+        match input {
+            None => eprintln!("skip   | speech-to-text needs --audio FILE or an installed TTS engine"),
+            Some((samples, source)) => {
+                let mut engine = Asr::load(Path::new(ASR_MODEL_DIR), device)?;
+                rows.push(bench_row("stt", ASR_MODEL_NAME.into(), engine.device, engine.load_ms, runs, || {
+                    let result = engine.transcribe(&samples)?;
+                    let timing = (result.run_ms, result.audio_seconds);
+                    transcript = Some(result.text());
+                    Ok(timing)
+                })?);
+                transcript = transcript.map(|text| format!("{text}\nstt input| {source}"));
+            }
+        }
+    }
+    if rows.is_empty() {
+        bail!("no speech engine installed; see `tarafer speech status`");
+    }
+    println!("tarafer bench speech | best of {runs} warm run(s) | RTF = warm run time / audio time");
+    println!(
+        "{:<4} {:<50} {:<9} {:>6} {:>7} {:>7} {:>7} {:>6}",
+        "task", "model", "device", "load s", "first s", "warm s", "audio s", "RTF"
+    );
+    for r in &rows {
+        println!(
+            "{:<4} {:<50} {:<9} {:>6.2} {:>7.2} {:>7.3} {:>7.1} {:>6.3}",
+            r.task, r.model, r.device, r.load_s, r.first_s, r.warm_s, r.audio_s,
+            r.warm_s / r.audio_s.max(1e-6)
+        );
+    }
+    println!("tts text | {BENCH_TEXT}");
+    if let Some(text) = transcript {
+        println!("stt text | {text}");
     }
     Ok(())
 }
