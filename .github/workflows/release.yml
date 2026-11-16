@@ -50,7 +50,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2.9.1
         with:
-          shared-key: release-linux
+          shared-key: release-linux-v2
           cache-on-failure: true
 
       - name: Build release
@@ -100,7 +100,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2.9.1
         with:
-          shared-key: release-windows
+          shared-key: release-windows-v2
           cache-on-failure: true
 
       - name: Build release
